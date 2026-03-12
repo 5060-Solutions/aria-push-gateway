@@ -1,0 +1,38 @@
+# Aria Push Gateway — example configuration
+# Copy to gateway.toml and edit for your environment.
+
+[server]
+listen = "0.0.0.0:8080"
+public_url = "https://gateway.example.com"
+
+[database]
+# SQLite database path (created automatically)
+url = "sqlite:gateway.db?mode=rwc"
+
+[auth]
+# JWT signing secret — CHANGE THIS in production
+secret = "CHANGE-ME-TO-A-STRONG-RANDOM-SECRET"
+# Token expiry in seconds (default: 30 days)
+token_expiry_secs = 2592000
+
+# ── Push Notification Providers ──────────────────────────────────────────────
+
+# Apple Push Notification Service (iOS)
+# Uncomment and configure for iOS push notifications.
+# [push.apns]
+# key_path = "/path/to/AuthKey_XXXXXXXXXX.p8"
+# key_id = "XXXXXXXXXX"
+# team_id = "XXXXXXXXXX"
+# bundle_id = "com.example.aria"
+# sandbox = false   # set true for development builds
+
+# Firebase Cloud Messaging (Android)
+# Uncomment and configure for Android push notifications.
+# [push.fcm]
+# service_account_path = "/path/to/firebase-service-account.json"
+# project_id = "your-firebase-project-id"
+
+[push]
+# At least one provider (apns or fcm) should be configured.
+# The gateway will start without push configuration but won't
+# be able to deliver incoming call notifications.

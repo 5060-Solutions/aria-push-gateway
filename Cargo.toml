@@ -1,0 +1,67 @@
+[package]
+name = "aria-push-gateway"
+version = "0.1.0"
+edition = "2021"
+authors = ["5060 Solutions <josh@5060solutions.com>"]
+description = "SIP push gateway for Aria mobile clients — maintains registrations and delivers VoIP push notifications"
+license = "LicenseRef-Proprietary"
+
+[lib]
+name = "aria_push_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aria-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Shared SIP protocol utilities
+aria-sip-core = { path = "../aria-sip-core" }
+
+# SIP protocol
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+
+# TLS for SIP transports
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
+rustls-pki-types = "1"
+
+# Push notifications
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
+
+# Auth
+jsonwebtoken = "9"
+
+# Config
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Base64 for APNs JWT
+base64 = "0.22"
+
+# Error handling
+anyhow = "1"
