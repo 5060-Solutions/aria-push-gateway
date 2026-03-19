@@ -289,7 +289,7 @@ impl HandoffManager {
         let from = message::extract_header(&call.invite_raw, "To").unwrap_or_default();
         let to = message::extract_header(&call.invite_raw, "From").unwrap_or_default();
         let cid = &call.call_id;
-        let branch = aria_sip_core::generate_branch();
+        let branch = rsip::generators::generate_branch();
 
         let bye = format!(
             "BYE sip:unknown@{pbx_ip} SIP/2.0\r\n\

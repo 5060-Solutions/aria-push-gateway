@@ -4,11 +4,11 @@
 //! Message builders are gateway-specific (REGISTER, provisional responses).
 
 // Re-export shared parsing utilities
-pub use aria_sip_core::parser::{
+pub use rsip::sip_parser::{
     extract_display_name, extract_from_uri, extract_header, extract_method, extract_cseq_method,
     extract_to_tag, is_request, parse_status_code,
 };
-pub use aria_sip_core::{generate_branch, generate_call_id, generate_tag};
+pub use rsip::generators::{generate_branch, generate_call_id, generate_tag};
 
 /// Build a REGISTER request.
 #[allow(clippy::too_many_arguments)]

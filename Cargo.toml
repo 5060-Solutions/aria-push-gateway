@@ -24,7 +24,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio = { version = "1", features = ["full"] }
 
 # Shared SIP protocol utilities
-aria-sip-core = { git = "https://github.com/5060-Solutions/aria-sip-core.git" }
+sip-5060 = { git = "https://github.com/5060-Solutions/5060-sip.git" }
 
 # SIP protocol
 rand = "0.8"

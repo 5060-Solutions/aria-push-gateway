@@ -3,8 +3,8 @@
 /// Test SIP message building and parsing through the gateway's message module.
 mod sip_message {
     // We test through aria-sip-core's public API since the gateway re-exports it.
-    use aria_sip_core::parser;
-    use aria_sip_core::{generate_branch, generate_call_id, generate_tag};
+    use rsip::parser;
+    use rsip::{generate_branch, generate_call_id, generate_tag};
 
     const SAMPLE_INVITE: &str = "\
 INVITE sip:alice@example.com SIP/2.0\r\n\
@@ -99,7 +99,7 @@ Content-Length: 0\r\n\r\n";
 
     #[test]
     fn digest_auth_round_trip() {
-        use aria_sip_core::auth::DigestAuth;
+        use rsip::sip_auth::DigestAuth;
 
         let www_auth = parser::extract_header(SAMPLE_401, "WWW-Authenticate").unwrap();
         let auth = DigestAuth::from_challenge(

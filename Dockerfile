@@ -3,7 +3,6 @@ FROM rust:1.83-bookworm AS builder
 WORKDIR /build
 
 # Copy shared crate first (dependency)
-COPY aria-sip-core/ /build/aria-sip-core/
 
 # Copy gateway source
 COPY push-gateway/ /build/push-gateway/
