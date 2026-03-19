@@ -6,5 +6,6 @@
 mod digest;
 pub mod message;
 pub mod proxy;
+pub mod resolver;
 
 pub use proxy::{SipAccountConfig, SipProxyManager};

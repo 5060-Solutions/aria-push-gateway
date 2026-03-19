@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 use super::digest::DigestAuth;
 use super::message;
+use super::resolver::SrvResolver;
 use crate::handoff::HandoffManager;
 use crate::push::PushManager;
 
@@ -68,12 +69,15 @@ enum ProxyState {
 /// Manages all proxy registrations.
 pub struct SipProxyManager {
     registrations: RwLock<HashMap<String, Arc<RwLock<ProxyRegistration>>>>,
+    resolver: Arc<SrvResolver>,
 }
 
 impl SipProxyManager {
     pub fn new() -> Self {
+        let resolver = SrvResolver::new().expect("Failed to create DNS resolver");
         Self {
             registrations: RwLock::new(HashMap::new()),
+            resolver: Arc::new(resolver),
         }
     }
 
@@ -101,12 +105,15 @@ impl SipProxyManager {
             "Starting proxy registration"
         );
 
-        // Resolve server address
+        // Resolve server address via SRV lookup (with A record fallback)
         let registrar = config.effective_registrar().to_string();
-        let server_addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", registrar, config.port))
-            .await?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Failed to resolve {}", registrar))?;
+        let resolved = self.resolver
+            .resolve(&registrar, config.port, &config.transport)
+            .await?;
+        let server_addr = resolved
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Failed to resolve {}", registrar))?
+            .addr;
 
         // Bind UDP socket
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -596,12 +603,14 @@ impl SipProxyManager {
         let effective_registrar = registrar.unwrap_or(domain);
         let effective_auth_user = auth_username.unwrap_or(username);
 
-        // Resolve target
-        let server_addr: SocketAddr =
-            tokio::net::lookup_host(format!("{}:{}", effective_registrar, port))
-                .await?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", effective_registrar))?;
+        // Resolve target via SRV lookup (with A record fallback)
+        let resolved = self.resolver
+            .resolve(effective_registrar, port, transport)
+            .await?;
+        let server_addr = resolved
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", effective_registrar))?
+            .addr;
 
         // Bind temporary socket
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
