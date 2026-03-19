@@ -2,3 +2,6 @@
 .DS_Store
 *.db
 *.sqlite
+gateway.toml
+*.p8
+firebase-*.json
