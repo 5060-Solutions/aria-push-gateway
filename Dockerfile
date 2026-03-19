@@ -1,29 +1,22 @@
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.94-alpine AS builder
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 
 WORKDIR /build
-
-# Copy shared crate first (dependency)
-
-# Copy gateway source
-COPY push-gateway/ /build/push-gateway/
-
-WORKDIR /build/push-gateway
+COPY . .
 RUN cargo build --release
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM alpine:3.23
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
-COPY --from=builder /build/push-gateway/target/release/aria-gateway /usr/local/bin/aria-gateway
+COPY --from=builder /build/target/release/aria-gateway /usr/local/bin/aria-gateway
 
-# Default config location
 WORKDIR /data
 VOLUME /data
 
-EXPOSE 8080
+EXPOSE 8090
 
 ENTRYPOINT ["aria-gateway"]
 CMD ["--config", "/data/gateway.toml"]
