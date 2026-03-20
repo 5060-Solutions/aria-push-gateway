@@ -167,4 +167,42 @@ impl Database {
         Ok(())
     }
 
+    /// Deactivate all active devices with a given push token.
+    /// Prevents one physical device from being registered as multiple extensions.
+    pub async fn deactivate_devices_for_token(&self, push_token: &str) -> anyhow::Result<()> {
+        if push_token.is_empty() { return Ok(()); }
+        let rows = sqlx::query(
+            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE push_token = ? AND active = TRUE"
+        )
+            .bind(push_token)
+            .execute(&self.pool)
+            .await?;
+        if rows.rows_affected() > 0 {
+            tracing::info!(
+                deactivated = rows.rows_affected(),
+                "deactivated old device registrations by push token"
+            );
+        }
+        Ok(())
+    }
+
+    /// Deactivate all active devices for a given SIP username.
+    /// Called before registering a new device to prevent stale registrations.
+    pub async fn deactivate_devices_for_user(&self, sip_username: &str) -> anyhow::Result<()> {
+        let rows = sqlx::query(
+            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE sip_username = ? AND active = TRUE"
+        )
+            .bind(sip_username)
+            .execute(&self.pool)
+            .await?;
+        if rows.rows_affected() > 0 {
+            tracing::info!(
+                user = %sip_username,
+                deactivated = rows.rows_affected(),
+                "deactivated old device registrations"
+            );
+        }
+        Ok(())
+    }
+
 }

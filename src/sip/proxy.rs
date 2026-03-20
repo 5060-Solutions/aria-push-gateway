@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use super::digest::DigestAuth;
 use super::message;
 use super::resolver::SrvResolver;
+use super::rtp_relay::RtpRelay;
 use crate::handoff::HandoffManager;
 use crate::push::PushManager;
 
@@ -334,16 +335,18 @@ impl SipProxyManager {
                 let caller_name = message::extract_display_name(text);
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
 
-                let (device_id, push_mgr, handoff) = {
+                let (device_id, push_mgr, handoff, local_ip) = {
                     let r = reg.read().await;
                     (
                         r.device_id.clone(),
                         r.push_manager.clone(),
                         r.handoff.clone(),
+                        r.local_addr.ip().to_string(),
                     )
                 };
 
                 // Create a handoff token for this INVITE
+                // SDP passes through unchanged — phone talks directly to PBX relay
                 let call_token = handoff
                     .create_pending_call(
                         device_id.clone(),
@@ -351,6 +354,10 @@ impl SipProxyManager {
                         text.to_string(),
                         from,
                         reg.clone(),
+                        None,  // no RTP relay — SDP pass-through
+                        String::new(),
+                        0,
+                        0,
                     )
                     .await;
 
@@ -409,6 +416,13 @@ impl SipProxyManager {
                 // CANCEL from PBX — caller hung up before answer
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
                 tracing::info!(call_id = %call_id, "CANCEL received — caller hung up");
+
+                // Clean up the pending call so the mobile app can't accept it
+                let handoff = {
+                    let r = reg.read().await;
+                    r.handoff.clone()
+                };
+                handoff.handle_cancel(&call_id).await;
 
                 // Respond with 200 OK to the CANCEL
                 let r = reg.read().await;
@@ -633,14 +647,25 @@ impl SipProxyManager {
             format!("sip:{}", destination_uri)
         };
 
-        // Build INVITE
+        // Extract phone's RTP address from its SDP offer
+        let phone_media = message::extract_sdp_media_address(sdp_offer);
+        if let Some((ref ip, port)) = phone_media {
+            tracing::info!(ip = %ip, port, "Phone SDP offer media address");
+        }
+
+        // Pass phone's SDP offer through to PBX unchanged.
+        // RTP flows directly between phone and PBX media relay — no gateway relay needed.
+        if let Some((ip, port)) = message::extract_sdp_media_address(sdp_offer) {
+            tracing::info!(ip, port, "Phone SDP offer media address (pass-through)");
+        }
+
         let invite = Self::build_originate_invite(
             &target_uri, &local_ip, local_port, &call_id, 1, &from_tag, &branch,
             username, domain, display_name, sdp_offer, None,
         );
 
         socket.send_to(invite.as_bytes(), server_addr).await?;
-        tracing::info!(uri = %target_uri, "Sent outgoing INVITE");
+        tracing::info!(uri = %target_uri, "Sent outgoing INVITE (SDP pass-through)");
 
         // Wait for final response (up to 30s)
         let mut buf = vec![0u8; 65535];
@@ -670,11 +695,18 @@ impl SipProxyManager {
                 }
                 200 => {
                     // Extract SDP from 200 OK
-                    let sdp_answer = text
+                    let raw_sdp_answer = text
                         .split("\r\n\r\n")
                         .nth(1)
                         .unwrap_or("")
                         .to_string();
+
+                    // Pass PBX's SDP answer through to phone unchanged.
+                    // Phone will send RTP directly to PBX media relay.
+                    let sdp_answer = raw_sdp_answer;
+                    if let Some((ip, port)) = message::extract_sdp_media_address(&sdp_answer) {
+                        tracing::info!(ip, port, "PBX SDP answer media address (pass-through)");
+                    }
 
                     // Send ACK
                     let to_tag = message::extract_to_tag(text).unwrap_or_default();
@@ -685,7 +717,6 @@ impl SipProxyManager {
                     socket.send_to(ack.as_bytes(), server_addr).await?;
 
                     // Create a call token for hangup tracking
-                    // We reuse the handoff manager with a stub pending call structure
                     let call_token = uuid::Uuid::new_v4().to_string();
 
                     // Store as an active call for BYE handling
@@ -713,8 +744,7 @@ impl SipProxyManager {
                         handoff: handoff.clone(),
                     }));
 
-                    // Register the active call in the handoff manager via accept flow
-                    // We directly create the active call entry
+                    // Register the active call with the RTP relay handle
                     handoff.register_active_call(
                         call_token.clone(),
                         call_id.clone(),
@@ -722,9 +752,63 @@ impl SipProxyManager {
                         text.to_string(),
                         server_addr,
                         proxy_reg,
+                        None,
                     ).await;
 
                     tracing::info!(call_id = %call_id, "Outgoing call connected");
+
+                    // Spawn a persistent receive loop on this socket to handle
+                    // BYE from PBX (when the remote party hangs up).
+                    let recv_socket = socket.clone();
+                    let recv_handoff = handoff.clone();
+                    let recv_call_id = call_id.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65535];
+                        loop {
+                            match recv_socket.recv_from(&mut buf).await {
+                                Ok((len, from)) => {
+                                    let text = match std::str::from_utf8(&buf[..len]) {
+                                        Ok(s) => s.to_string(),
+                                        Err(_) => continue,
+                                    };
+
+                                    if message::is_request(&text) {
+                                        let method = message::extract_method(&text).unwrap_or_default();
+                                        match method.as_str() {
+                                            "BYE" => {
+                                                let cid = message::extract_header(&text, "Call-ID")
+                                                    .unwrap_or_default();
+                                                tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
+
+                                                // Send 200 OK for BYE
+                                                let response = format!(
+                                                    "SIP/2.0 200 OK\r\n\
+                                                     {}\
+                                                     Content-Length: 0\r\n\r\n",
+                                                    Self::echo_headers(&text),
+                                                );
+                                                let _ = recv_socket.send_to(response.as_bytes(), from).await;
+
+                                                // Clean up via handoff
+                                                let _ = recv_handoff.handle_bye_from_pbx(&cid, &text, from).await;
+                                                break;
+                                            }
+                                            _ => {
+                                                tracing::debug!("Outgoing call recv loop: ignoring {} request", method);
+                                            }
+                                        }
+                                    }
+                                    // Ignore responses (200 OK to our BYE, etc.)
+                                }
+                                Err(e) => {
+                                    tracing::debug!(call_id = %recv_call_id, "Outgoing call socket error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        tracing::debug!(call_id = %recv_call_id, "Outgoing call receive loop ended");
+                    });
+
                     return Ok((call_token, sdp_answer));
                 }
                 401 | 407 => {

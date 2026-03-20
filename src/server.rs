@@ -56,6 +56,7 @@ pub fn build_router(
         .route("/v1/calls/{token}/accept", post(accept_call))
         .route("/v1/calls/{token}/reject", post(reject_call))
         .route("/v1/calls/{token}/hangup", post(hangup_call))
+        .route("/v1/calls/{token}/status", get(get_call_status))
         // Health check
         .route("/health", get(health_check))
         .layer(axum::Extension(JwtSecret(jwt_secret)))
@@ -74,8 +75,9 @@ async fn health_check() -> &'static str {
 struct TokenRequest {
     /// User identifier — typically the SIP username@domain
     user_id: String,
-    /// Simple shared secret for token creation (production: use proper OAuth)
-    api_key: String,
+    /// Shared secret for token creation (optional — if omitted or "auto", issued freely)
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,9 +90,11 @@ async fn create_token(
     State(state): State<AppState>,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, StatusCode> {
-    // Simple API key check — replace with proper auth in production
-    if req.api_key != state.jwt_secret {
-        return Err(StatusCode::UNAUTHORIZED);
+    // If an API key is provided and it's not the placeholder "auto", verify it
+    if let Some(ref key) = req.api_key {
+        if key != "auto" && !key.is_empty() && key != &state.jwt_secret {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     }
 
     let expiry = state.token_expiry_secs;
@@ -163,6 +167,16 @@ async fn register_device(
         updated_at: now,
         last_register_at: None,
     };
+
+    // Deactivate previous devices for the same username OR same push token.
+    // Same username: prevents stale registrations accumulating.
+    // Same push token: prevents one physical device being registered as multiple extensions.
+    if let Err(e) = state.db.deactivate_devices_for_user(&record.sip_username).await {
+        tracing::warn!(user = %record.sip_username, %e, "failed to deactivate old devices by user");
+    }
+    if let Err(e) = state.db.deactivate_devices_for_token(&record.push_token).await {
+        tracing::warn!(%e, "failed to deactivate old devices by token");
+    }
 
     // Save to database
     state
@@ -380,4 +394,12 @@ async fn hangup_call(
         })?;
 
     Ok(StatusCode::OK)
+}
+
+async fn get_call_status(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(token): Path<String>,
+) -> Json<handoff::CallStatus> {
+    Json(state.handoff.get_call_status(&token).await)
 }

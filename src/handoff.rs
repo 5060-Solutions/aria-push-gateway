@@ -2,11 +2,11 @@
 //!
 //! When an INVITE arrives at the gateway, we hold it pending while sending
 //! a push notification. The mobile app wakes up, connects to the gateway,
-//! and provides an SDP answer. The gateway forwards the 200 OK to the PBX
-//! with the app's SDP, and RTP flows directly between app and PBX.
+//! and provides an SDP answer. The gateway rewrites SDP to insert its own
+//! RTP relay addresses and forwards the 200 OK to the PBX.
 //!
 //! After acceptance, the call becomes "active" — the gateway tracks it so it
-//! can forward BYE in both directions and handle ACK.
+//! can forward BYE in both directions, handle ACK, and stop the RTP relay.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::sip::message;
+use crate::sip::rtp_relay::RtpRelay;
 
 /// A pending call waiting for the mobile app to respond.
 struct PendingCall {
@@ -26,6 +27,14 @@ struct PendingCall {
     pbx_addr: SocketAddr,
     /// The proxy registration's socket for sending responses.
     proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+    /// Pre-allocated RTP relay for this call (allocated when INVITE arrives).
+    rtp_relay: Option<Arc<RtpRelay>>,
+    /// The gateway's local IP for SDP rewriting.
+    local_ip: String,
+    /// The phone-side RTP relay port.
+    phone_rtp_port: u16,
+    /// The PBX-side RTP relay port.
+    pbx_rtp_port: u16,
 }
 
 /// An active call (post-200 OK) tracked for mid-dialog request forwarding.
@@ -36,6 +45,8 @@ pub struct ActiveCall {
     pub proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
     /// The original INVITE (for header reference).
     pub invite_raw: String,
+    /// RTP relay for this call — stopped and dropped when the call ends.
+    pub rtp_relay: Option<Arc<RtpRelay>>,
 }
 
 /// Manages pending call handoffs and active calls.
@@ -45,18 +56,45 @@ pub struct HandoffManager {
     active: Arc<RwLock<HashMap<String, ActiveCall>>>,
     /// Reverse map: call_token -> call_id (so the app can end calls by token).
     token_to_call_id: Arc<RwLock<HashMap<String, String>>>,
+    /// Calls that have been ended (by BYE or CANCEL). Keyed by call_token.
+    /// Mobile app polls this to detect remote hangup.
+    ended_calls: Arc<RwLock<HashMap<String, EndedCallInfo>>>,
+}
+
+/// Info about a call that has ended, available for mobile app polling.
+#[derive(Clone, serde::Serialize)]
+pub struct EndedCallInfo {
+    pub reason: String,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl HandoffManager {
     pub fn new() -> Self {
+        let ended = Arc::new(RwLock::new(HashMap::<String, EndedCallInfo>::new()));
+
+        // Spawn a cleanup task to expire ended call records after 2 minutes
+        let ended_ref = Arc::clone(&ended);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let now = chrono::Utc::now();
+                let mut map = ended_ref.write().await;
+                map.retain(|_, info| {
+                    (now - info.ended_at).num_seconds() < 120
+                });
+            }
+        });
+
         Self {
             pending: Arc::new(RwLock::new(HashMap::new())),
             active: Arc::new(RwLock::new(HashMap::new())),
             token_to_call_id: Arc::new(RwLock::new(HashMap::new())),
+            ended_calls: ended,
         }
     }
 
     /// Create a pending call entry and return a unique call token.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_call(
         &self,
         device_id: String,
@@ -64,6 +102,10 @@ impl HandoffManager {
         invite_raw: String,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+        rtp_relay: Option<Arc<RtpRelay>>,
+        local_ip: String,
+        phone_rtp_port: u16,
+        pbx_rtp_port: u16,
     ) -> String {
         let call_token = uuid::Uuid::new_v4().to_string();
 
@@ -73,6 +115,10 @@ impl HandoffManager {
             invite_raw,
             pbx_addr,
             proxy_reg,
+            rtp_relay,
+            local_ip,
+            phone_rtp_port,
+            pbx_rtp_port,
         };
 
         let token = call_token.clone();
@@ -115,7 +161,49 @@ impl HandoffManager {
                 .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?
         };
 
-        // Build 200 OK with the app's SDP and send to PBX
+        // Extract the phone's RTP address from its SDP answer
+        let phone_media = message::extract_sdp_media_address(&sdp_answer);
+        if let Some((ip, port)) = &phone_media {
+            tracing::info!(ip = %ip, port, "Phone SDP answer media address");
+        }
+
+        // Rewrite the app's SDP answer: replace phone's media address with
+        // the gateway's PBX-side relay port (this is what the PBX sees).
+        let rewritten_sdp = if call.rtp_relay.is_some() {
+            message::rewrite_sdp_media_address(
+                &sdp_answer,
+                &call.local_ip,
+                call.pbx_rtp_port,
+            )
+        } else {
+            sdp_answer.clone()
+        };
+
+        // Also extract PBX's RTP address from the original INVITE SDP offer
+        let invite_sdp = call
+            .invite_raw
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("");
+        let pbx_media = message::extract_sdp_media_address(invite_sdp);
+
+        // Start the RTP relay if allocated
+        if let Some(ref relay) = call.rtp_relay {
+            if let Some((pbx_ip, pbx_port)) = &pbx_media {
+                let pbx_addr: SocketAddr = format!("{}:{}", pbx_ip, pbx_port)
+                    .parse()
+                    .unwrap_or_else(|_| call.pbx_addr);
+                relay.start(pbx_addr);
+                tracing::info!(
+                    pbx_rtp = %pbx_addr,
+                    "Started RTP relay for inbound call"
+                );
+            } else {
+                tracing::warn!("Could not extract PBX media address from INVITE SDP");
+            }
+        }
+
+        // Build 200 OK with the rewritten SDP and send to PBX
         let reg = call.proxy_reg.read().await;
         let contact_uri = format!(
             "sip:{}@{}:{}",
@@ -125,10 +213,10 @@ impl HandoffManager {
         );
 
         if let Some(ok) =
-            message::build_200_ok_invite(&call.invite_raw, &sdp_answer, &contact_uri)
+            message::build_200_ok_invite(&call.invite_raw, &rewritten_sdp, &contact_uri)
         {
             reg.socket.send_to(ok.as_bytes(), call.pbx_addr).await?;
-            tracing::info!(token = %call_token, "Sent 200 OK to PBX");
+            tracing::info!(token = %call_token, "Sent 200 OK to PBX with rewritten SDP");
 
             // Move to active calls
             let active_call = ActiveCall {
@@ -137,6 +225,7 @@ impl HandoffManager {
                 pbx_addr: call.pbx_addr,
                 proxy_reg: call.proxy_reg.clone(),
                 invite_raw: call.invite_raw,
+                rtp_relay: call.rtp_relay,
             };
 
             {
@@ -185,6 +274,9 @@ impl HandoffManager {
     }
 
     /// Get the SDP offer from a pending call (so the app can generate an answer).
+    ///
+    /// The SDP is rewritten so that the media address points to the gateway's
+    /// phone-side RTP relay port — the phone will send its RTP there.
     pub async fn get_call_offer(&self, call_token: &str) -> anyhow::Result<CallOffer> {
         let calls = self.pending.read().await;
         let call = calls
@@ -192,12 +284,23 @@ impl HandoffManager {
             .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?;
 
         // Extract SDP from INVITE body
-        let sdp = call
+        let raw_sdp = call
             .invite_raw
             .split("\r\n\r\n")
             .nth(1)
             .unwrap_or("")
             .to_string();
+
+        // Rewrite the SDP offer with the gateway's phone-side relay address
+        let sdp = if call.rtp_relay.is_some() {
+            message::rewrite_sdp_media_address(
+                &raw_sdp,
+                &call.local_ip,
+                call.phone_rtp_port,
+            )
+        } else {
+            raw_sdp
+        };
 
         let (caller_user, caller_domain) =
             message::extract_from_uri(&call.invite_raw).unwrap_or(("unknown".into(), "".into()));
@@ -217,6 +320,62 @@ impl HandoffManager {
         if active.contains_key(call_id) {
             tracing::debug!(call_id = %call_id, "ACK received for active call");
         }
+    }
+
+    /// Handle a CANCEL from the PBX — remove the pending call so the mobile
+    /// app's accept attempt will fail cleanly with "cancelled".
+    pub async fn handle_cancel(&self, call_id: &str) {
+        let mut pending = self.pending.write().await;
+        // Find the token for this call_id
+        let token = pending
+            .iter()
+            .find(|(_, c)| c.call_id == call_id)
+            .map(|(t, _)| t.clone());
+
+        if let Some(token) = token {
+            pending.remove(&token);
+            tracing::info!(call_id = %call_id, token = %token, "Pending call cancelled");
+
+            // Record as ended so mobile app can detect cancellation
+            let mut ended = self.ended_calls.write().await;
+            ended.insert(token, EndedCallInfo {
+                reason: "cancelled".to_string(),
+                ended_at: chrono::Utc::now(),
+            });
+        }
+    }
+
+    /// Get the status of a call by token. Returns None if unknown,
+    /// or an EndedCallInfo if the call was ended by the remote party.
+    pub async fn get_call_status(&self, call_token: &str) -> CallStatus {
+        // Check if still pending
+        {
+            let pending = self.pending.read().await;
+            if pending.contains_key(call_token) {
+                return CallStatus::Pending;
+            }
+        }
+
+        // Check if active
+        {
+            let map = self.token_to_call_id.read().await;
+            if let Some(call_id) = map.get(call_token) {
+                let active = self.active.read().await;
+                if active.contains_key(call_id) {
+                    return CallStatus::Active;
+                }
+            }
+        }
+
+        // Check if ended
+        {
+            let ended = self.ended_calls.read().await;
+            if let Some(info) = ended.get(call_token) {
+                return CallStatus::Ended(info.clone());
+            }
+        }
+
+        CallStatus::Unknown
     }
 
     /// Handle an incoming BYE from the PBX for an active call.
@@ -255,12 +414,35 @@ impl HandoffManager {
         );
 
         reg.socket.send_to(resp.as_bytes(), from).await?;
+
+        // Stop RTP relay
+        if let Some(ref relay) = call.rtp_relay {
+            relay.stop();
+            tracing::info!(call_id = %call_id, "Stopped RTP relay for ended call");
+        }
+
         tracing::info!(call_id = %call_id, "BYE from PBX — sent 200 OK, call ended");
 
-        // Clean up token mapping
+        // Clean up token mapping and record ended state
         {
             let mut map = self.token_to_call_id.write().await;
-            map.retain(|_, v| v != call_id);
+            let tokens: Vec<String> = map
+                .iter()
+                .filter(|(_, v)| v.as_str() == call_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for token in &tokens {
+                map.remove(token);
+            }
+
+            // Record as ended so mobile app can detect remote hangup
+            let mut ended = self.ended_calls.write().await;
+            for token in tokens {
+                ended.insert(token, EndedCallInfo {
+                    reason: "bye_from_remote".to_string(),
+                    ended_at: chrono::Utc::now(),
+                });
+            }
         }
 
         Ok(Some(call.device_id))
@@ -307,6 +489,13 @@ impl HandoffManager {
         );
 
         reg.socket.send_to(bye.as_bytes(), call.pbx_addr).await?;
+
+        // Stop RTP relay
+        if let Some(ref relay) = call.rtp_relay {
+            relay.stop();
+            tracing::info!(call_id = %call_id, "Stopped RTP relay for hung-up call");
+        }
+
         tracing::info!(call_id = %call_id, "Sent BYE to PBX (app hangup)");
 
         // Clean up token mapping
@@ -328,6 +517,7 @@ impl HandoffManager {
         invite_raw: String,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+        rtp_relay: Option<Arc<RtpRelay>>,
     ) {
         let active_call = ActiveCall {
             device_id,
@@ -335,6 +525,7 @@ impl HandoffManager {
             pbx_addr,
             proxy_reg,
             invite_raw,
+            rtp_relay,
         };
 
         {
@@ -355,4 +546,18 @@ pub struct CallOffer {
     pub caller_uri: String,
     pub caller_name: Option<String>,
     pub sdp_offer: String,
+}
+
+/// Status of a call from the gateway's perspective.
+#[derive(serde::Serialize)]
+#[serde(tag = "status")]
+pub enum CallStatus {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "active")]
+    Active,
+    #[serde(rename = "ended")]
+    Ended(EndedCallInfo),
+    #[serde(rename = "unknown")]
+    Unknown,
 }

@@ -58,6 +58,9 @@ async fn main() -> anyhow::Result<()> {
     let devices = db.list_active_devices().await?;
     tracing::info!("Restoring {} device registrations", devices.len());
     for device in devices {
+        // Register push token so incoming calls can send notifications
+        push_manager.register_device(device.clone()).await;
+
         if let Err(e) = sip_proxy
             .register_device(
                 device.id.clone(),
