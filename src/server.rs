@@ -50,6 +50,7 @@ pub fn build_router(
         .route("/v1/devices", post(register_device))
         .route("/v1/devices/{id}", get(get_device_status))
         .route("/v1/devices/{id}", delete(unregister_device))
+        .route("/v1/devices/{id}/heartbeat", post(device_heartbeat))
         // Call signaling
         .route("/v1/calls", post(make_call))
         .route("/v1/calls/{token}", get(get_call_offer))
@@ -261,6 +262,51 @@ async fn unregister_device(
         .deactivate_device(&id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Device heartbeat — re-registers the SIP proxy connection after network change.
+///
+/// Called by mobile clients when they detect a network change (WiFi→cellular,
+/// reconnect after sleep, etc.). Forces a fresh SIP REGISTER to the PBX so
+/// the device's registration binding is updated with the new IP/port.
+async fn device_heartbeat(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let device = state
+        .db
+        .get_device(&id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if !device.active {
+        return Err(StatusCode::GONE);
+    }
+
+    tracing::info!(device_id = %id, user = %device.sip_username, "device heartbeat — re-registering SIP");
+
+    // Force SIP re-registration with fresh socket
+    let sip_config = device.sip_config();
+    if let Err(e) = state
+        .sip_proxy
+        .register_device(
+            id.clone(),
+            sip_config,
+            state.push_manager.clone(),
+            state.handoff.clone(),
+        )
+        .await
+    {
+        tracing::warn!(device_id = %id, %e, "heartbeat SIP re-registration failed");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    // Update last_register timestamp
+    let _ = state.db.touch_device(&id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

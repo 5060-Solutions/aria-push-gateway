@@ -167,6 +167,15 @@ impl Database {
         Ok(())
     }
 
+    /// Update last_register_at timestamp for a device (heartbeat/keepalive).
+    pub async fn touch_device(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE devices SET last_register_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Deactivate all active devices with a given push token.
     /// Prevents one physical device from being registered as multiple extensions.
     pub async fn deactivate_devices_for_token(&self, push_token: &str) -> anyhow::Result<()> {
