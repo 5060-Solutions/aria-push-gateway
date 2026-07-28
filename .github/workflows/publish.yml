@@ -39,3 +39,43 @@ jobs:
             ghcr.io/5060-solutions/aria-push-gateway:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to droplet
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DROPLET_IP: 159.203.80.231
+      DEPLOY_PATH: /opt/aria-pbx
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/aria_deploy
+          chmod 600 ~/.ssh/aria_deploy
+          ssh-keyscan -H "$DROPLET_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # This repo's own GITHUB_TOKEN can read this repo's own package, which is
+      # why the gateway deploys itself rather than being pulled by the
+      # aria-cloud-pbx deploy: that workflow's token is scoped to its own repo
+      # and cannot read this package while it is private.
+      - name: Pull and restart on droplet
+        run: |
+          ssh -i ~/.ssh/aria_deploy root@"$DROPLET_IP" bash -s <<'EOF'
+            set -euo pipefail
+            cd /opt/aria-pbx
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ghcr.io/5060-solutions/aria-push-gateway:latest
+            # Recreate in place; never `down` first, so a failed pull cannot
+            # leave the gateway stopped.
+            docker compose -f docker-compose.prod.yml up -d --no-deps push-gateway
+            docker image prune -f
+          EOF
+
+      - name: Verify
+        run: |
+          sleep 5
+          curl -fsS --max-time 20 https://push.ariaroute.com/health
