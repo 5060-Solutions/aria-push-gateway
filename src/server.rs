@@ -574,6 +574,7 @@ async fn transfer_call(
             match e {
                 TransferError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
                 TransferError::NotFound => StatusCode::NOT_FOUND,
+                TransferError::InProgress => StatusCode::CONFLICT,
                 TransferError::Rejected(_) | TransferError::Send(_) => StatusCode::BAD_GATEWAY,
                 TransferError::Timeout => StatusCode::GATEWAY_TIMEOUT,
             }
@@ -1045,5 +1046,25 @@ Content-Length: 0\r\n\r\n";
 
         let (_, body) = app.call(Method::GET, &status_path, "alice").await;
         assert_eq!(body, r#"{"status":"unknown"}"#);
+    }
+
+    #[tokio::test]
+    async fn concurrent_transfer_answers_409() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "bob").await;
+        let first = {
+            let handoff = app.handoff.clone();
+            let token = token.clone();
+            tokio::spawn(async move { handoff.transfer_call(&token, "1002").await })
+        };
+        let refer = recv_text(&pbx).await;
+        assert!(refer.starts_with("REFER "));
+
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/transfer"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        first.abort();
     }
 }

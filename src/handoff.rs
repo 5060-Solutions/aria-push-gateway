@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, RwLock};
 
 use crate::sip::digest::DigestAuth;
 use crate::sip::message;
@@ -74,7 +74,7 @@ pub struct ActiveCall {
     local_cseq: AtomicU32,
     /// Set while a REFER is outstanding or after the PBX accepted one, so a
     /// later NOTIFY/BYE is attributed to the transfer.
-    transfer_pending: AtomicBool,
+    transfer_pending: Arc<AtomicBool>,
     /// RTP relay for this call — stopped and dropped when the call ends.
     pub rtp_relay: Option<Arc<RtpRelay>>,
     /// Dropped together with the call, which wakes the receiver returned by
@@ -97,7 +97,7 @@ impl ActiveCall {
             proxy_reg,
             dialog,
             local_cseq: AtomicU32::new(initial_cseq),
-            transfer_pending: AtomicBool::new(false),
+            transfer_pending: Arc::new(AtomicBool::new(false)),
             rtp_relay,
             _ended: None,
         }
@@ -403,6 +403,8 @@ pub enum TransferError {
     InvalidTarget(&'static str),
     /// No active call has this token.
     NotFound,
+    /// Another transfer of this call is already in progress.
+    InProgress,
     /// The PBX answered the REFER with a non-2xx final response.
     Rejected(u16),
     /// The PBX did not answer the REFER in time.
@@ -416,6 +418,7 @@ impl std::fmt::Display for TransferError {
         match self {
             Self::InvalidTarget(why) => write!(f, "invalid transfer target: {why}"),
             Self::NotFound => write!(f, "call token not found or not active"),
+            Self::InProgress => write!(f, "a transfer of this call is already in progress"),
             Self::Rejected(status) => write!(f, "PBX rejected REFER with {status}"),
             Self::Timeout => write!(f, "no final response to REFER"),
             Self::Send(e) => write!(f, "failed to send REFER: {e}"),
@@ -442,6 +445,45 @@ pub fn refer_notify_status(notify: &str) -> Option<u16> {
     message::parse_sipfrag_status(body.trim_start())
 }
 
+/// Outstanding REFER transactions: Via branch -> where the final response goes.
+type PendingRefers = HashMap<String, oneshot::Sender<String>>;
+
+fn lock_refers(
+    refers: &std::sync::Mutex<PendingRefers>,
+) -> std::sync::MutexGuard<'_, PendingRefers> {
+    refers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Releases a call's transfer claim when dropped, unless the transfer was
+/// accepted. Covers every way `transfer_call` can stop, including its
+/// future being dropped when the HTTP client disconnects mid-transfer.
+struct TransferClaim {
+    flag: Arc<AtomicBool>,
+    accepted: bool,
+}
+
+impl Drop for TransferClaim {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Removes a REFER transaction's response slot when dropped.
+struct ReferSlot<'a> {
+    refers: &'a std::sync::Mutex<PendingRefers>,
+    branch: &'a str,
+}
+
+impl Drop for ReferSlot<'_> {
+    fn drop(&mut self) {
+        lock_refers(self.refers).remove(self.branch);
+    }
+}
+
 /// Manages pending call handoffs and active calls.
 pub struct HandoffManager {
     pending: Arc<RwLock<HashMap<String, PendingCall>>>,
@@ -454,7 +496,7 @@ pub struct HandoffManager {
     ended_calls: Arc<RwLock<HashMap<String, EndedCallInfo>>>,
     /// Outstanding REFER transactions keyed by Via branch; the sender gets
     /// the final response.
-    pending_refers: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    pending_refers: Arc<std::sync::Mutex<PendingRefers>>,
 }
 
 /// Info about a call that has ended, available for mobile app polling.
@@ -487,7 +529,7 @@ impl HandoffManager {
             active: Arc::new(RwLock::new(HashMap::new())),
             token_to_call_id: Arc::new(RwLock::new(HashMap::new())),
             ended_calls: ended,
-            pending_refers: Arc::new(Mutex::new(HashMap::new())),
+            pending_refers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -980,11 +1022,28 @@ impl HandoffManager {
             .await
             .ok_or(TransferError::NotFound)?;
 
-        let (dialog, pbx_addr, proxy_reg) = {
+        let (mut claim, dialog, pbx_addr, proxy_reg) = {
             let active = self.active.read().await;
             let call = active.get(&call_id).ok_or(TransferError::NotFound)?;
-            call.transfer_pending.store(true, Ordering::SeqCst);
-            (call.dialog.clone(), call.pbx_addr, call.proxy_reg.clone())
+            // Claim the call for this transfer; a second concurrent one is
+            // refused rather than racing the first on the same dialog.
+            if call
+                .transfer_pending
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Err(TransferError::InProgress);
+            }
+            let claim = TransferClaim {
+                flag: call.transfer_pending.clone(),
+                accepted: false,
+            };
+            (
+                claim,
+                call.dialog.clone(),
+                call.pbx_addr,
+                call.proxy_reg.clone(),
+            )
         };
 
         let (socket, local_addr, domain, (auth_user, password)) = {
@@ -1061,13 +1120,12 @@ impl HandoffManager {
 
         match &result {
             Ok(()) => {
+                // Stay claimed until the NOTIFY/BYE resolves the transfer.
+                claim.accepted = true;
                 tracing::info!(call_id = %call_id, "PBX accepted REFER");
             }
             Err(e) => {
                 tracing::warn!(call_id = %call_id, "Transfer failed: {}", e);
-                if let Some(call) = self.active.read().await.get(&call_id) {
-                    call.transfer_pending.store(false, Ordering::SeqCst);
-                }
             }
         }
         result
@@ -1088,10 +1146,11 @@ impl HandoffManager {
         branch: &str,
     ) -> Result<String, TransferError> {
         let (tx, mut rx) = oneshot::channel();
-        self.pending_refers
-            .lock()
-            .await
-            .insert(branch.to_string(), tx);
+        lock_refers(&self.pending_refers).insert(branch.to_string(), tx);
+        let _slot = ReferSlot {
+            refers: &self.pending_refers,
+            branch,
+        };
 
         let deadline = tokio::time::Instant::now() + REFER_TIMEOUT;
         let mut interval = SIP_T1;
@@ -1110,8 +1169,6 @@ impl HandoffManager {
                 Err(_) => interval = (interval * 2).min(SIP_T2),
             }
         };
-
-        self.pending_refers.lock().await.remove(branch);
         result
     }
 
@@ -1127,7 +1184,8 @@ impl HandoffManager {
         if status < 200 {
             return;
         }
-        if let Some(tx) = self.pending_refers.lock().await.remove(&branch) {
+        let slot = lock_refers(&self.pending_refers).remove(&branch);
+        if let Some(tx) = slot {
             let _ = tx.send(response.to_string());
         }
     }
@@ -1604,10 +1662,7 @@ Content-Length: 0\r\n\r\n";
     async fn refer_final_response_is_delivered_by_branch() {
         let mgr = HandoffManager::new();
         let (tx, rx) = oneshot::channel();
-        mgr.pending_refers
-            .lock()
-            .await
-            .insert("z9hG4bK-ref".into(), tx);
+        lock_refers(&mgr.pending_refers).insert("z9hG4bK-ref".into(), tx);
 
         let resp = |status: &str, branch: &str| {
             format!(
@@ -1624,12 +1679,12 @@ Content-Length: 0\r\n\r\n";
             .await;
         mgr.handle_refer_response(&resp("202 Accepted", "z9hG4bK-other"))
             .await;
-        assert!(mgr.pending_refers.lock().await.contains_key("z9hG4bK-ref"));
+        assert!(lock_refers(&mgr.pending_refers).contains_key("z9hG4bK-ref"));
 
         mgr.handle_refer_response(&resp("202 Accepted", "z9hG4bK-ref"))
             .await;
         assert_eq!(rx.await, Ok(resp("202 Accepted", "z9hG4bK-ref")));
-        assert!(mgr.pending_refers.lock().await.is_empty());
+        assert!(lock_refers(&mgr.pending_refers).is_empty());
     }
 
     #[tokio::test]
@@ -1891,5 +1946,95 @@ Content-Length: 0\r\n\r\n";
         mgr.handle_refer_response(&response_to(&first, "401 Unauthorized"))
             .await;
         assert_eq!(task.await.unwrap(), Err(TransferError::Rejected(401)));
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_transfer_is_refused() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let first = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        let refer = recv_text(&pbx).await;
+
+        // While the first REFER is outstanding...
+        assert_eq!(
+            mgr.transfer_call("tok", "1003").await,
+            Err(TransferError::InProgress)
+        );
+
+        // ...and after the PBX accepted it, until the transfer resolves.
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(
+            mgr.transfer_call("tok", "1003").await,
+            Err(TransferError::InProgress)
+        );
+
+        // A failed transfer releases the call for another attempt.
+        mgr.handle_notify(
+            "outbound-call-1",
+            &notify("refer", "SIP/2.0 486 Busy Here\r\n"),
+        )
+        .await;
+        let retry = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1003").await })
+        };
+        let refer = recv_text(&pbx).await;
+        assert_eq!(
+            message::extract_header(&refer, "Refer-To").unwrap(),
+            "<sip:1003@pbx.example.com>"
+        );
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(retry.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn rejected_transfer_releases_the_call() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        let refer = recv_text(&pbx).await;
+        mgr.handle_refer_response(&response_to(&refer, "603 Decline"))
+            .await;
+        assert_eq!(task.await.unwrap(), Err(TransferError::Rejected(603)));
+
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        let refer = recv_text(&pbx).await;
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn abandoned_transfer_releases_the_call() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        recv_text(&pbx).await;
+        // The HTTP request is dropped mid-transaction (client went away).
+        task.abort();
+        let _ = task.await;
+        assert!(lock_refers(&mgr.pending_refers).is_empty());
+
+        let retry = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1003").await })
+        };
+        let refer = recv_text(&pbx).await;
+        assert!(refer.contains("Refer-To: <sip:1003@pbx.example.com>"));
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(retry.await.unwrap(), Ok(()));
     }
 }
