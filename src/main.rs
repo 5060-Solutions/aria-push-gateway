@@ -72,6 +72,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let token_issuer_key = config.auth.resolve_token_issuer_key();
+    match &token_issuer_key {
+        None => tracing::warn!(
+            "TOKEN_ISSUER_KEY is not set — POST /v1/auth/token will refuse every request"
+        ),
+        Some(key) if key.len() < 32 => tracing::warn!(
+            "TOKEN_ISSUER_KEY is shorter than 32 characters — use a long random value"
+        ),
+        Some(_) => {}
+    }
+
     // Build and start HTTP server
     let app = server::build_router(
         db.clone(),
@@ -80,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         handoff.clone(),
         config.auth.secret.clone(),
         config.auth.token_expiry_secs,
+        token_issuer_key,
     );
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

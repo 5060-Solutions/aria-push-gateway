@@ -24,6 +24,9 @@ struct AppState {
     handoff: Arc<HandoffManager>,
     jwt_secret: String,
     token_expiry_secs: u64,
+    /// Key a trusted backend must present to mint tokens; `None` disables
+    /// the token endpoint.
+    token_issuer_key: Option<Arc<str>>,
 }
 
 pub fn build_router(
@@ -33,6 +36,7 @@ pub fn build_router(
     handoff: Arc<HandoffManager>,
     jwt_secret: String,
     token_expiry_secs: u64,
+    token_issuer_key: Option<String>,
 ) -> Router {
     let state = AppState {
         db,
@@ -41,6 +45,7 @@ pub fn build_router(
         handoff,
         jwt_secret: jwt_secret.clone(),
         token_expiry_secs,
+        token_issuer_key: token_issuer_key.map(Arc::from),
     };
 
     Router::new()
@@ -75,9 +80,9 @@ async fn health_check() -> &'static str {
 
 #[derive(Deserialize)]
 struct TokenRequest {
-    /// User identifier — typically the SIP username@domain
+    /// User identifier the token is issued for (the JWT `sub`).
     user_id: String,
-    /// Shared secret for token creation (optional — if omitted or "auto", issued freely)
+    /// Must equal the configured `TOKEN_ISSUER_KEY`.
     #[serde(default)]
     api_key: Option<String>,
 }
@@ -88,15 +93,39 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+/// Whether `presented` matches the issuer key, compared in constant time.
+fn issuer_key_matches(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+/// Mint a JWT for `user_id`.
+///
+/// Only a trusted backend holding `TOKEN_ISSUER_KEY` may call this. A missing,
+/// empty, `"auto"` or wrong key gets 401; if no issuer key is configured the
+/// endpoint is disabled and answers 503.
 async fn create_token(
     State(state): State<AppState>,
-    Json(req): Json<TokenRequest>,
+    body: Result<Json<TokenRequest>, JsonRejection>,
 ) -> Result<Json<TokenResponse>, StatusCode> {
-    // If an API key is provided and it's not the placeholder "auto", verify it
-    if let Some(ref key) = req.api_key {
-        if key != "auto" && !key.is_empty() && key != &state.jwt_secret {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    let Some(expected) = state.token_issuer_key.as_deref() else {
+        tracing::warn!("token request refused: TOKEN_ISSUER_KEY is not configured");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+
+    let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let presented = req.api_key.as_deref().unwrap_or_default();
+    if presented.is_empty()
+        || presented.eq_ignore_ascii_case("auto")
+        || !issuer_key_matches(presented, expected)
+    {
+        tracing::warn!("token request refused: invalid api_key");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    if req.user_id.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let expiry = state.token_expiry_secs;
@@ -489,4 +518,120 @@ async fn transfer_call(
         })?;
 
     Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request};
+    use tower::ServiceExt;
+
+    const JWT_SECRET: &str = "test-jwt-secret";
+    const ISSUER_KEY: &str = "test-issuer-key-0123456789abcdef0123";
+
+    struct TestApp {
+        router: Router,
+    }
+
+    async fn test_app(issuer_key: Option<&str>) -> TestApp {
+        let db = Database::connect_in_memory().await.unwrap();
+        let handoff = Arc::new(HandoffManager::new());
+        let router = build_router(
+            db,
+            Arc::new(SipProxyManager::new()),
+            Arc::new(PushManager::new_noop()),
+            handoff,
+            JWT_SECRET.to_string(),
+            3600,
+            issuer_key.map(str::to_string),
+        );
+        TestApp { router }
+    }
+
+    impl TestApp {
+        async fn send(&self, req: Request<Body>) -> (StatusCode, String) {
+            let resp = self.router.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+
+        async fn post_json(&self, path: &str, body: serde_json::Value) -> (StatusCode, String) {
+            self.send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+        }
+    }
+
+    // ── Token minting ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn token_is_issued_for_the_correct_issuer_key() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (status, body) = app
+            .post_json(
+                "/v1/auth/token",
+                serde_json::json!({"user_id": "ext-1", "api_key": ISSUER_KEY}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["expires_in"], 3600);
+        let claims = auth::verify_token(json["token"].as_str().unwrap(), JWT_SECRET).unwrap();
+        assert_eq!(claims.sub, "ext-1");
+    }
+
+    #[tokio::test]
+    async fn token_is_refused_without_the_issuer_key() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        for body in [
+            serde_json::json!({"user_id": "ext-1"}),
+            serde_json::json!({"user_id": "ext-1", "api_key": null}),
+            serde_json::json!({"user_id": "ext-1", "api_key": ""}),
+            serde_json::json!({"user_id": "ext-1", "api_key": "auto"}),
+            serde_json::json!({"user_id": "ext-1", "api_key": "wrong"}),
+            serde_json::json!({"user_id": "ext-1", "api_key": &ISSUER_KEY[1..]}),
+            serde_json::json!({"user_id": "ext-1", "api_key": format!("{ISSUER_KEY}x")}),
+            // The JWT signing secret is no longer accepted as a key.
+            serde_json::json!({"user_id": "ext-1", "api_key": JWT_SECRET}),
+        ] {
+            let (status, _) = app.post_json("/v1/auth/token", body.clone()).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_is_disabled_without_a_configured_key() {
+        let app = test_app(None).await;
+        for key in ["", "auto", "anything", JWT_SECRET] {
+            let (status, _) = app
+                .post_json(
+                    "/v1/auth/token",
+                    serde_json::json!({"user_id": "ext-1", "api_key": key}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_requires_a_user_id() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (status, _) = app
+            .post_json(
+                "/v1/auth/token",
+                serde_json::json!({"user_id": "  ", "api_key": ISSUER_KEY}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

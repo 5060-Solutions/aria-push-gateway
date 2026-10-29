@@ -60,6 +60,28 @@ pub struct AuthConfig {
     /// Token expiry in seconds (default: 30 days)
     #[serde(default = "default_token_expiry")]
     pub token_expiry_secs: u64,
+    /// Shared key a trusted backend must present to `POST /v1/auth/token`.
+    /// Overridden by the `TOKEN_ISSUER_KEY` environment variable. When unset,
+    /// token minting is disabled.
+    #[serde(default)]
+    pub token_issuer_key: Option<String>,
+}
+
+impl AuthConfig {
+    /// The effective token-issuer key: `TOKEN_ISSUER_KEY` from the
+    /// environment if set, else the config value. Blank values and the old
+    /// `"auto"` placeholder count as unset.
+    pub fn resolve_token_issuer_key(&self) -> Option<String> {
+        let from_env = std::env::var("TOKEN_ISSUER_KEY").ok();
+        normalize_issuer_key(from_env.or_else(|| self.token_issuer_key.clone()))
+    }
+}
+
+fn normalize_issuer_key(key: Option<String>) -> Option<String> {
+    key.filter(|k| {
+        let k = k.trim();
+        !k.is_empty() && !k.eq_ignore_ascii_case("auto")
+    })
 }
 
 fn default_token_expiry() -> u64 {
@@ -95,7 +117,23 @@ impl GatewayConfig {
             auth: AuthConfig {
                 secret: "CHANGE-ME-IN-PRODUCTION".to_string(),
                 token_expiry_secs: default_token_expiry(),
+                token_issuer_key: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_and_placeholder_issuer_keys_count_as_unset() {
+        assert_eq!(normalize_issuer_key(None), None);
+        assert_eq!(normalize_issuer_key(Some(String::new())), None);
+        assert_eq!(normalize_issuer_key(Some("   ".into())), None);
+        assert_eq!(normalize_issuer_key(Some("auto".into())), None);
+        assert_eq!(normalize_issuer_key(Some("AUTO".into())), None);
+        assert_eq!(normalize_issuer_key(Some("k3y".into())), Some("k3y".into()));
     }
 }

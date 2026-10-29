@@ -57,6 +57,20 @@ impl Database {
         Ok(Self { pool })
     }
 
+    /// A private in-memory database (single connection, so it isn't lost).
+    #[cfg(test)]
+    pub async fn connect_in_memory() -> anyhow::Result<Self> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect("sqlite::memory:")
+            .await?;
+        let db = Self { pool };
+        db.migrate().await?;
+        Ok(db)
+    }
+
     pub async fn migrate(&self) -> anyhow::Result<()> {
         sqlx::query(
             r#"
