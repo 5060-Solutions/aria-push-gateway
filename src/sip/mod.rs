@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod resolver;
 pub mod rtp_relay;
 pub mod transaction;
+pub mod trust;
 pub mod validate;
 
 pub use proxy::{SipAccountConfig, SipProxyManager};

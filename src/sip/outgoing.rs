@@ -26,6 +26,7 @@ use super::digest::DigestAuth;
 use super::message;
 use super::proxy::{InviteSlot, OriginateRefusal, SipAccountConfig, SipProxyManager};
 use super::transaction::{T1, T2, TIMEOUT};
+use super::trust::SourcePolicy;
 use crate::handoff::{build_in_dialog_request, Dialog, HandoffManager};
 
 /// How long an outgoing call may ring before the gateway cancels it.
@@ -47,6 +48,8 @@ pub struct OutgoingInvite {
     pub owner_user_id: String,
     pub handoff: Arc<HandoffManager>,
     pub ring_timeout: Duration,
+    /// Who may answer: the server's resolved IPs plus the allowlist.
+    pub sources: SourcePolicy,
 }
 
 enum Event {
@@ -255,7 +258,7 @@ impl OutgoingInvite {
                 }
             };
 
-            if from != self.server_addr {
+            if !self.sources.admits(from) {
                 tracing::warn!(call_id = %self.call_id, %from, "Dropping SIP message from an unexpected source");
                 continue;
             }
@@ -332,6 +335,7 @@ impl OutgoingInvite {
                         ack,
                         &self.owner_user_id,
                         &self.sdp_offer,
+                        &self.sources,
                     )
                     .await;
                     if result.is_none() {
@@ -412,7 +416,7 @@ impl OutgoingInvite {
             let Ok(text) = std::str::from_utf8(&buf[..len]) else {
                 continue;
             };
-            let is_final_again = from == self.server_addr
+            let is_final_again = self.sources.admits(from)
                 && message::extract_cseq_method(text).as_deref() == Some("INVITE")
                 && message::parse_status_code(text).is_some_and(|s| s >= 300)
                 && message::extract_header(text, "CSeq")
@@ -439,7 +443,7 @@ impl OutgoingInvite {
             while let Ok(Ok((len, from))) =
                 tokio::time::timeout_at(retx_at, self.socket.recv_from(&mut buf)).await
             {
-                if from != self.server_addr {
+                if !self.sources.admits(from) {
                     continue;
                 }
                 let Ok(text) = std::str::from_utf8(&buf[..len]) else {

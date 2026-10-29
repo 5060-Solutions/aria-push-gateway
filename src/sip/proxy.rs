@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use super::digest::DigestAuth;
 use super::message;
 use super::resolver::SrvResolver;
+use super::trust::{SourcePolicy, TrustedSources};
 use crate::handoff::{CallOwner, HandoffManager, InviteDisposition};
 use crate::push::PushManager;
 
@@ -49,9 +50,9 @@ pub struct ProxyRegistration {
     config: SipAccountConfig,
     pub(crate) socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
-    /// Addresses the PBX/registrar resolved to; SIP traffic from anywhere
-    /// else is dropped.
-    peers: Vec<SocketAddr>,
+    /// Sources accepted on this registration: the IPs the registrar
+    /// resolved to plus the operator allowlist (any port).
+    peers: SourcePolicy,
     pub(crate) local_addr: SocketAddr,
     call_id: String,
     from_tag: String,
@@ -89,13 +90,19 @@ impl ProxyRegistration {
 
     /// Whether a packet from `from` may be processed on this registration.
     fn is_trusted_peer(&self, from: SocketAddr) -> bool {
-        self.peers.contains(&from)
+        self.peers.admits(from)
     }
 
-    /// Accept SIP traffic from `peer` too (tests only).
+    /// Accept SIP traffic from `peer`'s IP too (tests only).
     #[cfg(test)]
     pub(crate) fn trust_peer(&mut self, peer: SocketAddr) {
-        self.peers.push(peer);
+        self.peers.add_ip(peer.ip());
+    }
+
+    /// Replace the accepted sources (tests only).
+    #[cfg(test)]
+    pub(crate) fn set_sources(&mut self, sources: SourcePolicy) {
+        self.peers = sources;
     }
 
     /// The SIP domain of the account this registration belongs to.
@@ -134,7 +141,7 @@ impl ProxyRegistration {
             },
             socket,
             server_addr: local_addr,
-            peers: Vec::new(),
+            peers: SourcePolicy::default(),
             local_addr,
             call_id: String::new(),
             from_tag: String::new(),
@@ -248,6 +255,8 @@ pub struct SipProxyManager {
     ring_timeout: Duration,
     /// When registrations refresh; shortened in tests.
     refresh_after: Duration,
+    /// Operator allowlist of SIP sources (`TRUSTED_SIP_SOURCES`).
+    trusted: Arc<TrustedSources>,
 }
 
 impl SipProxyManager {
@@ -260,7 +269,14 @@ impl SipProxyManager {
             next_invite_id: std::sync::atomic::AtomicU64::new(0),
             ring_timeout: super::outgoing::RING_TIMEOUT,
             refresh_after: REFRESH_AFTER,
+            trusted: Arc::default(),
         }
+    }
+
+    /// Also accept SIP from these IPs/CIDRs on every socket.
+    pub fn with_trusted_sources(mut self, trusted: TrustedSources) -> Self {
+        self.trusted = Arc::new(trusted);
+        self
     }
 
     /// Shorten the registration refresh interval (tests only).
@@ -372,7 +388,7 @@ impl SipProxyManager {
             config,
             socket: socket.clone(),
             server_addr,
-            peers: resolved.iter().map(|r| r.addr).collect(),
+            peers: SourcePolicy::new(resolved.iter().map(|r| r.addr.ip()), self.trusted.clone()),
             local_addr,
             call_id,
             from_tag,
@@ -1003,6 +1019,7 @@ impl SipProxyManager {
             owner_user_id: owner_user_id.to_string(),
             handoff,
             ring_timeout: self.ring_timeout,
+            sources: SourcePolicy::new(resolved.iter().map(|r| r.addr.ip()), self.trusted.clone()),
         };
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -1029,6 +1046,7 @@ impl SipProxyManager {
         ack: String,
         owner_user_id: &str,
         local_sdp: &str,
+        sources: &SourcePolicy,
     ) -> String {
         let call_token = uuid::Uuid::new_v4().to_string();
         let proxy_reg = Arc::new(RwLock::new(ProxyRegistration {
@@ -1036,7 +1054,7 @@ impl SipProxyManager {
             config: account.clone(),
             socket: socket.clone(),
             server_addr,
-            peers: vec![server_addr],
+            peers: sources.clone(),
             local_addr,
             call_id: call_id.to_string(),
             from_tag: from_tag.to_string(),
@@ -1071,7 +1089,7 @@ impl SipProxyManager {
         tracing::info!(call_id = %call_id, "Outgoing call connected");
         Self::spawn_outgoing_call_loop(
             socket.clone(),
-            server_addr,
+            sources.clone(),
             handoff.clone(),
             call_id.to_string(),
             ended,
@@ -1089,7 +1107,7 @@ impl SipProxyManager {
     /// its socket don't outlive the call.
     fn spawn_outgoing_call_loop(
         socket: Arc<UdpSocket>,
-        peer: SocketAddr,
+        sources: SourcePolicy,
         handoff: Arc<HandoffManager>,
         call_id: String,
         mut ended: tokio::sync::oneshot::Receiver<()>,
@@ -1140,7 +1158,7 @@ impl SipProxyManager {
                 let Ok(text) = std::str::from_utf8(&buf[..len]) else {
                     continue;
                 };
-                if from != peer {
+                if !sources.admits(from) {
                     tracing::warn!(call_id = %call_id, %from, "Dropping SIP message from an unexpected source");
                     continue;
                 }
@@ -1200,6 +1218,12 @@ Content-Length: 0\r\n\r\n";
     /// An active outgoing call whose receive loop is running, with a UDP
     /// socket standing in for the PBX.
     async fn outgoing_call() -> OutgoingCall {
+        outgoing_call_trusting(None).await
+    }
+
+    /// An outgoing call whose loop trusts `trusted` (default: the fake
+    /// PBX's own IP).
+    async fn outgoing_call_trusting(trusted: Option<SourcePolicy>) -> OutgoingCall {
         let handoff = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1222,9 +1246,11 @@ Content-Length: 0\r\n\r\n";
                 "sip:gw@127.0.0.1".into(),
             )
             .await;
+        let sources = trusted
+            .unwrap_or_else(|| SourcePolicy::new([pbx.local_addr().unwrap().ip()], Arc::default()));
         let recv_loop = SipProxyManager::spawn_outgoing_call_loop(
             gw,
-            pbx.local_addr().unwrap(),
+            sources,
             handoff.clone(),
             "out-call-1".into(),
             ended,
@@ -1462,6 +1488,9 @@ Content-Length: 0\r\n\r\n";
     #[tokio::test]
     async fn requests_from_foreign_sources_are_dropped() {
         let r = registered_with_call().await;
+        // A foreign IP (TEST-NET-1); loopback aliases aren't available on
+        // every host, and a dropped message is never answered anyway.
+        let foreign: SocketAddr = "192.0.2.66:5060".parse().unwrap();
 
         for msg in [
             INBOUND_INVITE.to_string(),
@@ -1469,16 +1498,43 @@ Content-Length: 0\r\n\r\n";
             refer_notify("out-call-1"),
             options().to_string(),
         ] {
-            SipProxyManager::handle_message(&r.reg, &msg, r.foreign_addr)
+            SipProxyManager::handle_message(&r.reg, &msg, foreign)
                 .await
                 .unwrap();
         }
-        nothing_arrives(&r.foreign).await;
         nothing_arrives(&r.pbx).await;
         assert_eq!(r.handoff.pending_count().await, 0, "no call may be offered");
         assert!(r.handoff.is_call_active("out-call-1").await);
 
-        // The same OPTIONS from the PBX is answered.
+        // The PBX's IP is trusted on any source port.
+        SipProxyManager::handle_message(&r.reg, options(), r.foreign_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.foreign).await.starts_with("SIP/2.0 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn loopback_is_dropped_unless_resolved_or_allowlisted() {
+        let r = registered_with_call().await;
+        let policy = |allow: &str| {
+            SourcePolicy::new(
+                ["192.0.2.1".parse().unwrap()],
+                Arc::new(TrustedSources::parse(allow).unwrap()),
+            )
+        };
+
+        // Only 192.0.2.1 is trusted: the loopback PBX is dropped.
+        r.reg.write().await.set_sources(policy(""));
+        SipProxyManager::handle_message(&r.reg, options(), r.pbx_addr)
+            .await
+            .unwrap();
+        nothing_arrives(&r.pbx).await;
+
+        // An allowlisted CIDR admits it.
+        r.reg
+            .write()
+            .await
+            .set_sources(policy("10.0.0.0/8, 127.0.0.0/8"));
         SipProxyManager::handle_message(&r.reg, options(), r.pbx_addr)
             .await
             .unwrap();
@@ -1532,14 +1588,28 @@ Content-Length: 0\r\n\r\n";
 
     #[tokio::test]
     async fn outgoing_loop_drops_foreign_sources() {
-        let call = outgoing_call().await;
-        let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        foreign
+        // The dialled server is 192.0.2.1: our loopback "PBX" is foreign.
+        let call = outgoing_call_trusting(Some(SourcePolicy::new(
+            ["192.0.2.1".parse().unwrap()],
+            Arc::default(),
+        )))
+        .await;
+        call.pbx
             .send_to(bye("out-call-1").as_bytes(), call.gw_addr)
             .await
             .unwrap();
-        nothing_arrives(&foreign).await;
+        nothing_arrives(&call.pbx).await;
         assert!(call.handoff.is_call_active("out-call-1").await);
+        call.recv_loop.abort();
+
+        // From the server's IP, any port is accepted.
+        let call = outgoing_call().await;
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        other_port
+            .send_to(bye("out-call-1").as_bytes(), call.gw_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&other_port).await.starts_with("SIP/2.0 200 OK"));
         call.recv_loop.abort();
     }
 

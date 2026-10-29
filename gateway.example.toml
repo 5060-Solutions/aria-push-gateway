@@ -23,6 +23,15 @@ token_expiry_secs = 2592000
 # the token endpoint refuses every request (503).
 # token_issuer_key = "CHANGE-ME-TO-A-DIFFERENT-STRONG-RANDOM-KEY"
 
+[sip]
+# SIP is accepted only from the IPs each registrar (or dialled server)
+# resolves to, on any port. If the PBX sends from other addresses — a
+# floating/reserved IP whose packets leave from the droplet's own IP, a host
+# with several addresses, or several proxy nodes — list them here as
+# comma-separated IPs/CIDRs. The TRUSTED_SIP_SOURCES environment variable
+# overrides this.
+# trusted_sources = "10.10.0.0/16, 203.0.113.7"
+
 # ── Push Notification Providers ──────────────────────────────────────────────
 
 # Apple Push Notification Service (iOS)

@@ -71,7 +71,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Database ready");
 
     // Initialize SIP proxy manager
-    let sip_proxy = Arc::new(sip::SipProxyManager::new());
+    let trusted_sources = config
+        .sip
+        .resolve_trusted_sources()
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+    if !trusted_sources.is_empty() {
+        tracing::info!(?trusted_sources, "Extra trusted SIP sources");
+    }
+    let sip_proxy = Arc::new(sip::SipProxyManager::new().with_trusted_sources(trusted_sources));
 
     // Initialize push notification clients
     let push_manager = Arc::new(push::PushManager::new(&config.push)?);

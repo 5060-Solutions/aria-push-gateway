@@ -6,6 +6,37 @@ pub struct GatewayConfig {
     pub database: DatabaseConfig,
     pub push: PushConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub sip: SipConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SipConfig {
+    /// Extra IPs/CIDRs (comma-separated) allowed to send SIP, besides the
+    /// addresses each registrar resolves to. Overridden by the
+    /// `TRUSTED_SIP_SOURCES` environment variable.
+    #[serde(default)]
+    pub trusted_sources: Option<String>,
+}
+
+impl SipConfig {
+    /// The allowlist: `TRUSTED_SIP_SOURCES` if set and non-blank, else the
+    /// config value. Invalid entries are an error (refuse to start).
+    pub fn resolve_trusted_sources(&self) -> anyhow::Result<crate::sip::trust::TrustedSources> {
+        self.trusted_sources_from(std::env::var("TRUSTED_SIP_SOURCES").ok())
+    }
+
+    fn trusted_sources_from(
+        &self,
+        env: Option<String>,
+    ) -> anyhow::Result<crate::sip::trust::TrustedSources> {
+        let list = env
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| self.trusted_sources.clone())
+            .unwrap_or_default();
+        crate::sip::trust::TrustedSources::parse(&list)
+            .map_err(|e| anyhow::anyhow!("TRUSTED_SIP_SOURCES: {e}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +186,7 @@ impl GatewayConfig {
                 apns: None,
                 fcm: None,
             },
+            sip: SipConfig::default(),
             auth: AuthConfig {
                 secret: PLACEHOLDER_JWT_SECRET.to_string(),
                 token_expiry_secs: default_token_expiry(),
@@ -227,6 +259,27 @@ mod tests {
         assert!(a.check_issuer_key(Some(&format!(" {secret} "))).is_err());
         assert!(a.check_issuer_key(Some("different-key")).is_ok());
         assert!(a.check_issuer_key(None).is_ok());
+    }
+
+    #[test]
+    fn trusted_sources_come_from_env_or_config() {
+        let cfg = SipConfig {
+            trusted_sources: Some("10.0.0.0/8".into()),
+        };
+        let ip = |s: &str| s.parse().unwrap();
+        let from_cfg = cfg.trusted_sources_from(None).unwrap();
+        assert!(from_cfg.contains(ip("10.1.2.3")));
+        let blank_env = cfg.trusted_sources_from(Some("  ".into())).unwrap();
+        assert!(blank_env.contains(ip("10.1.2.3")));
+        let from_env = cfg
+            .trusted_sources_from(Some("192.0.2.0/24".into()))
+            .unwrap();
+        assert!(from_env.contains(ip("192.0.2.9")) && !from_env.contains(ip("10.1.2.3")));
+        assert!(cfg.trusted_sources_from(Some("nope".into())).is_err());
+        assert!(SipConfig::default()
+            .trusted_sources_from(None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
