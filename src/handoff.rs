@@ -403,6 +403,28 @@ pub fn build_refer(
     build_in_dialog_request("REFER", dialog, cseq, local_addr, branch, &extra)
 }
 
+/// Decode `%XX` escapes (invalid escapes are kept as-is).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Maximum accepted length of a transfer target, in bytes.
 const MAX_TARGET_LEN: usize = 256;
 
@@ -496,11 +518,13 @@ impl TransferTarget {
         if rest.matches('@').count() > 1 {
             return Err("target URI is malformed");
         }
-        if rest
-            .split(';')
-            .skip(1)
-            .any(|p| p.to_ascii_lowercase().starts_with("method="))
-        {
+        // Parameters are compared after percent-decoding, so `%6dethod=BYE`
+        // can't slip a method parameter past the check.
+        if rest.split(';').skip(1).any(|p| {
+            let decoded = percent_decode(p).to_ascii_lowercase();
+            let name = decoded.split('=').next().unwrap_or_default().trim();
+            name == "method"
+        }) {
             return Err("target URI must not carry a method parameter");
         }
         Ok(target.to_string())
@@ -2161,6 +2185,10 @@ Content-Length: 0\r\n\r\n";
             "sip:a@b?Replaces=abc",
             "sip:a@b;method=BYE",
             "sip:a@b;METHOD=INVITE",
+            "sip:a@b;%6dethod=BYE",
+            "sip:a@b;%4D%45%54%48%4F%44=BYE",
+            "sip:a@b;user=phone;meth%6Fd=BYE",
+            "sip:a@b;method",
             "sip:a%0d%0aX@b",
             "sip:a%0A@b",
             "sip:a%3e@b",
