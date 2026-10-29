@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use super::digest::DigestAuth;
 use super::message;
 use super::resolver::SrvResolver;
-use crate::handoff::{CallOwner, HandoffManager};
+use crate::handoff::{CallOwner, HandoffManager, InviteDisposition};
 use crate::push::PushManager;
 
 /// SIP account configuration received from mobile devices.
@@ -518,177 +518,116 @@ impl SipProxyManager {
         text: &str,
         from: SocketAddr,
     ) -> anyhow::Result<()> {
+        let (handoff, socket) = {
+            let r = reg.read().await;
+            (r.handoff.clone(), r.socket.clone())
+        };
+        Self::handle_request_on(&handoff, &socket, Some(reg), text, from).await
+    }
+
+    /// Handle a request from the trusted peer `from` on `socket`. `reg` is
+    /// the registration that owns the socket; it is `None` for an outgoing
+    /// call's own socket, which only carries that call's dialog.
+    async fn handle_request_on(
+        handoff: &Arc<HandoffManager>,
+        socket: &Arc<UdpSocket>,
+        reg: Option<&Arc<RwLock<ProxyRegistration>>>,
+        text: &str,
+        from: SocketAddr,
+    ) -> anyhow::Result<()> {
         let method = message::extract_method(text).unwrap_or_default();
+        let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
+        let in_dialog = message::extract_to_tag(text).is_some();
+
+        // A retransmitted non-INVITE request we already answered gets the
+        // same response again rather than being processed twice.
+        if method != "ACK" && method != "INVITE" {
+            if let Some(resp) = handoff.server_transactions().replay(socket, text) {
+                socket.send_to(resp.as_bytes(), from).await?;
+                return Ok(());
+            }
+        }
 
         match method.as_str() {
-            "INVITE" => {
-                tracing::info!("Incoming INVITE for proxy device");
-
-                // Send 100 Trying immediately
-                if let Some(trying) = message::build_100_trying(text) {
-                    let r = reg.read().await;
-                    r.socket.send_to(trying.as_bytes(), from).await?;
-                }
-
-                // Extract caller info
-                let (caller_user, caller_domain) =
-                    message::extract_from_uri(text).unwrap_or(("unknown".into(), "unknown".into()));
-                let caller_name = message::extract_display_name(text);
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-
-                let (device_id, push_mgr, handoff) = {
-                    let r = reg.read().await;
-                    (
-                        r.device_id.clone(),
-                        r.push_manager.clone(),
-                        r.handoff.clone(),
-                    )
-                };
-
-                // Create a handoff token for this INVITE
-                // SDP passes through unchanged — phone talks directly to PBX relay
-                let call_token = handoff
-                    .create_pending_call(
-                        device_id.clone(),
-                        call_id,
-                        text.to_string(),
-                        from,
-                        reg.clone(),
-                        None, // no RTP relay — SDP pass-through
-                        String::new(),
-                        0,
-                        0,
-                    )
-                    .await;
-
-                tracing::info!(
-                    device = %device_id,
-                    caller = %format!("{}@{}", caller_user, caller_domain),
-                    token = %call_token,
-                    "Sending push notification for incoming call"
-                );
-
-                // Send push notification
-                push_mgr
-                    .send_incoming_call(
-                        &device_id,
-                        &call_token,
-                        &format!("{}@{}", caller_user, caller_domain),
-                        caller_name.as_deref(),
-                    )
-                    .await?;
-            }
             "ACK" => {
-                // ACK for an active call (after 200 OK)
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                let handoff = {
-                    let r = reg.read().await;
-                    r.handoff.clone()
-                };
-                handoff.handle_ack(&call_id).await;
+                handoff.handle_ack(text, socket).await;
             }
-            "BYE" => {
-                // BYE from PBX — end the active call
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                let (handoff, socket) = {
-                    let r = reg.read().await;
-                    (r.handoff.clone(), r.socket.clone())
+            "INVITE" if in_dialog => {
+                if handoff.handle_reinvite(text, from, socket).await.is_none() {
+                    tracing::debug!(call_id = %call_id, "re-INVITE for an unknown dialog — 481");
+                    Self::reply(socket, message::build_481(text), from).await?;
+                }
+            }
+            "INVITE" => {
+                let Some(reg) = reg else {
+                    Self::reply(socket, message::build_481(text), from).await?;
+                    return Ok(());
                 };
-
-                match handoff
-                    .handle_bye_from_pbx(&call_id, text, from, &socket)
-                    .await
-                {
-                    Ok(Some(owner)) => {
-                        tracing::info!(
-                            owner = %owner,
-                            call_id = %call_id,
-                            "Call ended by PBX"
-                        );
-                        // Could send a push notification here to notify the app
+                match handoff.classify_invite(text, socket).await {
+                    InviteDisposition::Retransmission(resp) => {
+                        tracing::debug!(call_id = %call_id, "INVITE retransmission — repeating our response");
+                        socket.send_to(resp.as_bytes(), from).await?;
                     }
-                    Ok(None) => {
-                        tracing::debug!(call_id = %call_id, "BYE for unknown call — sending 481");
-                        Self::reply_481(reg, text, from).await?;
+                    InviteDisposition::Merged => {
+                        tracing::warn!(call_id = %call_id, "INVITE for a Call-ID already in use — 482");
+                        let resp = message::build_simple_response(text, 482, "Loop Detected");
+                        if let Some(resp) = resp {
+                            handoff
+                                .server_transactions()
+                                .send_final(socket, from, text, resp);
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(call_id = %call_id, "Error handling BYE: {}", e);
+                    InviteDisposition::New => {
+                        Self::offer_incoming_call(reg, handoff, socket, text, from).await?;
                     }
                 }
             }
+            "BYE" => match handoff
+                .handle_bye_from_pbx(&call_id, text, from, socket)
+                .await
+            {
+                Ok(Some(owner)) => {
+                    tracing::info!(owner = %owner, call_id = %call_id, "Call ended by PBX");
+                }
+                Ok(None) => {
+                    tracing::debug!(call_id = %call_id, "BYE for unknown call — sending 481");
+                    Self::reply(socket, message::build_481(text), from).await?;
+                }
+                Err(e) => {
+                    tracing::error!(call_id = %call_id, "Error handling BYE: {}", e);
+                }
+            },
             "CANCEL" => {
-                // CANCEL from PBX — caller hung up before answer
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                tracing::info!(call_id = %call_id, "CANCEL received — caller hung up");
-
-                // Clean up the pending call so the mobile app can't accept it
-                let handoff = {
-                    let r = reg.read().await;
-                    r.handoff.clone()
-                };
-                handoff.handle_cancel(&call_id).await;
-
-                // Respond with 200 OK to the CANCEL
-                let r = reg.read().await;
-                let response = format!(
-                    "SIP/2.0 200 OK\r\n\
-                     {}\
-                     Content-Length: 0\r\n\r\n",
-                    Self::echo_headers(text),
-                );
-                r.socket.send_to(response.as_bytes(), from).await?;
-
-                // Send 487 Request Terminated for the original INVITE
-                let via = message::extract_header(text, "Via").unwrap_or_default();
-                let cancel_from = message::extract_header(text, "From").unwrap_or_default();
-                let cancel_to = message::extract_header(text, "To").unwrap_or_default();
-                let cseq_val = message::extract_header(text, "CSeq")
-                    .unwrap_or_default()
-                    .replace("CANCEL", "INVITE");
-
-                let terminated = format!(
-                    "SIP/2.0 487 Request Terminated\r\n\
-                     Via: {via}\r\n\
-                     From: {cancel_from}\r\n\
-                     To: {cancel_to}\r\n\
-                     Call-ID: {call_id}\r\n\
-                     CSeq: {cseq_val}\r\n\
-                     Content-Length: 0\r\n\r\n"
-                );
-                r.socket.send_to(terminated.as_bytes(), from).await?;
-            }
-            "OPTIONS" => {
-                // Respond to keepalive OPTIONS
-                let r = reg.read().await;
-                let response = format!(
-                    "SIP/2.0 200 OK\r\n\
-                     {}\
-                     Content-Length: 0\r\n\r\n",
-                    Self::echo_headers(text),
-                );
-                r.socket.send_to(response.as_bytes(), from).await?;
+                tracing::info!(call_id = %call_id, "CANCEL received");
+                handoff.answer_cancel(text, from, socket).await?;
             }
             "NOTIFY" => {
                 // An in-dialog NOTIFY (refer progress) must match one of this
                 // socket's dialogs, else 481. Out-of-dialog NOTIFYs from the
-                // PBX (e.g. unsolicited MWI) are acknowledged and ignored.
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                let (handoff, socket) = {
-                    let r = reg.read().await;
-                    (r.handoff.clone(), r.socket.clone())
-                };
-                let matched = message::extract_to_tag(text).is_none()
-                    || handoff.handle_notify_on(&call_id, text, &socket).await;
-                if matched {
-                    let response = format!(
-                        "SIP/2.0 200 OK\r\n\
-                         {}\
-                         Content-Length: 0\r\n\r\n",
-                        Self::echo_headers(text),
-                    );
-                    socket.send_to(response.as_bytes(), from).await?;
+                // registrar (e.g. unsolicited MWI) are acknowledged and ignored.
+                let matched = if in_dialog {
+                    handoff.handle_notify_on(&call_id, text, socket).await
                 } else {
-                    Self::reply_481(reg, text, from).await?;
+                    reg.is_some()
+                };
+                let resp = if matched {
+                    message::build_simple_response(text, 200, "OK")
+                } else {
+                    message::build_481(text)
+                };
+                if let Some(resp) = resp {
+                    handoff
+                        .server_transactions()
+                        .remember(socket, text, &resp, from);
+                    socket.send_to(resp.as_bytes(), from).await?;
+                }
+            }
+            "OPTIONS" => {
+                if let Some(resp) = message::build_simple_response(text, 200, "OK") {
+                    handoff
+                        .server_transactions()
+                        .remember(socket, text, &resp, from);
+                    socket.send_to(resp.as_bytes(), from).await?;
                 }
             }
             _ => {
@@ -696,6 +635,66 @@ impl SipProxyManager {
             }
         }
 
+        Ok(())
+    }
+
+    async fn reply(socket: &UdpSocket, resp: Option<String>, to: SocketAddr) -> anyhow::Result<()> {
+        if let Some(resp) = resp {
+            socket.send_to(resp.as_bytes(), to).await?;
+        }
+        Ok(())
+    }
+
+    /// A new incoming call: answer 100 Trying, hold the INVITE pending and
+    /// push the device.
+    async fn offer_incoming_call(
+        reg: &Arc<RwLock<ProxyRegistration>>,
+        handoff: &Arc<HandoffManager>,
+        socket: &Arc<UdpSocket>,
+        text: &str,
+        from: SocketAddr,
+    ) -> anyhow::Result<()> {
+        tracing::info!("Incoming INVITE for proxy device");
+        Self::reply(socket, message::build_100_trying(text), from).await?;
+
+        let (caller_user, caller_domain) =
+            message::extract_from_uri(text).unwrap_or(("unknown".into(), "unknown".into()));
+        let caller_name = message::extract_display_name(text);
+        let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
+        let (device_id, push_mgr) = {
+            let r = reg.read().await;
+            (r.device_id.clone(), r.push_manager.clone())
+        };
+
+        // SDP passes through unchanged — phone talks directly to PBX relay
+        let call_token = handoff
+            .create_pending_call(
+                device_id.clone(),
+                call_id,
+                text.to_string(),
+                from,
+                reg.clone(),
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+
+        tracing::info!(
+            device = %device_id,
+            caller = %format!("{}@{}", caller_user, caller_domain),
+            token = %call_token,
+            "Sending push notification for incoming call"
+        );
+        push_mgr
+            .send_incoming_call(
+                &device_id,
+                &call_token,
+                &format!("{}@{}", caller_user, caller_domain),
+                caller_name.as_deref(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -1105,6 +1104,8 @@ impl SipProxyManager {
                             server_addr,
                             proxy_reg,
                             None,
+                            sdp_offer.to_string(),
+                            format!("sip:{username}@{local_ip}:{local_port};transport=udp"),
                         )
                         .await;
 
@@ -1274,44 +1275,10 @@ impl SipProxyManager {
                 }
 
                 if message::is_request(text) {
-                    let method = message::extract_method(text).unwrap_or_default();
-                    let cid = message::extract_header(text, "Call-ID").unwrap_or_default();
-                    match method.as_str() {
-                        "BYE" => {
-                            // Ends the call and answers 200 OK if it is active.
-                            match handoff.handle_bye_from_pbx(&cid, text, from, &socket).await {
-                                Ok(Some(_)) => {
-                                    tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
-                                }
-                                Ok(None) => {
-                                    tracing::debug!(call_id = %cid, "BYE for unknown call — sending 481");
-                                    if let Some(resp) = message::build_481(text) {
-                                        let _ = socket.send_to(resp.as_bytes(), from).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(call_id = %cid, "Error handling BYE: {}", e);
-                                }
-                            }
-                        }
-                        "NOTIFY" => {
-                            let response = if handoff.handle_notify_on(&cid, text, &socket).await {
-                                Some(format!(
-                                    "SIP/2.0 200 OK\r\n\
-                                     {}\
-                                     Content-Length: 0\r\n\r\n",
-                                    Self::echo_headers(text),
-                                ))
-                            } else {
-                                message::build_481(text)
-                            };
-                            if let Some(response) = response {
-                                let _ = socket.send_to(response.as_bytes(), from).await;
-                            }
-                        }
-                        _ => {
-                            tracing::debug!("Outgoing call recv loop: ignoring {} request", method);
-                        }
+                    if let Err(e) =
+                        Self::handle_request_on(&handoff, &socket, None, text, from).await
+                    {
+                        tracing::warn!(call_id = %call_id, "Error handling SIP request: {}", e);
                     }
                 } else if message::extract_cseq_method(text).as_deref() == Some("REFER") {
                     handoff.handle_refer_response_on(text, &socket).await;
@@ -1381,30 +1348,6 @@ impl SipProxyManager {
              Content-Length: 0\r\n\r\n"
         )
     }
-
-    /// Answer `request` with 481 Call/Transaction Does Not Exist.
-    async fn reply_481(
-        reg: &Arc<RwLock<ProxyRegistration>>,
-        request: &str,
-        to: SocketAddr,
-    ) -> anyhow::Result<()> {
-        if let Some(resp) = message::build_481(request) {
-            let socket = reg.read().await.socket.clone();
-            socket.send_to(resp.as_bytes(), to).await?;
-        }
-        Ok(())
-    }
-
-    /// Echo Via/From/To/Call-ID/CSeq headers for simple responses.
-    fn echo_headers(msg: &str) -> String {
-        let mut out = String::new();
-        for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
-            if let Some(val) = message::extract_header(msg, name) {
-                out.push_str(&format!("{}: {}\r\n", name, val));
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -1450,6 +1393,8 @@ Content-Length: 0\r\n\r\n";
                 pbx.local_addr().unwrap(),
                 reg,
                 None,
+                "v=0\r\n".into(),
+                "sip:gw@127.0.0.1".into(),
             )
             .await;
         let recv_loop = SipProxyManager::spawn_outgoing_call_loop(
@@ -1565,6 +1510,8 @@ Content-Length: 0\r\n\r\n";
                 pbx_addr,
                 reg.clone(),
                 None,
+                "v=0\r\n".into(),
+                "sip:gw@127.0.0.1".into(),
             )
             .await;
 
@@ -1574,12 +1521,19 @@ Content-Length: 0\r\n\r\n";
             .unwrap();
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 481 "));
 
-        // First BYE ends the call with 200; a retransmission gets 481.
+        // First BYE ends the call with 200; its retransmission gets the
+        // same 200 again, and a new BYE for the ended call gets 481.
         SipProxyManager::handle_request(&reg, &bye("out-call-1"), pbx_addr)
             .await
             .unwrap();
-        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK\r\n"));
+        let ok = recv_text(&pbx).await;
+        assert!(ok.starts_with("SIP/2.0 200 OK\r\n"));
         SipProxyManager::handle_request(&reg, &bye("out-call-1"), pbx_addr)
+            .await
+            .unwrap();
+        assert_eq!(recv_text(&pbx).await, ok);
+        let new_bye = bye("out-call-1").replace("z9hG4bK-bye", "z9hG4bK-bye2");
+        SipProxyManager::handle_request(&reg, &new_bye, pbx_addr)
             .await
             .unwrap();
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 481 "));
@@ -1617,6 +1571,8 @@ Content-Length: 0\r\n\r\n";
                 pbx_addr,
                 reg.clone(),
                 None,
+                "v=0\r\n".into(),
+                "sip:gw@127.0.0.1".into(),
             )
             .await;
         Registered {
@@ -1750,5 +1706,282 @@ Content-Length: 0\r\n\r\n";
         nothing_arrives(&foreign).await;
         assert!(call.handoff.is_call_active("out-call-1").await);
         call.recv_loop.abort();
+    }
+
+    // ── INVITE server transactions ──────────────────────────────────────────
+
+    struct Ringing {
+        handoff: Arc<HandoffManager>,
+        reg: Arc<RwLock<ProxyRegistration>>,
+        pbx: UdpSocket,
+        pbx_addr: SocketAddr,
+        invite: String,
+        token: String,
+    }
+
+    fn incoming_invite(branch: &str) -> String {
+        let sdp = "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 0\r\n";
+        format!(
+            "INVITE sip:1001@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch={branch}\r\n\
+             Via: SIP/2.0/UDP 10.9.9.9:5060;branch=z9hG4bK-upstream\r\n\
+             Record-Route: <sip:edge.example.com;lr>\r\n\
+             From: \"Bob\" <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+             To: <sip:1001@pbx.example.com>\r\n\
+             Call-ID: in-1\r\nCSeq: 10 INVITE\r\n\
+             Contact: <sip:2000@127.0.0.1:5060>\r\n\
+             Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+            sdp.len()
+        )
+    }
+
+    /// An incoming call ringing on a registration that trusts the fake PBX;
+    /// the 100 Trying has been consumed.
+    async fn ringing() -> Ringing {
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_addr = pbx.local_addr().unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut r = ProxyRegistration::for_test(gw, "pbx.example.com", handoff.clone());
+        r.trust_peer(pbx_addr);
+        let reg = Arc::new(RwLock::new(r));
+        let invite = incoming_invite("z9hG4bK-in1");
+        // The no-op push manager fails to push; the call is still offered.
+        let _ = SipProxyManager::handle_message(&reg, &invite, pbx_addr).await;
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 100 Trying"));
+        let token = handoff.pending_token("in-1").await.unwrap();
+        Ringing {
+            handoff,
+            reg,
+            pbx,
+            pbx_addr,
+            invite,
+            token,
+        }
+    }
+
+    fn ack_for(response: &str, branch: &str) -> String {
+        let h = |n: &str| message::extract_header(response, n).unwrap();
+        format!(
+            "ACK sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch={branch}\r\n\
+             From: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: {} ACK\r\n\
+             Content-Length: 0\r\n\r\n",
+            h("From"),
+            h("To"),
+            h("Call-ID"),
+            h("CSeq").split_whitespace().next().unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn invite_retransmission_is_not_a_new_call() {
+        let r = ringing().await;
+        let _ = SipProxyManager::handle_message(&r.reg, &r.invite, r.pbx_addr).await;
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 100 Trying"));
+        assert_eq!(r.handoff.pending_count().await, 1);
+
+        // Same Call-ID on a different transaction: merged request.
+        let merged = incoming_invite("z9hG4bK-other");
+        let _ = SipProxyManager::handle_message(&r.reg, &merged, r.pbx_addr).await;
+        let resp = recv_text(&r.pbx).await;
+        assert!(resp.starts_with("SIP/2.0 482 Loop Detected"), "{resp}");
+        assert_eq!(r.handoff.pending_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn answered_call_retransmits_200_until_ack_and_repeats_it_for_retransmissions() {
+        let r = ringing().await;
+        r.handoff
+            .accept_call(
+                &r.token,
+                "v=0\r\nc=IN IP4 10.1.1.1\r\nm=audio 5000 RTP/AVP 0\r\n".into(),
+            )
+            .await
+            .unwrap();
+        let ok = recv_text(&r.pbx).await;
+        assert!(ok.starts_with("SIP/2.0 200 OK\r\n"));
+        // All Vias in order, Record-Route echoed, our tag on To.
+        let vias: Vec<&str> = ok.lines().filter(|l| l.starts_with("Via:")).collect();
+        assert_eq!(vias.len(), 2);
+        assert!(vias[0].contains("z9hG4bK-in1") && vias[1].contains("z9hG4bK-upstream"));
+        assert!(ok.contains("Record-Route: <sip:edge.example.com;lr>\r\n"));
+        assert!(message::extract_to_tag(&ok).is_some());
+
+        // Unacknowledged: retransmitted.
+        assert_eq!(recv_text(&r.pbx).await, ok);
+        // A retransmitted INVITE gets the same 200.
+        let _ = SipProxyManager::handle_message(&r.reg, &r.invite, r.pbx_addr).await;
+        assert_eq!(recv_text(&r.pbx).await, ok);
+        // The ACK stops the retransmissions.
+        SipProxyManager::handle_message(&r.reg, &ack_for(&ok, "z9hG4bK-ack"), r.pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut buf = [0u8; 4096];
+        while r.pbx.try_recv(&mut buf).is_ok() {}
+        nothing_arrives(&r.pbx).await;
+    }
+
+    #[tokio::test]
+    async fn reinvite_is_answered_in_the_dialog_without_a_new_call() {
+        let r = ringing().await;
+        let answer = "v=0\r\nc=IN IP4 10.1.1.1\r\nm=audio 5000 RTP/AVP 0\r\n";
+        r.handoff
+            .accept_call(&r.token, answer.into())
+            .await
+            .unwrap();
+        let ok = recv_text(&r.pbx).await;
+        let our_tag = message::extract_to_tag(&ok).unwrap();
+
+        // While the 200 is unacknowledged, a re-INVITE gets 491.
+        let reinvite = |cseq: u32, branch: &str| {
+            incoming_invite(branch)
+                .replace(
+                    "To: <sip:1001@pbx.example.com>",
+                    &format!("To: <sip:1001@pbx.example.com>;tag={our_tag}"),
+                )
+                .replace("CSeq: 10 INVITE", &format!("CSeq: {cseq} INVITE"))
+        };
+        let _ =
+            SipProxyManager::handle_message(&r.reg, &reinvite(11, "z9hG4bK-re1"), r.pbx_addr).await;
+        let mut resp = recv_text(&r.pbx).await;
+        while resp == ok {
+            resp = recv_text(&r.pbx).await;
+        }
+        assert!(resp.starts_with("SIP/2.0 491 "), "{resp}");
+
+        SipProxyManager::handle_message(&r.reg, &ack_for(&ok, "z9hG4bK-ack"), r.pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut buf = [0u8; 4096];
+        while r.pbx.try_recv(&mut buf).is_ok() {}
+
+        // Now a session-refresh re-INVITE gets 200 with our current SDP.
+        let _ =
+            SipProxyManager::handle_message(&r.reg, &reinvite(12, "z9hG4bK-re2"), r.pbx_addr).await;
+        let ok2 = recv_text(&r.pbx).await;
+        assert!(ok2.starts_with("SIP/2.0 200 OK\r\n"), "{ok2}");
+        assert!(ok2.ends_with(answer));
+        assert!(ok2.contains("CSeq: 12 INVITE"));
+        assert_eq!(r.handoff.pending_count().await, 0);
+        assert!(r.handoff.is_call_active("in-1").await);
+
+        // A re-INVITE for an unknown dialog gets 481.
+        let stray = reinvite(13, "z9hG4bK-re3").replace("Call-ID: in-1", "Call-ID: nope");
+        let _ = SipProxyManager::handle_message(&r.reg, &stray, r.pbx_addr).await;
+        let mut resp = recv_text(&r.pbx).await;
+        while resp == ok2 {
+            resp = recv_text(&r.pbx).await;
+        }
+        assert!(resp.starts_with("SIP/2.0 481 "), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn reject_sends_a_tagged_603_until_acked() {
+        let r = ringing().await;
+        r.handoff.reject_call(&r.token).await.unwrap();
+        let decline = recv_text(&r.pbx).await;
+        assert!(decline.starts_with("SIP/2.0 603 Decline"));
+        assert!(message::extract_to_tag(&decline).is_some());
+        assert_eq!(decline.lines().filter(|l| l.starts_with("Via:")).count(), 2);
+        assert_eq!(recv_text(&r.pbx).await, decline, "retransmitted until ACK");
+
+        // The non-2xx ACK reuses the INVITE branch and stops it.
+        SipProxyManager::handle_message(&r.reg, &ack_for(&decline, "z9hG4bK-in1"), r.pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut buf = [0u8; 4096];
+        while r.pbx.try_recv(&mut buf).is_ok() {}
+        nothing_arrives(&r.pbx).await;
+    }
+
+    fn cancel_of(invite: &str) -> String {
+        message::build_cancel(invite).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_ringing_call_gets_200_and_a_tagged_487() {
+        let r = ringing().await;
+        SipProxyManager::handle_message(&r.reg, &cancel_of(&r.invite), r.pbx_addr)
+            .await
+            .unwrap();
+        let ok = recv_text(&r.pbx).await;
+        assert!(ok.starts_with("SIP/2.0 200 OK") && ok.contains("CSeq: 10 CANCEL"));
+        let terminated = recv_text(&r.pbx).await;
+        assert!(terminated.starts_with("SIP/2.0 487 Request Terminated"));
+        assert!(terminated.contains("CSeq: 10 INVITE"));
+        assert_eq!(
+            message::extract_to_tag(&ok),
+            message::extract_to_tag(&terminated)
+        );
+        assert_eq!(r.handoff.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_for_an_unknown_or_answered_invite() {
+        let r = ringing().await;
+        // Wrong branch: no such transaction.
+        let wrong = cancel_of(&r.invite).replace("z9hG4bK-in1", "z9hG4bK-nope");
+        SipProxyManager::handle_message(&r.reg, &wrong, r.pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 481 "));
+        assert_eq!(r.handoff.pending_count().await, 1);
+
+        // After the answer, a CANCEL gets 200 but no 487 and the call stays.
+        r.handoff
+            .accept_call(&r.token, "v=0\r\n".into())
+            .await
+            .unwrap();
+        let ok = recv_text(&r.pbx).await;
+        SipProxyManager::handle_message(&r.reg, &ack_for(&ok, "z9hG4bK-ack"), r.pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut buf = [0u8; 4096];
+        while r.pbx.try_recv(&mut buf).is_ok() {}
+        SipProxyManager::handle_message(&r.reg, &cancel_of(&r.invite), r.pbx_addr)
+            .await
+            .unwrap();
+        let resp = recv_text(&r.pbx).await;
+        assert!(
+            resp.starts_with("SIP/2.0 200 OK") && resp.contains("CANCEL"),
+            "{resp}"
+        );
+        nothing_arrives(&r.pbx).await;
+        assert!(r.handoff.is_call_active("in-1").await);
+    }
+
+    #[tokio::test]
+    async fn accept_never_replaces_a_live_call() {
+        let r = ringing().await;
+        r.handoff
+            .accept_call(&r.token, "v=0\r\n".into())
+            .await
+            .unwrap();
+        // A second pending call that (bypassing classification) reuses the
+        // Call-ID cannot be accepted over the live one.
+        let token2 = r
+            .handoff
+            .create_pending_call(
+                "test-device".into(),
+                "in-1".into(),
+                incoming_invite("z9hG4bK-dup"),
+                r.pbx_addr,
+                r.reg.clone(),
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+        assert_eq!(
+            r.handoff.accept_call(&token2, "v=0\r\n".into()).await,
+            Err(crate::handoff::AcceptError::Conflict)
+        );
+        assert!(r.handoff.is_call_active("in-1").await);
     }
 }

@@ -164,64 +164,85 @@ pub fn build_register(
     msg
 }
 
-/// Build a 100 Trying response for an incoming INVITE.
-pub fn build_100_trying(request: &str) -> Option<String> {
-    let via = extract_header(request, "Via")?;
+/// Build a response to `request` (RFC 3261 §8.2.6):
+///
+/// - every Via, in order, plus From, Call-ID and CSeq copied verbatim;
+/// - To copied, with `;tag=<to_tag>` added if the request's To has no tag
+///   and `to_tag` is given (every response except 100 Trying should carry
+///   one);
+/// - Record-Route copied in order when `record_route` is set (2xx to a
+///   dialog-creating request);
+/// - `extra_headers` (CRLF-terminated lines) and an optional
+///   `(content type, body)`.
+pub fn build_response(
+    request: &str,
+    code: u16,
+    reason: &str,
+    to_tag: Option<&str>,
+    record_route: bool,
+    extra_headers: &str,
+    body: Option<(&str, &str)>,
+) -> Option<String> {
+    let vias = extract_all_headers(request, "Via");
+    if vias.is_empty() {
+        return None;
+    }
     let from = extract_header(request, "From")?;
-    let to = extract_header(request, "To")?;
+    let mut to = extract_header(request, "To")?;
     let call_id = extract_header(request, "Call-ID")?;
     let cseq = extract_header(request, "CSeq")?;
+    if let Some(tag) = to_tag {
+        if header_param(&to, "tag").is_none() {
+            to.push_str(&format!(";tag={tag}"));
+        }
+    }
 
-    Some(format!(
-        "SIP/2.0 100 Trying\r\n\
-         Via: {via}\r\n\
-         From: {from}\r\n\
-         To: {to}\r\n\
-         Call-ID: {call_id}\r\n\
-         CSeq: {cseq}\r\n\
-         Content-Length: 0\r\n\r\n"
-    ))
+    let mut msg = format!("SIP/2.0 {code} {reason}\r\n");
+    for via in vias {
+        msg.push_str(&format!("Via: {via}\r\n"));
+    }
+    if record_route {
+        for rr in extract_all_headers(request, "Record-Route") {
+            msg.push_str(&format!("Record-Route: {rr}\r\n"));
+        }
+    }
+    msg.push_str(&format!(
+        "From: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq}\r\n"
+    ));
+    msg.push_str(extra_headers);
+    msg.push_str("User-Agent: Aria-Gateway/0.1.0\r\n");
+    match body {
+        Some((content_type, body)) => msg.push_str(&format!(
+            "Content-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )),
+        None => msg.push_str("Content-Length: 0\r\n\r\n"),
+    }
+    Some(msg)
 }
 
-/// Build a 480 Temporarily Unavailable response.
-pub fn build_480(request: &str) -> Option<String> {
-    let via = extract_header(request, "Via")?;
-    let from = extract_header(request, "From")?;
-    let to = extract_header(request, "To")?;
-    let call_id = extract_header(request, "Call-ID")?;
-    let cseq = extract_header(request, "CSeq")?;
+/// A bodiless response; a To tag is generated if the request has none.
+pub fn build_simple_response(request: &str, code: u16, reason: &str) -> Option<String> {
+    build_response(
+        request,
+        code,
+        reason,
+        Some(&generate_tag()),
+        false,
+        "",
+        None,
+    )
+}
 
-    Some(format!(
-        "SIP/2.0 480 Temporarily Unavailable\r\n\
-         Via: {via}\r\n\
-         From: {from}\r\n\
-         To: {to}\r\n\
-         Call-ID: {call_id}\r\n\
-         CSeq: {cseq}\r\n\
-         User-Agent: Aria-Gateway/0.1.0\r\n\
-         Content-Length: 0\r\n\r\n"
-    ))
+/// Build a 100 Trying response for an incoming INVITE.
+pub fn build_100_trying(request: &str) -> Option<String> {
+    build_response(request, 100, "Trying", None, false, "", None)
 }
 
 /// Build a 481 Call/Transaction Does Not Exist response, e.g. for a BYE on a
 /// dialog the gateway doesn't know (RFC 3261 §15.1.2).
 pub fn build_481(request: &str) -> Option<String> {
-    let via = extract_header(request, "Via")?;
-    let from = extract_header(request, "From")?;
-    let to = extract_header(request, "To")?;
-    let call_id = extract_header(request, "Call-ID")?;
-    let cseq = extract_header(request, "CSeq")?;
-
-    Some(format!(
-        "SIP/2.0 481 Call/Transaction Does Not Exist\r\n\
-         Via: {via}\r\n\
-         From: {from}\r\n\
-         To: {to}\r\n\
-         Call-ID: {call_id}\r\n\
-         CSeq: {cseq}\r\n\
-         User-Agent: Aria-Gateway/0.1.0\r\n\
-         Content-Length: 0\r\n\r\n"
-    ))
+    build_simple_response(request, 481, "Call/Transaction Does Not Exist")
 }
 
 /// Extract the media IP and port from an SDP body.
@@ -295,34 +316,23 @@ pub fn rewrite_sdp_media_address(sdp: &str, new_ip: &str, new_port: u16) -> Stri
     result.join("\r\n")
 }
 
-/// Build a 200 OK for an INVITE, forwarding the mobile app's SDP answer.
-pub fn build_200_ok_invite(request: &str, sdp_answer: &str, contact_uri: &str) -> Option<String> {
-    let via = extract_header(request, "Via")?;
-    let from = extract_header(request, "From")?;
-    let to_base = extract_header(request, "To")?;
-    let call_id = extract_header(request, "Call-ID")?;
-    let cseq = extract_header(request, "CSeq")?;
-
-    let to_tag = generate_tag();
-    let to = if to_base.contains("tag=") {
-        to_base
-    } else {
-        format!("{};tag={}", to_base, to_tag)
-    };
-
-    Some(format!(
-        "SIP/2.0 200 OK\r\n\
-         Via: {via}\r\n\
-         From: {from}\r\n\
-         To: {to}\r\n\
-         Call-ID: {call_id}\r\n\
-         CSeq: {cseq}\r\n\
-         Contact: <{contact_uri}>\r\n\
-         Content-Type: application/sdp\r\n\
-         User-Agent: Aria-Gateway/0.1.0\r\n\
-         Content-Length: {len}\r\n\r\n{sdp_answer}",
-        len = sdp_answer.len(),
-    ))
+/// Build a 200 OK for an INVITE with our `to_tag`, the INVITE's
+/// Record-Route, our Contact and an SDP body.
+pub fn build_200_ok_invite(
+    request: &str,
+    sdp: &str,
+    contact_uri: &str,
+    to_tag: &str,
+) -> Option<String> {
+    build_response(
+        request,
+        200,
+        "OK",
+        Some(to_tag),
+        true,
+        &format!("Contact: <{contact_uri}>\r\nAllow: INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY\r\n"),
+        Some(("application/sdp", sdp)),
+    )
 }
 
 /// Build a CANCEL for a pending INVITE (RFC 3261 §9.1): same Request-URI,
@@ -363,6 +373,72 @@ pub fn build_cancel(invite: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INVITE_VIA_RR: &str = "INVITE sip:1001@10.0.0.2 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP edge.example.com;branch=z9hG4bK-a, SIP/2.0/UDP core;branch=z9hG4bK-b\r\n\
+        v: SIP/2.0/UDP pbx;branch=z9hG4bK-c\r\n\
+        Record-Route: <sip:edge.example.com;lr>\r\n\
+        Record-Route: <sip:core.example.com;lr>\r\n\
+        From: <sip:2000@pbx>;tag=pbx\r\n\
+        To: <sip:1001@pbx>\r\n\
+        Call-ID: c1\r\nCSeq: 5 INVITE\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn responses_copy_every_via_and_tag_the_to() {
+        let r = build_response(
+            INVITE_VIA_RR,
+            486,
+            "Busy Here",
+            Some("ourtag"),
+            false,
+            "",
+            None,
+        )
+        .unwrap();
+        let lines: Vec<&str> = r.split("\r\n").collect();
+        assert_eq!(lines[0], "SIP/2.0 486 Busy Here");
+        assert_eq!(
+            &lines[1..4],
+            &[
+                "Via: SIP/2.0/UDP edge.example.com;branch=z9hG4bK-a, SIP/2.0/UDP core;branch=z9hG4bK-b",
+                "Via: SIP/2.0/UDP pbx;branch=z9hG4bK-c",
+                "From: <sip:2000@pbx>;tag=pbx",
+            ]
+        );
+        assert!(lines.contains(&"To: <sip:1001@pbx>;tag=ourtag"));
+        assert!(!r.contains("Record-Route"));
+
+        // An existing To tag is kept; 100 Trying gets none.
+        let in_dialog = INVITE_VIA_RR.replace("To: <sip:1001@pbx>", "To: <sip:1001@pbx>;tag=x");
+        let r = build_response(&in_dialog, 200, "OK", Some("y"), false, "", None).unwrap();
+        assert!(r.contains("To: <sip:1001@pbx>;tag=x\r\n"));
+        assert!(build_100_trying(INVITE_VIA_RR)
+            .unwrap()
+            .contains("To: <sip:1001@pbx>\r\n"));
+        assert!(build_481(INVITE_VIA_RR)
+            .unwrap()
+            .contains("To: <sip:1001@pbx>;tag="));
+    }
+
+    #[test]
+    fn invite_200_echoes_record_route_in_order() {
+        let ok =
+            build_200_ok_invite(INVITE_VIA_RR, "v=0\r\n", "sip:gw@10.0.0.2:5060", "t1").unwrap();
+        let rr: Vec<&str> = ok
+            .lines()
+            .filter(|l| l.starts_with("Record-Route:"))
+            .collect();
+        assert_eq!(
+            rr,
+            vec![
+                "Record-Route: <sip:edge.example.com;lr>",
+                "Record-Route: <sip:core.example.com;lr>"
+            ]
+        );
+        assert!(ok.contains("To: <sip:1001@pbx>;tag=t1\r\n"));
+        assert!(ok.contains("Contact: <sip:gw@10.0.0.2:5060>\r\n"));
+        assert!(ok.ends_with("Content-Length: 5\r\n\r\nv=0\r\n"));
+    }
 
     const FOLDED: &str = "INVITE sip:a@b SIP/2.0\r\n\
         v: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1, SIP/2.0/UDP 10.0.0.2;branch=z9hG4bK-2\r\n\

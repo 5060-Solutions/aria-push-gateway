@@ -22,6 +22,7 @@ use tokio::sync::{oneshot, RwLock};
 use crate::sip::digest::DigestAuth;
 use crate::sip::message;
 use crate::sip::rtp_relay::RtpRelay;
+use crate::sip::transaction::{self, ServerTransactions};
 
 /// Who a call belongs to, for authorizing app requests on its token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,12 @@ struct PendingCall {
     proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
     /// Pre-allocated RTP relay for this call (allocated when INVITE arrives).
     rtp_relay: Option<Arc<RtpRelay>>,
+    /// The socket the INVITE arrived on (and its responses leave from).
+    socket: Arc<tokio::net::UdpSocket>,
+    /// Our To tag for every response to this INVITE.
+    local_tag: String,
+    /// Top Via branch of the INVITE (identifies its transaction).
+    invite_branch: String,
     /// The gateway's local IP for SDP rewriting.
     local_ip: String,
     /// The phone-side RTP relay port.
@@ -104,6 +111,17 @@ pub struct ActiveCall {
     pub rtp_relay: Option<Arc<RtpRelay>>,
     /// Outcome of the latest accepted transfer, for `/status`.
     transfer: std::sync::Mutex<TransferTrack>,
+    /// Our session description (sent again on a session-refresh re-INVITE).
+    local_sdp: String,
+    /// Our Contact URI on this dialog.
+    contact: String,
+    /// Branch of the INVITE that created the dialog, for an incoming call.
+    invite_branch: Option<String>,
+    /// While a 2xx to an INVITE is being retransmitted: its CSeq number and
+    /// the signal that stops it when the ACK arrives.
+    ack_wait: std::sync::Mutex<Option<(u32, oneshot::Sender<()>)>>,
+    /// The latest 2xx we sent to an INVITE on this dialog and its CSeq.
+    last_2xx: std::sync::Mutex<Option<(u32, String)>>,
     /// Dropped together with the call, which wakes the receiver returned by
     /// [`HandoffManager::register_active_call`] however the call ended.
     _ended: Option<oneshot::Sender<()>>,
@@ -129,6 +147,11 @@ impl ActiveCall {
             transfer_pending: Arc::new(AtomicBool::new(false)),
             rtp_relay,
             transfer: std::sync::Mutex::new(TransferTrack::default()),
+            local_sdp: String::new(),
+            contact: String::new(),
+            invite_branch: None,
+            ack_wait: std::sync::Mutex::new(None),
+            last_2xx: std::sync::Mutex::new(None),
             _ended: None,
         }
     }
@@ -144,6 +167,18 @@ impl ActiveCall {
                 .and_then(|v| message::header_param(&v, "tag"))
                 == message::header_param(&self.dialog.remote, "tag")
             && message::extract_to_tag(request) == message::header_param(&self.dialog.local, "tag")
+    }
+
+    fn ack_wait(&self) -> std::sync::MutexGuard<'_, Option<(u32, oneshot::Sender<()>)>> {
+        self.ack_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn last_2xx(&self) -> std::sync::MutexGuard<'_, Option<(u32, String)>> {
+        self.last_2xx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn transfer_track(&self) -> std::sync::MutexGuard<'_, TransferTrack> {
@@ -224,6 +259,29 @@ impl Dialog {
     fn local_uri(&self) -> String {
         name_addr_uri(&self.local)
     }
+}
+
+/// The number in a message's CSeq header.
+fn cseq_number(msg: &str) -> Option<u32> {
+    message::extract_header(msg, "CSeq")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether two handles name the same socket.
+fn c_matches(a: &Arc<tokio::net::UdpSocket>, b: &Arc<tokio::net::UdpSocket>) -> bool {
+    Arc::ptr_eq(a, b)
+}
+
+/// Fire-and-forget UDP send from synchronous context (a lock is held).
+fn try_send(
+    socket: &Arc<tokio::net::UdpSocket>,
+    msg: &str,
+    dest: SocketAddr,
+) -> std::io::Result<usize> {
+    socket.try_send_to(msg.as_bytes(), dest)
 }
 
 /// Extract the URI from the `Contact` header of a message.
@@ -590,6 +648,55 @@ pub struct HandoffManager {
     pending_refers: Arc<std::sync::Mutex<PendingRefers>>,
     /// See [`REFER_NOTIFY_TIMEOUT`]; shortened in tests.
     refer_notify_timeout: Duration,
+    /// Responses for retransmitted requests and ACKs of non-2xx finals.
+    uas: Arc<ServerTransactions>,
+}
+
+/// Why accepting a call failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcceptError {
+    /// No pending call has this token (expired, cancelled or answered).
+    NotFound,
+    /// A call with this Call-ID is already active; it is never replaced.
+    Conflict,
+    /// The 200 OK could not be built or sent to the PBX.
+    Send(String),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "call token not found or expired"),
+            Self::Conflict => write!(f, "a call with this Call-ID is already active"),
+            Self::Send(e) => write!(f, "failed to send 200 OK: {e}"),
+        }
+    }
+}
+
+/// How an incoming INVITE without a To tag relates to calls we know.
+pub enum InviteDisposition {
+    /// A new call.
+    New,
+    /// A retransmission of an INVITE we're handling: send this again.
+    Retransmission(String),
+    /// Same Call-ID as a call we know but a different transaction (loop or
+    /// merged request): answer 482.
+    Merged,
+}
+
+/// What a CANCEL from the PBX matched.
+pub enum CancelOutcome {
+    /// A ringing call: it is ended; answer 200 to the CANCEL and 487 to the
+    /// INVITE (`invite`, sent to `dest` with our `local_tag`).
+    Cancelled {
+        invite: String,
+        local_tag: String,
+        dest: SocketAddr,
+    },
+    /// The INVITE was already answered; the CANCEL has no effect (200).
+    AlreadyAnswered,
+    /// No such INVITE transaction (481).
+    Unknown,
 }
 
 /// Info about a call that has ended, available for mobile app polling.
@@ -624,7 +731,13 @@ impl HandoffManager {
             ended_calls: ended,
             pending_refers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             refer_notify_timeout: REFER_NOTIFY_TIMEOUT,
+            uas: Arc::new(ServerTransactions::default()),
         }
+    }
+
+    /// Server transaction memory shared with the SIP receive loops.
+    pub fn server_transactions(&self) -> &Arc<ServerTransactions> {
+        &self.uas
     }
 
     /// Shorten the wait for the first refer NOTIFY (tests only).
@@ -649,6 +762,8 @@ impl HandoffManager {
         pbx_rtp_port: u16,
     ) -> String {
         let call_token = uuid::Uuid::new_v4().to_string();
+        let socket = proxy_reg.read().await.socket.clone();
+        let invite_branch = message::extract_via_branch(&invite_raw).unwrap_or_default();
 
         let pending = PendingCall {
             device_id,
@@ -657,6 +772,9 @@ impl HandoffManager {
             pbx_addr,
             proxy_reg,
             rtp_relay,
+            socket,
+            local_tag: message::generate_tag(),
+            invite_branch,
             local_ip,
             phone_rtp_port,
             pbx_rtp_port,
@@ -670,6 +788,7 @@ impl HandoffManager {
 
         // Spawn timeout — if app doesn't respond in 30s, send 480
         let pending_ref = Arc::clone(&self.pending);
+        let uas = Arc::clone(&self.uas);
         let token_clone = token.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -679,9 +798,16 @@ impl HandoffManager {
                     token = %token_clone,
                     "Call handoff timed out — sending 480"
                 );
-                if let Some(resp) = message::build_480(&call.invite_raw) {
-                    let reg = call.proxy_reg.read().await;
-                    let _ = reg.socket.send_to(resp.as_bytes(), call.pbx_addr).await;
+                if let Some(resp) = message::build_response(
+                    &call.invite_raw,
+                    480,
+                    "Temporarily Unavailable",
+                    Some(&call.local_tag),
+                    false,
+                    "",
+                    None,
+                ) {
+                    uas.send_final(&call.socket, call.pbx_addr, &call.invite_raw, resp);
                 }
             }
         });
@@ -694,11 +820,25 @@ impl HandoffManager {
     /// The pending-calls lock is held until the call is in the active map,
     /// so nothing (status polls, ownership checks, hangup, CANCEL, the
     /// handoff timeout) can observe the call as neither pending nor active.
-    pub async fn accept_call(&self, call_token: &str, sdp_answer: String) -> anyhow::Result<()> {
+    ///
+    /// The 200 OK is retransmitted until the PBX ACKs it; without an ACK
+    /// within 64·T1 the call is ended with a BYE (RFC 3261 §13.3.1.4).
+    pub async fn accept_call(
+        self: &Arc<Self>,
+        call_token: &str,
+        sdp_answer: String,
+    ) -> Result<(), AcceptError> {
         let mut pending = self.pending.write().await;
-        let call = pending
-            .remove(call_token)
-            .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?;
+        let call_id = pending
+            .get(call_token)
+            .ok_or(AcceptError::NotFound)?
+            .call_id
+            .clone();
+        if self.active.read().await.contains_key(&call_id) {
+            tracing::warn!(call_id = %call_id, "accept for a Call-ID that is already active — refused");
+            return Err(AcceptError::Conflict);
+        }
+        let call = pending.remove(call_token).ok_or(AcceptError::NotFound)?;
 
         // Extract the phone's RTP address from its SDP answer
         let phone_media = message::extract_sdp_media_address(&sdp_answer);
@@ -735,45 +875,79 @@ impl HandoffManager {
         }
 
         // Build 200 OK with the rewritten SDP and send to PBX
-        let reg = call.proxy_reg.read().await;
-        let contact_uri = format!(
-            "sip:{}@{}:{}",
-            "aria-gateway",
-            reg.local_addr.ip(),
-            reg.local_addr.port()
+        let local_addr = call.proxy_reg.read().await.local_addr;
+        let contact_uri = format!("sip:aria-gateway@{}:{}", local_addr.ip(), local_addr.port());
+        let ok = message::build_200_ok_invite(
+            &call.invite_raw,
+            &rewritten_sdp,
+            &contact_uri,
+            &call.local_tag,
+        )
+        .ok_or_else(|| AcceptError::Send("INVITE is malformed".into()))?;
+        call.socket
+            .send_to(ok.as_bytes(), call.pbx_addr)
+            .await
+            .map_err(|e| AcceptError::Send(e.to_string()))?;
+        tracing::info!(token = %call_token, "Sent 200 OK to PBX with rewritten SDP");
+
+        // Move to active calls. The gateway has sent no requests on this
+        // dialog yet, so its first one (BYE/REFER) uses CSeq 1.
+        let dialog = Dialog::from_uas(&call.invite_raw, &ok, call.pbx_addr);
+        let invite_cseq = cseq_number(&call.invite_raw).unwrap_or(0);
+        let mut active_call = ActiveCall::new(
+            CallOwner::Device(call.device_id),
+            call.pbx_addr,
+            call.proxy_reg.clone(),
+            call.socket.clone(),
+            dialog,
+            0,
+            call.rtp_relay,
         );
+        active_call.local_sdp = rewritten_sdp;
+        active_call.contact = contact_uri;
+        active_call.invite_branch = Some(call.invite_branch);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        *active_call.ack_wait() = Some((invite_cseq, ack_tx));
+        *active_call.last_2xx() = Some((invite_cseq, ok.clone()));
 
-        if let Some(ok) =
-            message::build_200_ok_invite(&call.invite_raw, &rewritten_sdp, &contact_uri)
         {
-            reg.socket.send_to(ok.as_bytes(), call.pbx_addr).await?;
-            tracing::info!(token = %call_token, "Sent 200 OK to PBX with rewritten SDP");
-
-            // Move to active calls. The gateway has sent no requests on this
-            // dialog yet, so its first one (BYE/REFER) uses CSeq 1.
-            let dialog = Dialog::from_uas(&call.invite_raw, &ok, call.pbx_addr);
-            let active_call = ActiveCall::new(
-                CallOwner::Device(call.device_id),
-                call.pbx_addr,
-                call.proxy_reg.clone(),
-                reg.socket.clone(),
-                dialog,
-                0,
-                call.rtp_relay,
-            );
-
-            {
-                let mut active = self.active.write().await;
-                active.insert(call.call_id.clone(), active_call);
-            }
-            {
-                let mut map = self.token_to_call_id.write().await;
-                map.insert(call_token.to_string(), call.call_id);
-            }
+            let mut active = self.active.write().await;
+            active.insert(call.call_id.clone(), active_call);
         }
+        {
+            let mut map = self.token_to_call_id.write().await;
+            map.insert(call_token.to_string(), call.call_id.clone());
+        }
+        self.retransmit_2xx(call.call_id, call.socket, call.pbx_addr, ok, ack_rx);
 
         drop(pending);
         Ok(())
+    }
+
+    /// Retransmit a 2xx to an INVITE until its ACK arrives (`ack` fires, or
+    /// is dropped with the call). Without an ACK the call is ended.
+    fn retransmit_2xx(
+        self: &Arc<Self>,
+        call_id: String,
+        socket: Arc<tokio::net::UdpSocket>,
+        dest: SocketAddr,
+        ok: String,
+        ack: oneshot::Receiver<()>,
+    ) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            // Already sent once; resume at the first retransmission.
+            tokio::time::sleep(transaction::T1).await;
+            let mut ack = ack;
+            if ack.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+                return;
+            }
+            if transaction::retransmit_until(&socket, dest, &ok, transaction::T2, ack).await {
+                return;
+            }
+            tracing::warn!(call_id = %call_id, "No ACK for our 200 OK — ending the call");
+            let _ = this.end_call_with_bye(&call_id, Some("no_ack")).await;
+        });
     }
 
     /// Wait for any `accept_call` in flight to finish moving its call from
@@ -791,25 +965,19 @@ impl HandoffManager {
                 .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?
         };
 
-        // Send 603 Decline
-        let reg = call.proxy_reg.read().await;
-        let via = message::extract_header(&call.invite_raw, "Via").unwrap_or_default();
-        let from = message::extract_header(&call.invite_raw, "From").unwrap_or_default();
-        let to = message::extract_header(&call.invite_raw, "To").unwrap_or_default();
-        let cid = message::extract_header(&call.invite_raw, "Call-ID").unwrap_or_default();
-        let cseq = message::extract_header(&call.invite_raw, "CSeq").unwrap_or_default();
-
-        let resp = format!(
-            "SIP/2.0 603 Decline\r\n\
-             Via: {via}\r\n\
-             From: {from}\r\n\
-             To: {to}\r\n\
-             Call-ID: {cid}\r\n\
-             CSeq: {cseq}\r\n\
-             Content-Length: 0\r\n\r\n"
-        );
-
-        reg.socket.send_to(resp.as_bytes(), call.pbx_addr).await?;
+        // Send 603 Decline (retransmitted until the PBX ACKs it)
+        let resp = message::build_response(
+            &call.invite_raw,
+            603,
+            "Decline",
+            Some(&call.local_tag),
+            false,
+            "",
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("INVITE is malformed"))?;
+        self.uas
+            .send_final(&call.socket, call.pbx_addr, &call.invite_raw, resp);
         tracing::info!(token = %call_token, "Call rejected, sent 603");
         Ok(())
     }
@@ -851,40 +1019,218 @@ impl HandoffManager {
         })
     }
 
-    /// Handle an incoming ACK for an active call (after 200 OK).
-    pub async fn handle_ack(&self, call_id: &str) {
+    /// Handle an ACK from the PBX: either for a non-2xx final we are
+    /// retransmitting (same branch as the INVITE), or for a 2xx on one of
+    /// this socket's dialogs (matching CSeq). Returns whether it matched.
+    pub async fn handle_ack(&self, ack: &str, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+        if self.uas.ack(socket, ack) {
+            return true;
+        }
+        let call_id = message::extract_header(ack, "Call-ID").unwrap_or_default();
         let active = self.active.read().await;
-        if active.contains_key(call_id) {
-            tracing::debug!(call_id = %call_id, "ACK received for active call");
+        let Some(call) = active.get(&call_id).filter(|c| c.owns_request(ack, socket)) else {
+            tracing::debug!(call_id = %call_id, "ACK matches no transaction");
+            return false;
+        };
+        let mut wait = call.ack_wait();
+        if wait.as_ref().map(|(cseq, _)| *cseq) == cseq_number(ack) {
+            if let Some((_, tx)) = wait.take() {
+                let _ = tx.send(());
+            }
+            tracing::debug!(call_id = %call_id, "ACK received for our 200 OK");
+        }
+        true
+    }
+
+    /// Classify an INVITE without a To tag that arrived on `socket`.
+    pub async fn classify_invite(
+        &self,
+        invite: &str,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) -> InviteDisposition {
+        let call_id = message::extract_header(invite, "Call-ID").unwrap_or_default();
+        let branch = message::extract_via_branch(invite).unwrap_or_default();
+
+        if let Some(call) = self
+            .pending
+            .read()
+            .await
+            .values()
+            .find(|c| c.call_id == call_id)
+        {
+            return if c_matches(&call.socket, socket) && call.invite_branch == branch {
+                message::build_100_trying(invite)
+                    .map_or(InviteDisposition::Merged, InviteDisposition::Retransmission)
+            } else {
+                InviteDisposition::Merged
+            };
+        }
+        if let Some(call) = self.active.read().await.get(&call_id) {
+            let same = c_matches(&call.socket, socket)
+                && call.invite_branch.as_deref() == Some(branch.as_str());
+            return match call.last_2xx().clone() {
+                Some((_, ok)) if same => InviteDisposition::Retransmission(ok),
+                _ => InviteDisposition::Merged,
+            };
+        }
+        match self.uas.replay(socket, invite) {
+            Some(resp) => InviteDisposition::Retransmission(resp),
+            None => InviteDisposition::New,
         }
     }
 
-    /// Handle a CANCEL from the PBX — remove the pending call so the mobile
-    /// app's accept attempt will fail cleanly with "cancelled".
-    pub async fn handle_cancel(&self, call_id: &str) {
+    /// Answer an in-dialog re-INVITE (session refresh, hold, ...) on one of
+    /// `socket`'s dialogs with 200 OK and our current session description.
+    /// A re-INVITE while our previous 2xx is still unacknowledged gets 491.
+    /// Returns `None` if the request matches no dialog (the caller sends
+    /// 481), else the response sent.
+    pub async fn handle_reinvite(
+        self: &Arc<Self>,
+        invite: &str,
+        from: SocketAddr,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) -> Option<String> {
+        let call_id = message::extract_header(invite, "Call-ID").unwrap_or_default();
+        let cseq = cseq_number(invite).unwrap_or(0);
+        let (ok, ack_rx) = {
+            let active = self.active.read().await;
+            let call = active
+                .get(&call_id)
+                .filter(|c| c.owns_request(invite, socket))?;
+
+            if let Some((last_cseq, last)) = call.last_2xx().clone() {
+                if last_cseq == cseq {
+                    // Retransmitted re-INVITE.
+                    let _ = try_send(socket, &last, from);
+                    return Some(last);
+                }
+            }
+            if call.ack_wait().is_some() {
+                let resp = message::build_simple_response(invite, 491, "Request Pending")?;
+                self.uas.remember(socket, invite, &resp, from);
+                let _ = try_send(socket, &resp, from);
+                return Some(resp);
+            }
+
+            let ok = message::build_response(
+                invite,
+                200,
+                "OK",
+                None,
+                false,
+                &format!(
+                    "Contact: <{}>\r\nAllow: INVITE, ACK, CANCEL, BYE, OPTIONS, REFER, NOTIFY\r\n",
+                    call.contact
+                ),
+                Some(("application/sdp", &call.local_sdp)),
+            )?;
+            let (tx, rx) = oneshot::channel();
+            *call.ack_wait() = Some((cseq, tx));
+            *call.last_2xx() = Some((cseq, ok.clone()));
+            (ok, rx)
+        };
+        tracing::info!(call_id = %call_id, "Answered re-INVITE with our current session");
+        let _ = socket.send_to(ok.as_bytes(), from).await;
+        self.retransmit_2xx(call_id, socket.clone(), from, ok.clone(), ack_rx);
+        Some(ok)
+    }
+
+    /// Handle a CANCEL from the PBX. Only a CANCEL for a still-ringing INVITE
+    /// on this socket (same Call-ID and branch) ends the call; one for an
+    /// answered INVITE has no effect, and anything else is unknown.
+    pub async fn handle_cancel(
+        &self,
+        cancel: &str,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) -> CancelOutcome {
+        let call_id = message::extract_header(cancel, "Call-ID").unwrap_or_default();
+        let branch = message::extract_via_branch(cancel).unwrap_or_default();
+
         let mut pending = self.pending.write().await;
-        // Find the token for this call_id
         let token = pending
             .iter()
-            .find(|(_, c)| c.call_id == call_id)
+            .find(|(_, c)| {
+                c.call_id == call_id && c.invite_branch == branch && c_matches(&c.socket, socket)
+            })
             .map(|(t, _)| t.clone());
 
         if let Some(token) = token {
-            let call = pending.remove(&token);
+            let call = pending.remove(&token).expect("found above");
+            drop(pending);
             tracing::info!(call_id = %call_id, token = %token, "Pending call cancelled");
-            let owner = CallOwner::Device(call.map(|c| c.device_id).unwrap_or_default());
 
             // Record as ended so mobile app can detect cancellation
-            let mut ended = self.ended_calls.write().await;
-            ended.insert(
+            self.ended_calls.write().await.insert(
                 token,
                 EndedCallInfo {
                     reason: "cancelled".to_string(),
                     ended_at: chrono::Utc::now(),
-                    owner,
+                    owner: CallOwner::Device(call.device_id),
                 },
             );
+            return CancelOutcome::Cancelled {
+                invite: call.invite_raw,
+                local_tag: call.local_tag,
+                dest: call.pbx_addr,
+            };
         }
+        drop(pending);
+
+        let answered = self.active.read().await.get(&call_id).is_some_and(|c| {
+            c_matches(&c.socket, socket) && c.invite_branch.as_deref() == Some(branch.as_str())
+        }) || self.uas.answered_invite(socket, &branch);
+        if answered {
+            CancelOutcome::AlreadyAnswered
+        } else {
+            CancelOutcome::Unknown
+        }
+    }
+
+    /// Answer a CANCEL as [`Self::handle_cancel`] decides: 200 (and 487 to
+    /// the INVITE) for a ringing call, 200 for an answered one, else 481.
+    pub async fn answer_cancel(
+        &self,
+        cancel: &str,
+        from: SocketAddr,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) -> anyhow::Result<()> {
+        match self.handle_cancel(cancel, socket).await {
+            CancelOutcome::Cancelled {
+                invite,
+                local_tag,
+                dest,
+            } => {
+                if let Some(ok) =
+                    message::build_response(cancel, 200, "OK", Some(&local_tag), false, "", None)
+                {
+                    socket.send_to(ok.as_bytes(), from).await?;
+                    self.uas.remember(socket, cancel, &ok, from);
+                }
+                if let Some(terminated) = message::build_response(
+                    &invite,
+                    487,
+                    "Request Terminated",
+                    Some(&local_tag),
+                    false,
+                    "",
+                    None,
+                ) {
+                    self.uas.send_final(socket, dest, &invite, terminated);
+                }
+            }
+            CancelOutcome::AlreadyAnswered => {
+                if let Some(ok) = message::build_simple_response(cancel, 200, "OK") {
+                    socket.send_to(ok.as_bytes(), from).await?;
+                    self.uas.remember(socket, cancel, &ok, from);
+                }
+            }
+            CancelOutcome::Unknown => {
+                if let Some(resp) = message::build_481(cancel) {
+                    socket.send_to(resp.as_bytes(), from).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Get the status of a call by token. Returns None if unknown,
@@ -967,25 +1313,11 @@ impl HandoffManager {
             return Ok(None);
         };
 
-        // Send 200 OK for the BYE
-        let reg = call.proxy_reg.read().await;
-        let via = message::extract_header(bye_raw, "Via").unwrap_or_default();
-        let bye_from = message::extract_header(bye_raw, "From").unwrap_or_default();
-        let bye_to = message::extract_header(bye_raw, "To").unwrap_or_default();
-        let cid = message::extract_header(bye_raw, "Call-ID").unwrap_or_default();
-        let cseq = message::extract_header(bye_raw, "CSeq").unwrap_or_default();
-
-        let resp = format!(
-            "SIP/2.0 200 OK\r\n\
-             Via: {via}\r\n\
-             From: {bye_from}\r\n\
-             To: {bye_to}\r\n\
-             Call-ID: {cid}\r\n\
-             CSeq: {cseq}\r\n\
-             Content-Length: 0\r\n\r\n"
-        );
-
-        reg.socket.send_to(resp.as_bytes(), from).await?;
+        // Send 200 OK for the BYE (and repeat it for retransmissions)
+        if let Some(resp) = message::build_simple_response(bye_raw, 200, "OK") {
+            self.uas.remember(socket, bye_raw, &resp, from);
+            socket.send_to(resp.as_bytes(), from).await?;
+        }
 
         // Stop RTP relay
         if let Some(ref relay) = call.rtp_relay {
@@ -1042,6 +1374,33 @@ impl HandoffManager {
             .await
             .contains_key(&call_id)
             .then_some(call_id)
+    }
+
+    /// Simulate the PBX cancelling the ringing call `call_id` (tests only).
+    #[cfg(test)]
+    pub async fn cancel_pending(&self, call_id: &str) -> CancelOutcome {
+        let found = self
+            .pending
+            .read()
+            .await
+            .values()
+            .find(|c| c.call_id == call_id)
+            .map(|c| (message::build_cancel(&c.invite_raw), c.socket.clone()));
+        match found {
+            Some((Some(cancel), socket)) => self.handle_cancel(&cancel, &socket).await,
+            _ => CancelOutcome::Unknown,
+        }
+    }
+
+    /// Token of the ringing call with this Call-ID (tests only).
+    #[cfg(test)]
+    pub async fn pending_token(&self, call_id: &str) -> Option<String> {
+        self.pending
+            .read()
+            .await
+            .iter()
+            .find(|(_, c)| c.call_id == call_id)
+            .map(|(t, _)| t.clone())
     }
 
     /// Number of calls waiting for the app to answer (tests only).
@@ -1492,6 +1851,8 @@ impl HandoffManager {
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
         rtp_relay: Option<Arc<RtpRelay>>,
+        local_sdp: String,
+        contact: String,
     ) -> oneshot::Receiver<()> {
         let dialog = Dialog::from_uac(&invite_raw, pbx_addr);
         // Continue the CSeq space our INVITE started.
@@ -1510,6 +1871,8 @@ impl HandoffManager {
             rtp_relay,
         );
         active_call._ended = Some(ended_tx);
+        active_call.local_sdp = local_sdp;
+        active_call.contact = contact;
 
         {
             let mut active = self.active.write().await;
@@ -2019,6 +2382,8 @@ Content-Length: 0\r\n\r\n";
             pbx.local_addr().unwrap(),
             reg,
             None,
+            "v=0\r\n".into(),
+            "sip:gw@127.0.0.1".into(),
         )
         .await;
         Harness { mgr, pbx }
@@ -2470,7 +2835,7 @@ Content-Length: 0\r\n\r\n";
         };
         let cancel = {
             let mgr = mgr.clone();
-            tokio::spawn(async move { mgr.handle_cancel("inbound-call-1").await })
+            tokio::spawn(async move { mgr.cancel_pending("inbound-call-1").await })
         };
         accept.await.unwrap().unwrap();
         cancel.await.unwrap();

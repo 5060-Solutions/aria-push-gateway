@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthUser, JwtSecret};
 use crate::db::{Database, DeviceRecord};
-use crate::handoff::{self, CallOwner, HandoffManager, TransferError};
+use crate::handoff::{self, AcceptError, CallOwner, HandoffManager, TransferError};
 use crate::push::PushManager;
 use crate::sip::proxy::{is_valid_client_ref, OriginateRefusal};
 use crate::sip::SipProxyManager;
@@ -605,7 +605,11 @@ async fn accept_call(
         .await
         .map_err(|e| {
             tracing::error!("Accept call failed: {}", e);
-            StatusCode::NOT_FOUND
+            match e {
+                AcceptError::NotFound => StatusCode::NOT_FOUND,
+                AcceptError::Conflict => StatusCode::CONFLICT,
+                AcceptError::Send(_) => StatusCode::BAD_GATEWAY,
+            }
         })?;
 
     Ok(StatusCode::OK)
@@ -1030,6 +1034,8 @@ Content-Length: 0\r\n\r\n";
                 pbx.local_addr().unwrap(),
                 reg,
                 None,
+                "v=0\r\n".into(),
+                "sip:gw@127.0.0.1".into(),
             )
             .await;
         (pbx, "out-tok".into())
@@ -1164,7 +1170,7 @@ Content-Length: 0\r\n\r\n";
         let app = test_app(Some(ISSUER_KEY)).await;
         app.add_device("bob-dev", "bob", true).await;
         let (pbx, token) = pending_call_for(&app, "bob-dev").await;
-        app.handoff.handle_cancel("in-call-1").await;
+        app.handoff.cancel_pending("in-call-1").await;
         drop(pbx);
 
         let status_path = format!("/v1/calls/{token}/status");

@@ -8,5 +8,6 @@ pub mod message;
 pub mod proxy;
 pub mod resolver;
 pub mod rtp_relay;
+pub mod transaction;
 
 pub use proxy::{SipAccountConfig, SipProxyManager};
