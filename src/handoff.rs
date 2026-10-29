@@ -192,7 +192,7 @@ impl HandoffManager {
             if let Some((pbx_ip, pbx_port)) = &pbx_media {
                 let pbx_addr: SocketAddr = format!("{}:{}", pbx_ip, pbx_port)
                     .parse()
-                    .unwrap_or_else(|_| call.pbx_addr);
+                    .unwrap_or(call.pbx_addr);
                 relay.start(pbx_addr);
                 tracing::info!(
                     pbx_rtp = %pbx_addr,
@@ -509,6 +509,7 @@ impl HandoffManager {
 
     /// Register an active call directly (used for outgoing calls that skip the
     /// pending phase since we already have the SDP answer).
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_active_call(
         &self,
         call_token: String,

@@ -3,8 +3,8 @@
 /// Test SIP message building and parsing through the gateway's message module.
 mod sip_message {
     // We test through aria-sip-core's public API since the gateway re-exports it.
-    use rsip::parser;
-    use rsip::{generate_branch, generate_call_id, generate_tag};
+    use rsip::sip_parser as parser;
+    use rsip::generators::{generate_branch, generate_call_id, generate_tag};
 
     const SAMPLE_INVITE: &str = "\
 INVITE sip:alice@example.com SIP/2.0\r\n\

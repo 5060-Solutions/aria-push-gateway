@@ -14,7 +14,6 @@ use tokio::sync::RwLock;
 use super::digest::DigestAuth;
 use super::message;
 use super::resolver::SrvResolver;
-use super::rtp_relay::RtpRelay;
 use crate::handoff::HandoffManager;
 use crate::push::PushManager;
 
@@ -335,13 +334,12 @@ impl SipProxyManager {
                 let caller_name = message::extract_display_name(text);
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
 
-                let (device_id, push_mgr, handoff, local_ip) = {
+                let (device_id, push_mgr, handoff) = {
                     let r = reg.read().await;
                     (
                         r.device_id.clone(),
                         r.push_manager.clone(),
                         r.handoff.clone(),
-                        r.local_addr.ip().to_string(),
                     )
                 };
 
@@ -866,6 +864,7 @@ impl SipProxyManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_originate_invite(
         target_uri: &str,
         local_ip: &str,
@@ -902,6 +901,7 @@ impl SipProxyManager {
         msg
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_ack(
         target_uri: &str,
         local_ip: &str,

@@ -16,7 +16,9 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct ResolvedServer {
     pub addr: SocketAddr,
+    #[allow(dead_code)] // kept for diagnostics; ordering happens at resolve time
     pub priority: u16,
+    #[allow(dead_code)]
     pub weight: u16,
 }
 
