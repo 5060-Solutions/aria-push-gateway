@@ -189,6 +189,17 @@ The JWT signing secret (`auth.secret`) is never accepted as `api_key`.
 | `DELETE` | `/v1/devices/{id}` | Unregister device |
 | `POST` | `/v1/devices/{id}/heartbeat` | Force a fresh SIP REGISTER after a network change |
 
+Fields that end up in SIP messages are validated, and anything else gets
+`400`:
+- `sip_username`: URI user characters only;
+- `sip_domain` and `sip_registrar`: hostname or IP, no port or parameters;
+- `sip_auth_username`: a user, optionally `user@host`;
+- `sip_transport`: `udp`, `tcp` or `tls`;
+- `sip_display_name` and `sip_password`: no control characters;
+- `platform`: `ios` or `android`.
+
+The display name is always sent as an escaped quoted string.
+
 Registering a device deactivates the caller's own earlier devices with the
 same `sip_username` or the same `push_token`. It never touches another user's
 devices: if another user has an active device with the same push token, both
@@ -241,6 +252,11 @@ unknown, has expired, or belongs to another user's call. `/status` answers
   "sip_domain": "sip.example.com"
 }
 ```
+
+`destination_uri` may be a number or extension (dialled in the account's
+domain), `user@host`, or a `sip:`/`sips:` URI. It is validated like a
+transfer target, so CR/LF, `<>"`, whitespace, `?` headers and `method=` are
+rejected with `400 {"error":"invalid_destination"}`.
 
 `sip_username` + `sip_domain` (domain case-insensitive) select the SIP
 account. It must belong to an **active device the caller registered**,

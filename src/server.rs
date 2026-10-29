@@ -16,7 +16,7 @@ use crate::db::{Database, DeviceRecord};
 use crate::handoff::{self, AcceptError, CallOwner, HandoffManager, TransferError};
 use crate::push::PushManager;
 use crate::sip::proxy::{is_valid_client_ref, OriginateRefusal};
-use crate::sip::SipProxyManager;
+use crate::sip::{validate, SipProxyManager};
 
 #[derive(Clone)]
 struct AppState {
@@ -229,11 +229,38 @@ struct RegisterDeviceResponse {
     status: String,
 }
 
+/// Reject a registration whose fields would not be safe to place into SIP
+/// messages (CR/LF, URI or quoted-string delimiters, unknown transport).
+fn validate_registration(req: &mut RegisterDeviceRequest) -> Result<(), StatusCode> {
+    let valid = matches!(req.platform.as_str(), "ios" | "android")
+        && validate::is_valid_sip_user(&req.sip_username)
+        && validate::is_valid_host(&req.sip_domain)
+        && req
+            .sip_registrar
+            .as_deref()
+            .is_none_or(|r| r.is_empty() || validate::is_valid_host(r))
+        && req
+            .sip_auth_username
+            .as_deref()
+            .is_none_or(|u| u.is_empty() || validate::is_valid_auth_user(u))
+        && validate::is_valid_display_name(&req.sip_display_name)
+        && !req.sip_password.chars().any(char::is_control)
+        && req.sip_port != 0;
+    if !valid {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    req.sip_transport =
+        validate::normalize_transport(&req.sip_transport).ok_or(StatusCode::BAD_REQUEST)?;
+    Ok(())
+}
+
 async fn register_device(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<RegisterDeviceRequest>,
+    body: Result<Json<RegisterDeviceRequest>, JsonRejection>,
 ) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
+    let Json(mut req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    validate_registration(&mut req)?;
     let device_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
 
@@ -513,10 +540,13 @@ async fn make_call(
             ApiError::from(StatusCode::NOT_FOUND)
         })?;
 
+    let destination = validate::destination_uri(&req.destination_uri, &device.sip_domain)
+        .ok_or_else(|| ApiError::coded(StatusCode::BAD_REQUEST, "invalid_destination"))?;
+
     let (call_token, sdp_answer) = state
         .sip_proxy
         .originate_call(
-            &req.destination_uri,
+            &destination,
             &req.sdp_offer,
             &device.sip_config(),
             &auth.user_id,
@@ -2005,5 +2035,119 @@ Content-Length: 0\r\n\r\n";
         pbx.send_to(ok.as_bytes(), gw).await.unwrap();
         let (ack2, _) = recv_from(&pbx).await;
         assert!(ack2.starts_with("ACK sip:2000@10.20.30.40:5070 SIP/2.0"));
+    }
+
+    // ── Header injection ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn registration_rejects_fields_unsafe_for_sip() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let base = serde_json::json!({
+            "platform": "android",
+            "push_token": "t",
+            "sip_username": "1001",
+            "sip_password": "pw",
+            "sip_domain": "pbx.example.com",
+        });
+        for (field, value) in [
+            ("sip_username", "1001\r\nX-Evil: 1"),
+            ("sip_username", "10 01"),
+            ("sip_username", "1001>"),
+            ("sip_domain", "pbx.example.com\r\nX: y"),
+            ("sip_domain", "pbx.example.com;transport=tcp"),
+            ("sip_registrar", "evil.example.com>"),
+            ("sip_transport", "udp\r\nX: y"),
+            ("sip_transport", "sctp"),
+            ("sip_auth_username", "a\"b"),
+            ("sip_display_name", "Bob\r\nX-Evil: 1"),
+            ("sip_password", "pw\r\n"),
+            ("platform", "windows"),
+        ] {
+            let mut body = base.clone();
+            body[field] = serde_json::json!(value);
+            let (status, _) = app.send(post_as("bob", "/v1/devices", &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}={value:?}");
+        }
+        // Malformed JSON is a 400 too.
+        let (status, _) = app
+            .send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/devices")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!(
+                            "Bearer {}",
+                            auth::create_token("bob", JWT_SECRET, 60).unwrap()
+                        ),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_rejects_an_unsafe_destination() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            &app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+        for dest in [
+            "sip:2000@pbx.example.com\r\nX-Evil: 1",
+            "sip:2000@pbx.example.com>",
+            "2000\r\n",
+            "sip:2000@pbx.example.com?Subject=x",
+        ] {
+            let (status, body) = app
+                .send(post_as(
+                    "bob",
+                    "/v1/calls",
+                    &make_call_body(serde_json::json!({ "destination_uri": dest })),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{dest:?}");
+            assert_eq!(body, r#"{"error":"invalid_destination"}"#);
+        }
+        quiet_for(&pbx, 200).await;
+    }
+
+    #[tokio::test]
+    async fn display_name_is_escaped_in_the_invite() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            &app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+        let mut device = app.db.get_device("bob-dev").await.unwrap().unwrap();
+        device.sip_display_name = "Bob \"Q\" \\ Jr".into();
+        app.db.upsert_device(&device).await.unwrap();
+        let req = post_as(
+            "bob",
+            "/v1/calls",
+            &make_call_body(serde_json::json!({ "destination_uri": "2000" })),
+        );
+        let router = app.router.clone();
+        let http = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+        let (invite, _) = recv_from(&pbx).await;
+        assert!(invite.starts_with("INVITE sip:2000@pbx.example.com SIP/2.0\r\n"));
+        assert!(
+            invite.contains("From: \"Bob \\\"Q\\\" \\\\ Jr\" <sip:1001@pbx.example.com>;tag="),
+            "{invite}"
+        );
+        http.abort();
     }
 }
