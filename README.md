@@ -243,7 +243,7 @@ re-registration fails.
 | `POST` | `/v1/calls/{token}/accept` | Accept call with SDP answer (`502` if the 200 OK can't be sent, `409` if a call with the same Call-ID is already active) |
 | `POST` | `/v1/calls/{token}/reject` | Reject call (sends 603 to PBX) |
 | `POST` | `/v1/calls/{token}/hangup` | Hang up active call (sends BYE to PBX) |
-| `POST` | `/v1/calls/{token}/transfer` | Blind-transfer active call (sends REFER to PBX) |
+| `POST` | `/v1/calls/{token}/transfer` | Blind- or attended-transfer an active call (sends REFER to PBX) |
 | `GET` | `/v1/calls/{token}/status` | Poll call state: `pending`, `active`, `ended` (with `reason`) or `unknown` |
 
 Offer, accept, reject, hangup and transfer answer `404` when the token is
@@ -341,7 +341,47 @@ with digest credentials from the SIP account that carried the call. After a
 failed transfer (`502`, or `"transfer":"failed"` in `/status`) the call stays
 up and can be transferred again.
 
-Only blind (unattended) transfer is supported.
+**Attended (consultative) transfer body:** `{"replaces": "<other call token>"}`
+
+Joins the far ends of two of the caller's active calls and drops the phone
+from both: typically the call being transferred and a consultation call the
+user placed to the target. `target` is ignored when `replaces` is present.
+
+The PBX only accepts this as a REFER on a call the phone **received**, with a
+`Replaces` naming a call the phone **placed**. So one call must be incoming
+and the other outgoing; either token may go in the path. The gateway always
+sends the REFER on the incoming call's dialog:
+
+```
+Refer-To: <sip:<consultation remote URI>?Replaces=<consultation Call-ID>%3Bto-tag%3D<remote tag>%3Bfrom-tag%3D<our tag>>
+```
+
+The Call-ID and tags are percent-encoded (everything except
+`A-Z a-z 0-9 - . _ ~`). `Referred-By`, digest retry and the 30 s NOTIFY
+watchdog work as for blind transfer.
+
+| Status | Meaning |
+|--------|---------|
+| `202` | PBX accepted the REFER. Both calls report `"transfer":"pending"` in `/status` |
+| `400` | Malformed body, or `{"error":"same_call"}`: both tokens name the same call |
+| `404` | Either token is unknown or belongs to another user's call |
+| `409` | `{"error":"call_not_established"}`: either call is still ringing or already ended |
+| `409` | `{"error":"unsupported_by_pbx"}`: both calls are incoming or both are outgoing |
+| `409` | (no body) A transfer of either call is already in progress. Both calls are claimed until the transfer resolves |
+| `502` / `504` | As for blind transfer. On `502` both calls stay up and are released; `/status` is unchanged |
+
+Outcome, reported on **both** calls' `/status`:
+
+- **Success.** On the NOTIFY `SIP/2.0 200` the gateway sends BYE on both
+  legs. If the PBX's own BYEs arrive first, they are answered instead. Either
+  way both calls report `{"status":"ended","reason":"transferred"}`.
+- **Failure.** A failure NOTIFY (code `N`), a subscription terminated without
+  success, or no NOTIFY within 30 s (`408`) leaves both calls up. Both report
+  `{"status":"active","transfer":"failed","transfer_code":N}`, and both can be
+  transferred again.
+- **Abandoned.** If the app hangs up the incoming call while the transfer is
+  pending, the consultation call is released with `"transfer":"failed"`,
+  `"transfer_code":487`.
 
 ### Health
 
