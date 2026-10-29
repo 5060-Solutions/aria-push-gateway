@@ -100,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let token_issuer_key = config.auth.resolve_token_issuer_key();
+    config
+        .auth
+        .check_issuer_key(token_issuer_key.as_deref())
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
     match &token_issuer_key {
         None => tracing::warn!(
             "TOKEN_ISSUER_KEY is not set — POST /v1/auth/token will refuse every request"

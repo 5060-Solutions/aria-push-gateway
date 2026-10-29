@@ -72,8 +72,22 @@ impl AuthConfig {
     /// environment if set, else the config value. Blank values and the old
     /// `"auto"` placeholder count as unset.
     pub fn resolve_token_issuer_key(&self) -> Option<String> {
-        let from_env = std::env::var("TOKEN_ISSUER_KEY").ok();
-        normalize_issuer_key(from_env.or_else(|| self.token_issuer_key.clone()))
+        self.issuer_key_from(std::env::var("TOKEN_ISSUER_KEY").ok())
+    }
+
+    /// The issuer key given the environment value: a blank (or `"auto"`)
+    /// environment value does not override a valid config value.
+    fn issuer_key_from(&self, env: Option<String>) -> Option<String> {
+        normalize_issuer_key(env).or_else(|| normalize_issuer_key(self.token_issuer_key.clone()))
+    }
+
+    /// Refuse an issuer key equal to the JWT signing secret: whoever holds
+    /// one would hold the other, and the secret must never leave the gateway.
+    pub fn check_issuer_key(&self, key: Option<&str>) -> anyhow::Result<()> {
+        if key.is_some_and(|k| k == self.secret || k.trim() == self.secret.trim()) {
+            anyhow::bail!("TOKEN_ISSUER_KEY must differ from auth.secret");
+        }
+        Ok(())
     }
 }
 
@@ -178,6 +192,41 @@ mod tests {
         assert!(auth(&"x".repeat(MIN_JWT_SECRET_LEN))
             .check_jwt_secret()
             .is_ok());
+    }
+
+    #[test]
+    fn blank_env_does_not_override_the_config_key() {
+        let mut a = auth(&"s".repeat(40));
+        a.token_issuer_key = Some("from-config".into());
+        assert_eq!(
+            a.issuer_key_from(Some(String::new())).as_deref(),
+            Some("from-config")
+        );
+        assert_eq!(
+            a.issuer_key_from(Some("  ".into())).as_deref(),
+            Some("from-config")
+        );
+        assert_eq!(
+            a.issuer_key_from(Some("auto".into())).as_deref(),
+            Some("from-config")
+        );
+        assert_eq!(
+            a.issuer_key_from(Some("from-env".into())).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(a.issuer_key_from(None).as_deref(), Some("from-config"));
+        a.token_issuer_key = Some(" ".into());
+        assert_eq!(a.issuer_key_from(Some(String::new())), None);
+    }
+
+    #[test]
+    fn issuer_key_equal_to_the_jwt_secret_is_refused() {
+        let secret = "s".repeat(40);
+        let a = auth(&secret);
+        assert!(a.check_issuer_key(Some(&secret)).is_err());
+        assert!(a.check_issuer_key(Some(&format!(" {secret} "))).is_err());
+        assert!(a.check_issuer_key(Some("different-key")).is_ok());
+        assert!(a.check_issuer_key(None).is_ok());
     }
 
     #[test]

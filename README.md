@@ -98,6 +98,8 @@ or in the environment (the environment wins):
 export TOKEN_ISSUER_KEY="$(openssl rand -hex 32)"
 ```
 
+A blank `TOKEN_ISSUER_KEY` doesn't override the config value. The gateway
+refuses to start if the issuer key equals `auth.secret`.
 Without it the gateway still starts, logs a warning, and refuses every token
 request, so no client can obtain a token. Give the same value to the Aria PBX
 API as `PUSH_GATEWAY_ISSUER_KEY`.
