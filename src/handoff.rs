@@ -11,6 +11,11 @@
 //! Active calls can also be blind-transferred: the gateway sends a REFER on
 //! the PBX dialog and, once the PBX reports (via NOTIFY) that the transfer
 //! target answered, ends its own leg with a BYE.
+//!
+//! An attended transfer joins an incoming call to a consultation call the
+//! phone placed: the REFER goes on the incoming call's dialog with a
+//! `Replaces` naming the consultation dialog, and on success both of the
+//! gateway's legs end as transferred.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -69,7 +74,7 @@ struct PendingCall {
     pbx_rtp_port: u16,
 }
 
-/// What the app can learn about a blind transfer after the PBX accepted it.
+/// What the app can learn about a transfer after the PBX accepted it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransferProgress {
     /// No transfer accepted yet on this call.
@@ -81,6 +86,18 @@ pub enum TransferProgress {
     Failed(u16),
 }
 
+/// How a call takes part in an attended transfer (both values are SIP
+/// Call-IDs of active calls).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransferLink {
+    /// The REFER went on this call with a `Replaces` naming this
+    /// consultation call.
+    Replaces(String),
+    /// This is the consultation call replaced into this transferred call;
+    /// it carries no REFER of its own and mirrors that call's outcome.
+    ReplacedInto(String),
+}
+
 /// Transfer bookkeeping for one active call.
 #[derive(Debug, Default)]
 struct TransferTrack {
@@ -89,6 +106,8 @@ struct TransferTrack {
     progress: TransferProgress,
     /// Whether any refer NOTIFY arrived for the current generation.
     notified: bool,
+    /// The other call of the latest attended transfer, if it was one.
+    link: Option<TransferLink>,
 }
 
 /// An active call (post-200 OK) tracked for mid-dialog request forwarding.
@@ -202,6 +221,27 @@ impl ActiveCall {
     /// Allocate the CSeq number for the next request the gateway sends.
     fn next_cseq(&self) -> u32 {
         self.local_cseq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Whether the PBX called us on this dialog (we are the UAS).
+    fn is_incoming(&self) -> bool {
+        self.invite_branch.is_some()
+    }
+
+    /// The consultation call this call is being attended-transferred with,
+    /// if its transfer is still pending and it links back to this call.
+    fn pending_consult<'a>(
+        &self,
+        calls: &'a HashMap<String, ActiveCall>,
+    ) -> Option<&'a ActiveCall> {
+        let Some(TransferLink::Replaces(consult_id)) = self.transfer_track().link.clone() else {
+            return None;
+        };
+        calls.get(&consult_id).filter(|c| {
+            c.transfer_pending.load(Ordering::SeqCst)
+                && c.transfer_track().link
+                    == Some(TransferLink::ReplacedInto(self.dialog.call_id.clone()))
+        })
     }
 }
 
@@ -403,6 +443,36 @@ pub fn build_refer(
     build_in_dialog_request("REFER", dialog, cseq, local_addr, branch, &extra)
 }
 
+/// Percent-encode everything but RFC 3986 unreserved characters, so the
+/// value is safe inside a URI header (`?Replaces=...`) and inside `<...>`.
+fn uri_header_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The `Refer-To` URI of an attended transfer (RFC 5589 §7): the
+/// consultation call's remote party, with a `Replaces` header (RFC 3891)
+/// naming the consultation dialog — its Call-ID, the remote (to) tag and our
+/// own (from) tag, each percent-encoded.
+pub fn replaces_refer_to(consult: &Dialog) -> String {
+    let remote = name_addr_uri(&consult.remote);
+    let target = remote.split('?').next().unwrap_or_default();
+    let tag = |party: &str| message::header_param(party, "tag").unwrap_or_default();
+    format!(
+        "{target}?Replaces={call_id}%3Bto-tag%3D{to_tag}%3Bfrom-tag%3D{from_tag}",
+        call_id = uri_header_escape(&consult.call_id),
+        to_tag = uri_header_escape(&tag(&consult.remote)),
+        from_tag = uri_header_escape(&tag(&consult.local)),
+    )
+}
+
 /// Decode `%XX` escapes (invalid escapes are kept as-is).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -548,6 +618,14 @@ pub enum TransferError {
     NotFound,
     /// Another transfer of this call is already in progress.
     InProgress,
+    /// An attended transfer named a call that is not answered (still
+    /// ringing) or already over.
+    NotEstablished,
+    /// An attended transfer between two calls the PBX can't join: it only
+    /// accepts a REFER on a call the phone received, replacing one it placed.
+    Unsupported,
+    /// An attended transfer named the same call twice.
+    SameCall,
     /// The PBX answered the REFER with a non-2xx final response.
     Rejected(u16),
     /// The PBX did not answer the REFER in time.
@@ -562,6 +640,12 @@ impl std::fmt::Display for TransferError {
             Self::InvalidTarget(why) => write!(f, "invalid transfer target: {why}"),
             Self::NotFound => write!(f, "call token not found or not active"),
             Self::InProgress => write!(f, "a transfer of this call is already in progress"),
+            Self::NotEstablished => write!(f, "both calls must be answered and active"),
+            Self::Unsupported => write!(
+                f,
+                "attended transfer needs one incoming and one outgoing call"
+            ),
+            Self::SameCall => write!(f, "a call cannot replace itself"),
             Self::Rejected(status) => write!(f, "PBX rejected REFER with {status}"),
             Self::Timeout => write!(f, "no final response to REFER"),
             Self::Send(e) => write!(f, "failed to send REFER: {e}"),
@@ -614,21 +698,31 @@ enum ClaimMode {
 /// stop, including its future being dropped when the HTTP client
 /// disconnects mid-transfer.
 struct TransferClaim {
-    flag: Arc<AtomicBool>,
+    /// The claimed calls' `transfer_pending` flags (the consultation call's
+    /// too, for an attended transfer).
+    flags: Vec<Arc<AtomicBool>>,
     mode: ClaimMode,
     active: Arc<RwLock<HashMap<String, ActiveCall>>>,
+    /// The call the REFER is sent on.
     call_id: String,
+    /// The consultation call of an attended transfer.
+    consult: Option<String>,
     timeout: Duration,
 }
 
 impl Drop for TransferClaim {
     fn drop(&mut self) {
         match self.mode {
-            ClaimMode::Release => self.flag.store(false, Ordering::SeqCst),
+            ClaimMode::Release => {
+                for flag in &self.flags {
+                    flag.store(false, Ordering::SeqCst);
+                }
+            }
             ClaimMode::Watch => {
                 tokio::spawn(watch_transfer_outcome(
                     Arc::clone(&self.active),
                     self.call_id.clone(),
+                    self.consult.clone(),
                     self.timeout,
                 ));
             }
@@ -637,41 +731,58 @@ impl Drop for TransferClaim {
     }
 }
 
-/// Mark the call's transfer pending and wait for the outcome: if no refer
-/// NOTIFY arrives within `timeout`, report it failed with 408 and release
-/// the call for another attempt.
+/// Mark the call's transfer (and its consultation call's, for an attended
+/// transfer) pending and wait for the outcome: if no refer NOTIFY arrives on
+/// `call_id` within `timeout`, report it failed with 408 on both and release
+/// them for another attempt. A consultation call whose transferred call is
+/// gone by then is released the same way unless the PBX ended it.
 async fn watch_transfer_outcome(
     active: Arc<RwLock<HashMap<String, ActiveCall>>>,
     call_id: String,
+    consult: Option<String>,
     timeout: Duration,
 ) {
-    let generation = {
+    let ids: Vec<String> = std::iter::once(call_id).chain(consult).collect();
+    let generations: Vec<Option<u64>> = {
         let calls = active.read().await;
-        let Some(call) = calls.get(&call_id) else {
-            return;
-        };
-        let mut track = call.transfer_track();
-        track.generation += 1;
-        track.progress = TransferProgress::Pending;
-        track.notified = false;
-        track.generation
+        ids.iter()
+            .map(|id| {
+                let call = calls.get(id)?;
+                let mut track = call.transfer_track();
+                track.generation += 1;
+                track.progress = TransferProgress::Pending;
+                track.notified = false;
+                Some(track.generation)
+            })
+            .collect()
     };
+    if generations.iter().all(Option::is_none) {
+        return;
+    }
 
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
         let calls = active.read().await;
-        let Some(call) = calls.get(&call_id) else {
-            return;
-        };
-        let silent = {
+        let unresolved = |id: &String, generation: Option<u64>| {
+            let call = calls.get(id)?;
             let track = call.transfer_track();
-            track.generation == generation
-                && track.progress == TransferProgress::Pending
-                && !track.notified
+            (Some(track.generation) == generation && track.progress == TransferProgress::Pending)
+                .then_some((call, track.notified))
         };
-        if silent {
-            tracing::warn!(call_id = %call_id, "No NOTIFY after REFER — transfer failed (408)");
+        let primary = unresolved(&ids[0], generations[0]);
+        let primary_gone = !calls.contains_key(&ids[0]);
+        let silent = primary.is_some_and(|(_, notified)| !notified);
+        if let Some((call, _)) = primary.filter(|_| silent) {
+            tracing::warn!(call_id = %ids[0], "No NOTIFY after REFER — transfer failed (408)");
             call.fail_transfer(408);
+        }
+        if let (Some(id), Some(generation)) = (ids.get(1), generations.get(1)) {
+            if let Some((call, _)) = unresolved(id, *generation) {
+                if silent || primary_gone {
+                    tracing::warn!(call_id = %id, "Attended transfer unresolved — consultation call released (408)");
+                    call.fail_transfer(408);
+                }
+            }
         }
     });
 }
@@ -1540,7 +1651,18 @@ impl HandoffManager {
     ) -> anyhow::Result<()> {
         let call = {
             let mut active = self.active.write().await;
-            active.remove(call_id)
+            let call = active.remove(call_id);
+            // Hanging up a call mid attended transfer abandons it: release
+            // the consultation call for another attempt.
+            if let Some(consult) = call
+                .as_ref()
+                .filter(|_| ended_reason != Some("transferred"))
+                .and_then(|c| c.pending_consult(&active))
+            {
+                tracing::info!(call_id = %call_id, "Transferred call ended — attended transfer abandoned (487)");
+                consult.fail_transfer(487);
+            }
+            call
         };
 
         let call = call.ok_or_else(|| anyhow::anyhow!("Call not active"))?;
@@ -1671,7 +1793,7 @@ impl HandoffManager {
             .await
             .ok_or(TransferError::NotFound)?;
 
-        let (mut claim, dialog, pbx_addr, proxy_reg) = {
+        let (claim, dialog, pbx_addr, proxy_reg) = {
             let active = self.active.read().await;
             let call = active.get(&call_id).ok_or(TransferError::NotFound)?;
             // Claim the call for this transfer; a second concurrent one is
@@ -1683,11 +1805,13 @@ impl HandoffManager {
             {
                 return Err(TransferError::InProgress);
             }
+            call.transfer_track().link = None;
             let claim = TransferClaim {
-                flag: call.transfer_pending.clone(),
+                flags: vec![call.transfer_pending.clone()],
                 mode: ClaimMode::Release,
                 active: Arc::clone(&self.active),
                 call_id: call_id.clone(),
+                consult: None,
                 timeout: self.refer_notify_timeout,
             };
             (
@@ -1698,6 +1822,105 @@ impl HandoffManager {
             )
         };
 
+        self.run_transfer(claim, dialog, pbx_addr, proxy_reg, |domain| {
+            target.refer_to_uri(domain)
+        })
+        .await
+    }
+
+    /// Attended-transfer: join the far end of one of the user's calls to the
+    /// far end of another and drop the phone from both.
+    ///
+    /// The PBX only accepts this as a REFER on a call the phone received,
+    /// with a `Replaces` naming a call the phone placed, so the incoming call
+    /// carries the REFER and the outgoing one is replaced, whichever order
+    /// the tokens come in. Ownership of both tokens is the caller's to check.
+    ///
+    /// On success both calls stay active with their transfer pending; they
+    /// end as `transferred` on the PBX's NOTIFY 200 or BYEs. A failure
+    /// NOTIFY, or none within the timeout, fails the transfer on both and
+    /// leaves both calls up.
+    pub async fn attended_transfer(
+        &self,
+        call_token: &str,
+        replaces_token: &str,
+    ) -> Result<(), TransferError> {
+        self.settle_accepts().await;
+        let a = self
+            .active_call_id(call_token)
+            .await
+            .ok_or(TransferError::NotEstablished)?;
+        let b = self
+            .active_call_id(replaces_token)
+            .await
+            .ok_or(TransferError::NotEstablished)?;
+        if a == b {
+            return Err(TransferError::SameCall);
+        }
+
+        let (claim, dialog, pbx_addr, proxy_reg, refer_to) = {
+            let active = self.active.read().await;
+            let (Some(call_a), Some(call_b)) = (active.get(&a), active.get(&b)) else {
+                return Err(TransferError::NotEstablished);
+            };
+            let (call, consult) = match (call_a.is_incoming(), call_b.is_incoming()) {
+                (true, false) => (call_a, call_b),
+                (false, true) => (call_b, call_a),
+                _ => return Err(TransferError::Unsupported),
+            };
+            // Claim both calls: neither may carry another transfer meanwhile.
+            let claim = |c: &ActiveCall| {
+                c.transfer_pending
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            };
+            if !claim(call) {
+                return Err(TransferError::InProgress);
+            }
+            if !claim(consult) {
+                call.transfer_pending.store(false, Ordering::SeqCst);
+                return Err(TransferError::InProgress);
+            }
+            call.transfer_track().link =
+                Some(TransferLink::Replaces(consult.dialog.call_id.clone()));
+            consult.transfer_track().link =
+                Some(TransferLink::ReplacedInto(call.dialog.call_id.clone()));
+            let claim = TransferClaim {
+                flags: vec![
+                    call.transfer_pending.clone(),
+                    consult.transfer_pending.clone(),
+                ],
+                mode: ClaimMode::Release,
+                active: Arc::clone(&self.active),
+                call_id: call.dialog.call_id.clone(),
+                consult: Some(consult.dialog.call_id.clone()),
+                timeout: self.refer_notify_timeout,
+            };
+            (
+                claim,
+                call.dialog.clone(),
+                call.pbx_addr,
+                call.proxy_reg.clone(),
+                replaces_refer_to(&consult.dialog),
+            )
+        };
+
+        self.run_transfer(claim, dialog, pbx_addr, proxy_reg, |_| refer_to)
+            .await
+    }
+
+    /// Send the REFER for a claimed transfer on `dialog` and wait for the
+    /// PBX to accept it; `refer_to` builds the `Refer-To` URI from the
+    /// account's SIP domain.
+    async fn run_transfer(
+        &self,
+        mut claim: TransferClaim,
+        dialog: Dialog,
+        pbx_addr: SocketAddr,
+        proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+        refer_to: impl FnOnce(&str) -> String,
+    ) -> Result<(), TransferError> {
+        let call_id = claim.call_id.clone();
         let (socket, local_addr, domain, (auth_user, password)) = {
             let reg = proxy_reg.read().await;
             (
@@ -1712,9 +1935,9 @@ impl HandoffManager {
         } else {
             domain
         };
-        let refer_to = target.refer_to_uri(&domain);
+        let refer_to = refer_to(&domain);
 
-        tracing::info!(call_id = %call_id, refer_to = %refer_to, "Sending REFER to PBX");
+        tracing::info!(call_id = %call_id, refer_to = %refer_to, consult = ?claim.consult, "Sending REFER to PBX");
 
         // Send the REFER; if the PBX challenges it, resend once with digest
         // credentials from the registration that carried the call.
@@ -1777,14 +2000,14 @@ impl HandoffManager {
                 // Stay claimed until the NOTIFY/BYE resolves the transfer.
                 claim.mode = ClaimMode::Keep;
                 tracing::info!(call_id = %call_id, "PBX accepted REFER");
-                self.watch_transfer(&call_id).await;
+                self.watch_transfer(&call_id, claim.consult.clone()).await;
             }
             Err(TransferError::Timeout) => {
                 // The PBX may still have acted on it: resolve via NOTIFY,
                 // BYE or the outcome timeout.
                 claim.mode = ClaimMode::Keep;
                 tracing::warn!(call_id = %call_id, "No final response to REFER — outcome pending");
-                self.watch_transfer(&call_id).await;
+                self.watch_transfer(&call_id, claim.consult.clone()).await;
             }
             Err(e) => {
                 claim.mode = ClaimMode::Release;
@@ -1885,11 +2108,13 @@ impl HandoffManager {
 
     /// Mark the call's transfer pending and start a watchdog: if no refer
     /// NOTIFY arrives within the timeout, the transfer is reported failed
-    /// with 408 and the call is released for another attempt.
-    async fn watch_transfer(&self, call_id: &str) {
+    /// with 408 and the call (and `consult`, for an attended transfer) is
+    /// released for another attempt.
+    async fn watch_transfer(&self, call_id: &str, consult: Option<String>) {
         watch_transfer_outcome(
             Arc::clone(&self.active),
             call_id.to_string(),
+            consult,
             self.refer_notify_timeout,
         )
         .await;
@@ -1902,6 +2127,10 @@ impl HandoffManager {
     /// - a 3xx–6xx sipfrag means it failed: report it and keep the call up;
     /// - a terminated subscription without a 2xx also means it failed (408
     ///   when no final status was reported).
+    ///
+    /// For an attended transfer the outcome applies to the consultation call
+    /// too: it is ended as transferred, or its transfer fails with the same
+    /// code.
     ///
     /// Returns whether the NOTIFY belongs to a dialog owned by `socket`
     /// (Call-ID and both tags); the caller answers 481 when it doesn't.
@@ -1927,40 +2156,51 @@ impl HandoffManager {
             return true;
         };
 
-        let completed = {
+        let (completed, consult) = {
             let active = self.active.read().await;
-            let Some(call) = active
-                .get(call_id)
-                .filter(|c| c.transfer_pending.load(Ordering::SeqCst))
-            else {
+            let Some(call) = active.get(call_id).filter(|c| {
+                c.transfer_pending.load(Ordering::SeqCst)
+                    // A consultation call sent no REFER: nothing to report.
+                    && !matches!(c.transfer_track().link, Some(TransferLink::ReplacedInto(_)))
+            }) else {
                 tracing::debug!(call_id = %call_id, ?report, "refer NOTIFY for a call with no transfer in progress");
                 return true;
             };
             call.transfer_track().notified = true;
+            let consult = call.pending_consult(&active);
+            let fail = |status: u16| {
+                call.fail_transfer(status);
+                if let Some(consult) = consult {
+                    consult.fail_transfer(status);
+                }
+            };
 
-            match report.status {
+            let completed = match report.status {
                 Some(200..=299) => true,
                 Some(status @ 300..) => {
                     tracing::warn!(call_id = %call_id, status, "Transfer target failed — call stays up");
-                    call.fail_transfer(status);
+                    fail(status);
                     false
                 }
                 status if report.terminated => {
                     tracing::warn!(call_id = %call_id, ?status, "Refer subscription ended without success — call stays up");
-                    call.fail_transfer(408);
+                    fail(408);
                     false
                 }
                 status => {
                     tracing::debug!(call_id = %call_id, ?status, "Transfer in progress");
                     false
                 }
-            }
+            };
+            (completed, consult.map(|c| c.dialog.call_id.clone()))
         };
 
         if completed {
             tracing::info!(call_id = %call_id, "Transfer completed — ending gateway leg");
-            if let Err(e) = self.end_call_with_bye(call_id, Some("transferred")).await {
-                tracing::warn!(call_id = %call_id, "Failed to end transferred call: {}", e);
+            for id in std::iter::once(call_id).chain(consult.as_deref()) {
+                if let Err(e) = self.end_call_with_bye(id, Some("transferred")).await {
+                    tracing::warn!(call_id = %id, "Failed to end transferred call: {}", e);
+                }
             }
         }
         true
@@ -3205,5 +3445,431 @@ Content-Length: 0\r\n\r\n";
                 .is_err(),
             "no retransmission after the 200"
         );
+    }
+
+    // ── Attended transfer ───────────────────────────────────────────────────
+
+    #[test]
+    fn replaces_refer_to_escapes_the_consultation_dialog() {
+        let consult = Dialog {
+            call_id: "a1 b+c@10.0.0.9".into(),
+            local: "\"Alice\" <sip:1001@pbx.example.com>;tag=our%tag".into(),
+            remote: "<sip:1002@pbx.example.com;user=phone>;tag=their;tag".into(),
+            remote_target: "sip:1002@10.0.0.1".into(),
+            route_set: vec![],
+        };
+        assert_eq!(
+            replaces_refer_to(&consult),
+            "sip:1002@pbx.example.com;user=phone?Replaces=a1%20b%2Bc%4010.0.0.9\
+             %3Bto-tag%3Dtheir%3Bfrom-tag%3Dour%25tag"
+        );
+    }
+
+    /// The Call-ID of the consultation (outgoing) call in [`attended_harness`].
+    const CONSULT_CALL_ID: &str = "c0nsult@10.0.0.9";
+
+    /// An answered incoming call (`in`, from `pbx_in`) and an outgoing call
+    /// (`out`, to `pbx_out`, Call-ID [`CONSULT_CALL_ID`]) on one manager.
+    struct AttendedHarness {
+        mgr: Arc<HandoffManager>,
+        in_token: String,
+        pbx_in: tokio::net::UdpSocket,
+        pbx_out: tokio::net::UdpSocket,
+        /// The gateway socket of the incoming call.
+        gw_in: SocketAddr,
+    }
+
+    async fn attended_harness_with(mgr: HandoffManager) -> AttendedHarness {
+        use crate::sip::proxy::ProxyRegistration;
+        use tokio::net::UdpSocket;
+
+        let mgr = Arc::new(mgr);
+        let reg = |gw: Arc<UdpSocket>| {
+            Arc::new(RwLock::new(ProxyRegistration::for_test(
+                gw,
+                "pbx.example.com",
+                mgr.clone(),
+            )))
+        };
+
+        let pbx_in = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw_in = gw.local_addr().unwrap();
+        let in_token = mgr
+            .create_pending_call(
+                "dev".into(),
+                "inbound-call-1".into(),
+                INBOUND_INVITE.into(),
+                pbx_in.local_addr().unwrap(),
+                reg(gw.clone()),
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+        mgr.accept_call(&in_token, "v=0\r\n".into()).await.unwrap();
+        let ok = recv_text(&pbx_in).await;
+        let ack = format!(
+            "ACK sip:aria-gateway@{gw_in} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack\r\n\
+             From: {}\r\nTo: {}\r\nCall-ID: inbound-call-1\r\n\
+             CSeq: 102 ACK\r\nContent-Length: 0\r\n\r\n",
+            message::extract_header(&ok, "From").unwrap(),
+            message::extract_header(&ok, "To").unwrap(),
+        );
+        assert!(mgr.handle_ack(&ack, &gw).await);
+
+        let pbx_out = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mgr.register_active_call(
+            "out".into(),
+            CONSULT_CALL_ID.into(),
+            CallOwner::User("alice".into()),
+            OUTBOUND_200.replace("outbound-call-1", CONSULT_CALL_ID),
+            pbx_out.local_addr().unwrap(),
+            reg(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())),
+            None,
+            "v=0\r\n".into(),
+            "sip:gw@127.0.0.1".into(),
+        )
+        .await;
+        AttendedHarness {
+            mgr,
+            in_token,
+            pbx_in,
+            pbx_out,
+            gw_in,
+        }
+    }
+
+    async fn attended_harness() -> AttendedHarness {
+        attended_harness_with(HandoffManager::new()).await
+    }
+
+    /// A request from the PBX on the dialog of `ours` (a request we sent).
+    fn pbx_request_on(ours: &str, method: &str, extra: &str, body: &str) -> String {
+        let h = |name| message::extract_header(ours, name).unwrap();
+        format!(
+            "{method} sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-{}\r\n\
+             From: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: 900 {method}\r\n\
+             {extra}Content-Length: {}\r\n\r\n{body}",
+            message::generate_branch(),
+            h("To"),
+            h("From"),
+            h("Call-ID"),
+            body.len()
+        )
+    }
+
+    fn refer_notify_on(refer: &str, frag: &str, state: &str) -> String {
+        pbx_request_on(
+            refer,
+            "NOTIFY",
+            &format!(
+                "Event: refer\r\nSubscription-State: {state}\r\n\
+                 Content-Type: message/sipfrag;version=2.0\r\n"
+            ),
+            frag,
+        )
+    }
+
+    /// Run an attended transfer of the harness calls, check the REFER and
+    /// have the PBX accept it; returns the REFER.
+    async fn accepted_attended(h: &AttendedHarness, token: &str, replaces: &str) -> String {
+        let task = {
+            let mgr = h.mgr.clone();
+            let (token, replaces) = (token.to_string(), replaces.to_string());
+            tokio::spawn(async move { mgr.attended_transfer(&token, &replaces).await })
+        };
+        let mut buf = vec![0u8; 65535];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(2), h.pbx_in.recv_from(&mut buf))
+                .await
+                .expect("no REFER on the incoming call")
+                .unwrap();
+        let refer = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert_eq!(
+            from, h.gw_in,
+            "REFER leaves from the incoming call's socket"
+        );
+        assert!(refer.starts_with("REFER sip:2000@10.0.0.1:5060;transport=udp SIP/2.0\r\n"));
+        assert_eq!(
+            message::extract_header(&refer, "Call-ID").unwrap(),
+            "inbound-call-1"
+        );
+        assert_eq!(
+            message::extract_header(&refer, "Refer-To").unwrap(),
+            "<sip:2000@pbx.example.com?Replaces=c0nsult%4010.0.0.9\
+             %3Bto-tag%3Dpbxtag%3Bfrom-tag%3Dgwtag>"
+        );
+        assert_eq!(
+            message::extract_header(&refer, "Referred-By").unwrap(),
+            "<sip:1001@pbx.example.com>"
+        );
+        h.mgr
+            .handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(task.await.unwrap(), Ok(()));
+        refer
+    }
+
+    async fn status_of(mgr: &HandoffManager, token: &str) -> String {
+        status_json(&mgr.get_call_status(token).await)
+    }
+
+    const PENDING: &str = r#"{"status":"active","transfer":"pending"}"#;
+
+    #[tokio::test]
+    async fn attended_transfer_completes_on_notify_200() {
+        let h = attended_harness().await;
+        let refer = accepted_attended(&h, &h.in_token, "out").await;
+        assert_eq!(status_of(&h.mgr, &h.in_token).await, PENDING);
+        assert_eq!(status_of(&h.mgr, "out").await, PENDING);
+
+        h.mgr
+            .handle_notify(
+                "inbound-call-1",
+                &refer_notify_on(&refer, "SIP/2.0 100 Trying\r\n", "active"),
+            )
+            .await;
+        assert!(h.mgr.is_call_active(CONSULT_CALL_ID).await);
+        h.mgr
+            .handle_notify(
+                "inbound-call-1",
+                &refer_notify_on(&refer, "SIP/2.0 200 OK\r\n", "terminated"),
+            )
+            .await;
+
+        assert!(recv_text(&h.pbx_in).await.starts_with("BYE "));
+        let bye = recv_text(&h.pbx_out).await;
+        assert!(bye.starts_with("BYE "));
+        assert_eq!(
+            message::extract_header(&bye, "Call-ID").unwrap(),
+            CONSULT_CALL_ID
+        );
+        for token in [h.in_token.as_str(), "out"] {
+            match h.mgr.get_call_status(token).await {
+                CallStatus::Ended(info) => assert_eq!(info.reason, "transferred"),
+                _ => panic!("{token} should have ended"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_with_swapped_tokens_refers_the_incoming_call() {
+        let h = attended_harness().await;
+        // The outgoing call's token in the path: the REFER still goes on the
+        // incoming call (checked by `accepted_attended`).
+        accepted_attended(&h, "out", &h.in_token.clone()).await;
+        assert_eq!(status_of(&h.mgr, &h.in_token).await, PENDING);
+        assert_eq!(status_of(&h.mgr, "out").await, PENDING);
+    }
+
+    #[tokio::test]
+    async fn consultation_call_ends_as_transferred_on_the_pbx_bye() {
+        let h = attended_harness().await;
+        accepted_attended(&h, &h.in_token, "out").await;
+
+        // The PBX releases both of the phone's legs itself.
+        let socket_of = |call_id: &'static str| {
+            let mgr = h.mgr.clone();
+            async move { mgr.active.read().await[call_id].socket.clone() }
+        };
+        for (call_id, pbx, token) in [
+            ("inbound-call-1", &h.pbx_in, h.in_token.as_str()),
+            (CONSULT_CALL_ID, &h.pbx_out, "out"),
+        ] {
+            let (local, remote) = {
+                let calls = h.mgr.active.read().await;
+                let dialog = &calls[call_id].dialog;
+                (dialog.local.clone(), dialog.remote.clone())
+            };
+            let bye = format!(
+                "BYE sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bye\r\n\
+                 From: {remote}\r\nTo: {local}\r\nCall-ID: {call_id}\r\n\
+                 CSeq: 900 BYE\r\nContent-Length: 0\r\n\r\n"
+            );
+            let socket = socket_of(call_id).await;
+            let owner = h
+                .mgr
+                .handle_bye_from_pbx(call_id, &bye, pbx.local_addr().unwrap(), &socket)
+                .await
+                .unwrap();
+            assert!(owner.is_some(), "BYE matched {call_id}");
+            match h.mgr.get_call_status(token).await {
+                CallStatus::Ended(info) => assert_eq!(info.reason, "transferred"),
+                _ => panic!("{token} should have ended"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_attended_transfer_leaves_both_calls_up() {
+        let h = attended_harness().await;
+        let refer = accepted_attended(&h, &h.in_token, "out").await;
+        h.mgr
+            .handle_notify(
+                "inbound-call-1",
+                &refer_notify_on(&refer, "SIP/2.0 486 Busy Here\r\n", "terminated"),
+            )
+            .await;
+
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":486}"#;
+        assert_eq!(status_of(&h.mgr, &h.in_token).await, failed);
+        assert_eq!(status_of(&h.mgr, "out").await, failed);
+        assert!(h.mgr.is_call_active("inbound-call-1").await);
+        assert!(h.mgr.is_call_active(CONSULT_CALL_ID).await);
+        // Both calls are released for another attempt.
+        accepted_attended(&h, "out", &h.in_token.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn silent_attended_transfer_fails_on_both_calls() {
+        let h = attended_harness_with(
+            HandoffManager::new().with_refer_notify_timeout(Duration::from_millis(100)),
+        )
+        .await;
+        accepted_attended(&h, &h.in_token, "out").await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":408}"#;
+        assert_eq!(status_of(&h.mgr, &h.in_token).await, failed);
+        assert_eq!(status_of(&h.mgr, "out").await, failed);
+    }
+
+    #[tokio::test]
+    async fn rejected_attended_refer_releases_both_calls() {
+        let h = attended_harness().await;
+        let task = {
+            let (mgr, token) = (h.mgr.clone(), h.in_token.clone());
+            tokio::spawn(async move { mgr.attended_transfer(&token, "out").await })
+        };
+        let refer = recv_text(&h.pbx_in).await;
+        h.mgr
+            .handle_refer_response(&response_to(&refer, "481 Replaced Call Not Found"))
+            .await;
+        assert_eq!(task.await.unwrap(), Err(TransferError::Rejected(481)));
+        assert!(h.mgr.is_call_active("inbound-call-1").await);
+        assert!(h.mgr.is_call_active(CONSULT_CALL_ID).await);
+        // Neither call stays claimed: a blind transfer of the consultation
+        // call goes out.
+        let blind = {
+            let mgr = h.mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("out", "1003").await })
+        };
+        assert!(recv_text(&h.pbx_out).await.starts_with("REFER "));
+        blind.abort();
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_claims_both_calls() {
+        let h = attended_harness().await;
+        accepted_attended(&h, &h.in_token, "out").await;
+        assert_eq!(
+            h.mgr.transfer_call("out", "1003").await,
+            Err(TransferError::InProgress)
+        );
+        assert_eq!(
+            h.mgr.attended_transfer("out", &h.in_token).await,
+            Err(TransferError::InProgress)
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_up_the_transferred_call_releases_the_consultation_call() {
+        let h = attended_harness().await;
+        accepted_attended(&h, &h.in_token, "out").await;
+        h.mgr.hangup_call(&h.in_token).await.unwrap();
+        assert_eq!(
+            status_of(&h.mgr, "out").await,
+            r#"{"status":"active","transfer":"failed","transfer_code":487}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_needs_one_incoming_and_one_outgoing_call() {
+        let Harness { mgr, pbx: _pbx } = outgoing_call_harness().await;
+        let (pbx2, reg) = {
+            use crate::sip::proxy::ProxyRegistration;
+            let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+                gw,
+                "pbx.example.com",
+                mgr.clone(),
+            )));
+            (pbx, reg)
+        };
+        mgr.register_active_call(
+            "tok2".into(),
+            "outbound-call-2".into(),
+            CallOwner::User("alice".into()),
+            OUTBOUND_200.replace("outbound-call-1", "outbound-call-2"),
+            pbx2.local_addr().unwrap(),
+            reg,
+            None,
+            "v=0\r\n".into(),
+            "sip:gw@127.0.0.1".into(),
+        )
+        .await;
+        assert_eq!(
+            mgr.attended_transfer("tok", "tok2").await,
+            Err(TransferError::Unsupported)
+        );
+        assert_eq!(
+            mgr.attended_transfer("tok", "tok").await,
+            Err(TransferError::SameCall)
+        );
+        // Neither call was claimed.
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_needs_both_calls_answered() {
+        let h = attended_harness().await;
+        let (_pbx, ringing) = {
+            use crate::sip::proxy::ProxyRegistration;
+            let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+                gw,
+                "pbx.example.com",
+                h.mgr.clone(),
+            )));
+            let token = h
+                .mgr
+                .create_pending_call(
+                    "dev".into(),
+                    "inbound-call-2".into(),
+                    INBOUND_INVITE.replace("inbound-call-1", "inbound-call-2"),
+                    pbx.local_addr().unwrap(),
+                    reg,
+                    None,
+                    String::new(),
+                    0,
+                    0,
+                )
+                .await;
+            (pbx, token)
+        };
+        assert_eq!(
+            h.mgr.attended_transfer(&ringing, "out").await,
+            Err(TransferError::NotEstablished)
+        );
+        assert_eq!(
+            h.mgr.attended_transfer("out", &ringing).await,
+            Err(TransferError::NotEstablished)
+        );
+        // An ended call is not established either.
+        h.mgr.hangup_call(&h.in_token).await.unwrap();
+        assert_eq!(
+            h.mgr.attended_transfer(&h.in_token, "out").await,
+            Err(TransferError::NotEstablished)
+        );
+        assert_eq!(status_of(&h.mgr, "out").await, r#"{"status":"active"}"#);
     }
 }
