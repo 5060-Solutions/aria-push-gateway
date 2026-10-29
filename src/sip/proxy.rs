@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use super::digest::DigestAuth;
 use super::message;
 use super::resolver::SrvResolver;
-use crate::handoff::HandoffManager;
+use crate::handoff::{CallOwner, HandoffManager};
 use crate::push::PushManager;
 
 /// SIP account configuration received from mobile devices.
@@ -429,9 +429,9 @@ impl SipProxyManager {
                 };
 
                 match handoff.handle_bye_from_pbx(&call_id, text, from).await {
-                    Ok(Some(device_id)) => {
+                    Ok(Some(owner)) => {
                         tracing::info!(
-                            device = %device_id,
+                            owner = %owner,
                             call_id = %call_id,
                             "Call ended by PBX"
                         );
@@ -668,6 +668,7 @@ impl SipProxyManager {
         port: u16,
         auth_username: Option<&str>,
         display_name: &str,
+        owner_user_id: &str,
         handoff: Arc<HandoffManager>,
     ) -> anyhow::Result<(String, String)> {
         let effective_registrar = registrar.unwrap_or(domain);
@@ -818,7 +819,7 @@ impl SipProxyManager {
                         .register_active_call(
                             call_token.clone(),
                             call_id.clone(),
-                            format!("outgoing-{}", &call_token[..8]),
+                            CallOwner::User(owner_user_id.to_string()),
                             text.to_string(),
                             server_addr,
                             proxy_reg,

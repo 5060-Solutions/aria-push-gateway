@@ -22,6 +22,25 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use crate::sip::message;
 use crate::sip::rtp_relay::RtpRelay;
 
+/// Who a call belongs to, for authorizing app requests on its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallOwner {
+    /// An incoming call delivered to this registered device (owned by the
+    /// device's user).
+    Device(String),
+    /// An outgoing call placed by this authenticated user.
+    User(String),
+}
+
+impl std::fmt::Display for CallOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(id) => write!(f, "device {id}"),
+            Self::User(id) => write!(f, "user {id}"),
+        }
+    }
+}
+
 /// A pending call waiting for the mobile app to respond.
 struct PendingCall {
     device_id: String,
@@ -44,7 +63,8 @@ struct PendingCall {
 
 /// An active call (post-200 OK) tracked for mid-dialog request forwarding.
 pub struct ActiveCall {
-    pub device_id: String,
+    /// The device (incoming) or user (outgoing) the call belongs to.
+    pub owner: CallOwner,
     pub pbx_addr: SocketAddr,
     pub proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
     /// Dialog identifiers and routing used for in-dialog requests (BYE, REFER).
@@ -60,7 +80,7 @@ pub struct ActiveCall {
 
 impl ActiveCall {
     fn new(
-        device_id: String,
+        owner: CallOwner,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
         dialog: Dialog,
@@ -68,7 +88,7 @@ impl ActiveCall {
         rtp_relay: Option<Arc<RtpRelay>>,
     ) -> Self {
         Self {
-            device_id,
+            owner,
             pbx_addr,
             proxy_reg,
             dialog,
@@ -430,6 +450,9 @@ pub struct HandoffManager {
 pub struct EndedCallInfo {
     pub reason: String,
     pub ended_at: chrono::DateTime<chrono::Utc>,
+    /// Who the call belonged to; kept so `/status` stays owner-only.
+    #[serde(skip)]
+    pub owner: CallOwner,
 }
 
 impl HandoffManager {
@@ -573,7 +596,7 @@ impl HandoffManager {
             // dialog yet, so its first one (BYE/REFER) uses CSeq 1.
             let dialog = Dialog::from_uas(&call.invite_raw, &ok, call.pbx_addr);
             let active_call = ActiveCall::new(
-                call.device_id,
+                CallOwner::Device(call.device_id),
                 call.pbx_addr,
                 call.proxy_reg.clone(),
                 dialog,
@@ -682,8 +705,9 @@ impl HandoffManager {
             .map(|(t, _)| t.clone());
 
         if let Some(token) = token {
-            pending.remove(&token);
+            let call = pending.remove(&token);
             tracing::info!(call_id = %call_id, token = %token, "Pending call cancelled");
+            let owner = CallOwner::Device(call.map(|c| c.device_id).unwrap_or_default());
 
             // Record as ended so mobile app can detect cancellation
             let mut ended = self.ended_calls.write().await;
@@ -692,6 +716,7 @@ impl HandoffManager {
                 EndedCallInfo {
                     reason: "cancelled".to_string(),
                     ended_at: chrono::Utc::now(),
+                    owner,
                 },
             );
         }
@@ -730,14 +755,33 @@ impl HandoffManager {
         CallStatus::Unknown
     }
 
+    /// Who owns the call behind `call_token`, whether it is pending, active
+    /// or recently ended. `None` if the token is unknown.
+    pub async fn call_owner(&self, call_token: &str) -> Option<CallOwner> {
+        if let Some(call) = self.pending.read().await.get(call_token) {
+            return Some(CallOwner::Device(call.device_id.clone()));
+        }
+        let call_id = self.token_to_call_id.read().await.get(call_token).cloned();
+        if let Some(call_id) = call_id {
+            if let Some(call) = self.active.read().await.get(&call_id) {
+                return Some(call.owner.clone());
+            }
+        }
+        self.ended_calls
+            .read()
+            .await
+            .get(call_token)
+            .map(|info| info.owner.clone())
+    }
+
     /// Handle an incoming BYE from the PBX for an active call.
-    /// Returns the device_id so the caller can send a push/notification.
+    /// Returns the call's owner, or `None` if no such call is active.
     pub async fn handle_bye_from_pbx(
         &self,
         call_id: &str,
         bye_raw: &str,
         from: SocketAddr,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<CallOwner>> {
         let call = {
             let mut active = self.active.write().await;
             active.remove(call_id)
@@ -800,12 +844,13 @@ impl HandoffManager {
                     EndedCallInfo {
                         reason: reason.to_string(),
                         ended_at: chrono::Utc::now(),
+                        owner: call.owner.clone(),
                     },
                 );
             }
         }
 
-        Ok(Some(call.device_id))
+        Ok(Some(call.owner))
     }
 
     /// Look up the SIP Call-ID of an active call by its token.
@@ -897,6 +942,7 @@ impl HandoffManager {
                         EndedCallInfo {
                             reason: reason.to_string(),
                             ended_at: chrono::Utc::now(),
+                            owner: call.owner.clone(),
                         },
                     );
                 }
@@ -1058,7 +1104,7 @@ impl HandoffManager {
         &self,
         call_token: String,
         call_id: String,
-        device_id: String,
+        owner: CallOwner,
         invite_raw: String,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
@@ -1069,14 +1115,8 @@ impl HandoffManager {
         let initial_cseq = message::extract_header(&invite_raw, "CSeq")
             .and_then(|v| v.split_whitespace().next()?.parse().ok())
             .unwrap_or(1);
-        let active_call = ActiveCall::new(
-            device_id,
-            pbx_addr,
-            proxy_reg,
-            dialog,
-            initial_cseq,
-            rtp_relay,
-        );
+        let active_call =
+            ActiveCall::new(owner, pbx_addr, proxy_reg, dialog, initial_cseq, rtp_relay);
 
         {
             let mut active = self.active.write().await;
@@ -1538,7 +1578,7 @@ Content-Length: 0\r\n\r\n";
         mgr.register_active_call(
             "tok".into(),
             "outbound-call-1".into(),
-            "dev".into(),
+            CallOwner::User("alice".into()),
             OUTBOUND_200.into(),
             pbx.local_addr().unwrap(),
             reg,

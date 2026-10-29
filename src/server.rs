@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthUser, JwtSecret};
 use crate::db::{Database, DeviceRecord};
-use crate::handoff::{self, HandoffManager, TransferError};
+use crate::handoff::{self, CallOwner, HandoffManager, TransferError};
 use crate::push::PushManager;
 use crate::sip::SipProxyManager;
 
@@ -138,6 +138,61 @@ async fn create_token(
     }))
 }
 
+// ── Ownership ────────────────────────────────────────────────────────────────
+//
+// Every device and call route answers 404 when the resource exists but
+// belongs to someone else, so a caller can't probe for other users' IDs.
+
+/// Load device `id` if it belongs to `user`; 404 otherwise.
+async fn owned_device(
+    state: &AppState,
+    user: &AuthUser,
+    id: &str,
+) -> Result<DeviceRecord, StatusCode> {
+    let device = state
+        .db
+        .get_device(id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if device.user_id != user.user_id {
+        tracing::warn!(device_id = %id, user = %user.user_id, "device request by non-owner");
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(device)
+}
+
+/// Whether the call behind `token` belongs to `user`: an incoming call must
+/// have been delivered to one of the user's devices, an outgoing call must
+/// have been placed by the user. Unknown tokens are not owned.
+async fn owns_call(state: &AppState, user: &AuthUser, token: &str) -> Result<bool, StatusCode> {
+    let owned = match state.handoff.call_owner(token).await {
+        None => false,
+        Some(CallOwner::User(owner)) => owner == user.user_id,
+        Some(CallOwner::Device(device_id)) => state
+            .db
+            .get_device(&device_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .is_some_and(|d| d.user_id == user.user_id),
+    };
+    Ok(owned)
+}
+
+/// 404 unless the call behind `token` belongs to `user`.
+async fn require_call_owner(
+    state: &AppState,
+    user: &AuthUser,
+    token: &str,
+) -> Result<(), StatusCode> {
+    if owns_call(state, user, token).await? {
+        Ok(())
+    } else {
+        tracing::debug!(user = %user.user_id, "call request for a token the user does not own");
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 // ── Device Registration ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -260,15 +315,10 @@ struct DeviceStatusResponse {
 
 async fn get_device_status(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<DeviceStatusResponse>, StatusCode> {
-    let device = state
-        .db
-        .get_device(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let device = owned_device(&state, &auth, &id).await?;
 
     let sip_status = state
         .sip_proxy
@@ -285,9 +335,11 @@ async fn get_device_status(
 
 async fn unregister_device(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    owned_device(&state, &auth, &id).await?;
+
     // Unregister from SIP
     let _ = state.sip_proxy.unregister_device(&id).await;
 
@@ -311,15 +363,10 @@ async fn unregister_device(
 /// the device's registration binding is updated with the new IP/port.
 async fn device_heartbeat(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let device = state
-        .db
-        .get_device(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let device = owned_device(&state, &auth, &id).await?;
 
     if !device.active {
         return Err(StatusCode::GONE);
@@ -382,7 +429,7 @@ struct MakeCallResponse {
 /// mobile app can set up RTP directly with the remote party).
 async fn make_call(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Json(req): Json<MakeCallRequest>,
 ) -> Result<Json<MakeCallResponse>, StatusCode> {
     let (call_token, sdp_answer) = state
@@ -398,6 +445,7 @@ async fn make_call(
             req.sip_port,
             req.sip_auth_username.as_deref(),
             &req.sip_display_name,
+            &auth.user_id,
             state.handoff.clone(),
         )
         .await
@@ -414,9 +462,10 @@ async fn make_call(
 
 async fn get_call_offer(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
 ) -> Result<Json<handoff::CallOffer>, StatusCode> {
+    require_call_owner(&state, &auth, &token).await?;
     let offer = state
         .handoff
         .get_call_offer(&token)
@@ -433,10 +482,11 @@ struct AcceptCallRequest {
 
 async fn accept_call(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
     Json(req): Json<AcceptCallRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    require_call_owner(&state, &auth, &token).await?;
     state
         .handoff
         .accept_call(&token, req.sdp_answer)
@@ -451,9 +501,10 @@ async fn accept_call(
 
 async fn reject_call(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    require_call_owner(&state, &auth, &token).await?;
     state
         .handoff
         .reject_call(&token)
@@ -465,9 +516,10 @@ async fn reject_call(
 
 async fn hangup_call(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    require_call_owner(&state, &auth, &token).await?;
     state.handoff.hangup_call(&token).await.map_err(|e| {
         tracing::error!("Hangup failed: {}", e);
         StatusCode::NOT_FOUND
@@ -476,12 +528,21 @@ async fn hangup_call(
     Ok(StatusCode::OK)
 }
 
+/// Poll a call's state.
+///
+/// Unlike the other call routes this never answers 404: clients rely on
+/// `{"status":"unknown"}` (200) to learn that a call is gone, so a call that
+/// belongs to someone else reports `unknown` too, exactly like a token the
+/// gateway has never seen.
 async fn get_call_status(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
-) -> Json<handoff::CallStatus> {
-    Json(state.handoff.get_call_status(&token).await)
+) -> Result<Json<handoff::CallStatus>, StatusCode> {
+    if !owns_call(&state, &auth, &token).await? {
+        return Ok(Json(handoff::CallStatus::Unknown));
+    }
+    Ok(Json(state.handoff.get_call_status(&token).await))
 }
 
 #[derive(Deserialize)]
@@ -497,10 +558,11 @@ struct TransferCallRequest {
 /// normal BYE/NOTIFY flow and `/status` reports it as ended.
 async fn transfer_call(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(token): Path<String>,
     body: Result<Json<TransferCallRequest>, JsonRejection>,
 ) -> Result<StatusCode, StatusCode> {
+    require_call_owner(&state, &auth, &token).await?;
     let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
 
     state
@@ -532,21 +594,27 @@ mod tests {
 
     struct TestApp {
         router: Router,
+        db: Database,
+        handoff: Arc<HandoffManager>,
     }
 
     async fn test_app(issuer_key: Option<&str>) -> TestApp {
         let db = Database::connect_in_memory().await.unwrap();
         let handoff = Arc::new(HandoffManager::new());
         let router = build_router(
-            db,
+            db.clone(),
             Arc::new(SipProxyManager::new()),
             Arc::new(PushManager::new_noop()),
-            handoff,
+            handoff.clone(),
             JWT_SECRET.to_string(),
             3600,
             issuer_key.map(str::to_string),
         );
-        TestApp { router }
+        TestApp {
+            router,
+            db,
+            handoff,
+        }
     }
 
     impl TestApp {
@@ -570,7 +638,108 @@ mod tests {
             )
             .await
         }
+
+        async fn call(&self, method: Method, path: &str, user: &str) -> (StatusCode, String) {
+            let jwt = auth::create_token(user, JWT_SECRET, 3600).unwrap();
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {jwt}"));
+            let body = if method == Method::POST {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                if path.ends_with("/accept") {
+                    r#"{"sdp_answer":"v=0\r\n"}"#
+                } else if path.ends_with("/transfer") {
+                    r#"{"target":"1002"}"#
+                } else {
+                    "{}"
+                }
+            } else {
+                ""
+            };
+            self.send(req.body(Body::from(body)).unwrap()).await
+        }
+
+        async fn add_device(&self, id: &str, user_id: &str, active: bool) {
+            let now = chrono::Utc::now();
+            self.db
+                .upsert_device(&DeviceRecord {
+                    id: id.into(),
+                    user_id: user_id.into(),
+                    platform: "android".into(),
+                    push_token: format!("push-{id}"),
+                    bundle_id: None,
+                    sip_username: format!("sip-{id}"),
+                    sip_password: "pw".into(),
+                    sip_domain: "pbx.example.com".into(),
+                    sip_registrar: None,
+                    sip_transport: "udp".into(),
+                    sip_port: 5060,
+                    sip_auth_username: None,
+                    sip_display_name: String::new(),
+                    active,
+                    created_at: now,
+                    updated_at: now,
+                    last_register_at: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn device_active(&self, id: &str) -> bool {
+            self.db.get_device(id).await.unwrap().unwrap().active
+        }
     }
+
+    /// A UDP socket standing in for the PBX, and a registration that sends
+    /// to it from a gateway-side socket.
+    async fn fake_pbx(
+        handoff: &Arc<HandoffManager>,
+    ) -> (
+        tokio::net::UdpSocket,
+        Arc<tokio::sync::RwLock<crate::sip::proxy::ProxyRegistration>>,
+    ) {
+        use crate::sip::proxy::ProxyRegistration;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let reg = Arc::new(tokio::sync::RwLock::new(ProxyRegistration::for_test(
+            gw,
+            "pbx.example.com",
+            handoff.clone(),
+        )));
+        (pbx, reg)
+    }
+
+    async fn recv_text(sock: &tokio::net::UdpSocket) -> String {
+        let mut buf = vec![0u8; 65535];
+        let len = tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv(&mut buf))
+            .await
+            .expect("timed out waiting for SIP message")
+            .unwrap();
+        String::from_utf8(buf[..len].to_vec()).unwrap()
+    }
+
+    const INVITE: &str = "\
+INVITE sip:1001@127.0.0.1 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-inv\r\n\
+From: \"Bob\" <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+To: <sip:1001@pbx.example.com>\r\n\
+Call-ID: in-call-1\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:2000@127.0.0.1:5060>\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: 10\r\n\r\n\
+v=0\r\no=x\r\n";
+
+    const OK_200: &str = "\
+SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:40000;branch=z9hG4bK-out;rport\r\n\
+From: <sip:1001@pbx.example.com>;tag=gwtag\r\n\
+To: <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+Call-ID: out-call-1\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:2000@127.0.0.1:5060>\r\n\
+Content-Length: 0\r\n\r\n";
 
     // ── Token minting ───────────────────────────────────────────────────────
 
@@ -633,5 +802,248 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── Device ownership ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn device_routes_hide_other_users_devices() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+
+        for (method, path) in [
+            (Method::GET, "/v1/devices/bob-dev"),
+            (Method::DELETE, "/v1/devices/bob-dev"),
+            (Method::POST, "/v1/devices/bob-dev/heartbeat"),
+        ] {
+            let (status, _) = app.call(method.clone(), path, "alice").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            // Indistinguishable from a device that doesn't exist.
+            let missing = path.replace("bob-dev", "no-such-dev");
+            let (status, _) = app.call(method.clone(), &missing, "alice").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {missing}");
+        }
+        assert!(
+            app.device_active("bob-dev").await,
+            "alice must not deactivate bob's device"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_routes_work_for_the_owner() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        app.add_device("bob-old", "bob", false).await;
+
+        let (status, body) = app.call(Method::GET, "/v1/devices/bob-dev", "bob").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["device_id"], "bob-dev");
+        assert_eq!(json["active"], true);
+
+        // Ownership passes; the inactive device is then reported gone.
+        let (status, _) = app
+            .call(Method::POST, "/v1/devices/bob-old/heartbeat", "bob")
+            .await;
+        assert_eq!(status, StatusCode::GONE);
+
+        let (status, _) = app.call(Method::DELETE, "/v1/devices/bob-dev", "bob").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!app.device_active("bob-dev").await);
+    }
+
+    #[tokio::test]
+    async fn device_routes_require_a_token() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (status, _) = app
+            .send(
+                Request::builder()
+                    .uri("/v1/devices/bob-dev")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Call ownership ──────────────────────────────────────────────────────
+
+    async fn pending_call_for(app: &TestApp, device_id: &str) -> (tokio::net::UdpSocket, String) {
+        let (pbx, reg) = fake_pbx(&app.handoff).await;
+        let token = app
+            .handoff
+            .create_pending_call(
+                device_id.into(),
+                "in-call-1".into(),
+                INVITE.into(),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+        (pbx, token)
+    }
+
+    async fn outgoing_call_for(app: &TestApp, user: &str) -> (tokio::net::UdpSocket, String) {
+        let (pbx, reg) = fake_pbx(&app.handoff).await;
+        app.handoff
+            .register_active_call(
+                "out-tok".into(),
+                "out-call-1".into(),
+                CallOwner::User(user.into()),
+                OK_200.into(),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+            )
+            .await;
+        (pbx, "out-tok".into())
+    }
+
+    fn call_routes(token: &str) -> Vec<(Method, String)> {
+        vec![
+            (Method::GET, format!("/v1/calls/{token}")),
+            (Method::POST, format!("/v1/calls/{token}/accept")),
+            (Method::POST, format!("/v1/calls/{token}/reject")),
+            (Method::POST, format!("/v1/calls/{token}/hangup")),
+            (Method::POST, format!("/v1/calls/{token}/transfer")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn incoming_call_is_hidden_from_other_users() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (_pbx, token) = pending_call_for(&app, "bob-dev").await;
+
+        for (method, path) in call_routes(&token) {
+            let (status, _) = app.call(method.clone(), &path, "alice").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let (status, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}/status"), "alice")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"status":"unknown"}"#);
+
+        // Alice's attempts left bob's call untouched.
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}/status"), "bob")
+            .await;
+        assert_eq!(body, r#"{"status":"pending"}"#);
+    }
+
+    #[tokio::test]
+    async fn incoming_call_works_for_the_device_owner() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (pbx, token) = pending_call_for(&app, "bob-dev").await;
+
+        let (status, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let offer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(offer["call_token"], token.as_str());
+        assert_eq!(offer["caller_uri"], "2000@pbx.example.com");
+
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/reject"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 603 Decline\r\n"));
+    }
+
+    #[tokio::test]
+    async fn incoming_call_can_be_accepted_by_the_owner() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (pbx, token) = pending_call_for(&app, "bob-dev").await;
+
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/accept"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK\r\n"));
+
+        // Once active, the call is still bob's and still hidden from alice.
+        let status_path = format!("/v1/calls/{token}/status");
+        let (_, body) = app.call(Method::GET, &status_path, "bob").await;
+        assert_eq!(body, r#"{"status":"active"}"#);
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/hangup"), "alice")
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/hangup"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(recv_text(&pbx).await.starts_with("BYE "));
+    }
+
+    #[tokio::test]
+    async fn call_for_an_unknown_device_belongs_to_nobody() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        // The call names a device that isn't in the database at all.
+        let (_pbx, token) = pending_call_for(&app, "ghost-dev").await;
+        let (status, _) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_is_hidden_from_other_users() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (_pbx, token) = outgoing_call_for(&app, "bob").await;
+
+        for (method, path) in call_routes(&token) {
+            let (status, _) = app.call(method.clone(), &path, "alice").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let status_path = format!("/v1/calls/{token}/status");
+        let (_, body) = app.call(Method::GET, &status_path, "alice").await;
+        assert_eq!(body, r#"{"status":"unknown"}"#);
+        assert!(app.handoff.is_call_active("out-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_can_be_hung_up_by_its_caller() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "bob").await;
+
+        let status_path = format!("/v1/calls/{token}/status");
+        let (_, body) = app.call(Method::GET, &status_path, "bob").await;
+        assert_eq!(body, r#"{"status":"active"}"#);
+
+        let (status, _) = app
+            .call(Method::POST, &format!("/v1/calls/{token}/hangup"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(recv_text(&pbx).await.starts_with("BYE "));
+        assert!(!app.handoff.is_call_active("out-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn ended_call_status_stays_owner_only() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (pbx, token) = pending_call_for(&app, "bob-dev").await;
+        app.handoff.handle_cancel("in-call-1").await;
+        drop(pbx);
+
+        let status_path = format!("/v1/calls/{token}/status");
+        let (_, body) = app.call(Method::GET, &status_path, "bob").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["status"], "ended");
+        assert_eq!(json["reason"], "cancelled");
+        assert!(json.get("owner").is_none());
+
+        let (_, body) = app.call(Method::GET, &status_path, "alice").await;
+        assert_eq!(body, r#"{"status":"unknown"}"#);
     }
 }
