@@ -192,43 +192,79 @@ impl Database {
         Ok(())
     }
 
-    /// Deactivate all active devices with a given push token.
-    /// Prevents one physical device from being registered as multiple extensions.
-    pub async fn deactivate_devices_for_token(&self, push_token: &str) -> anyhow::Result<()> {
+    /// Deactivate `user_id`'s active devices with this push token, so one
+    /// physical device isn't registered as several of the user's extensions.
+    /// Other users' devices are never touched.
+    pub async fn deactivate_user_devices_for_token(
+        &self,
+        user_id: &str,
+        push_token: &str,
+    ) -> anyhow::Result<u64> {
         if push_token.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let rows = sqlx::query(
-            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE push_token = ? AND active = TRUE"
+            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP \
+             WHERE user_id = ? AND push_token = ? AND active = TRUE",
         )
-            .bind(push_token)
-            .execute(&self.pool)
-            .await?;
+        .bind(user_id)
+        .bind(push_token)
+        .execute(&self.pool)
+        .await?;
         if rows.rows_affected() > 0 {
             tracing::info!(
+                user = %user_id,
                 deactivated = rows.rows_affected(),
                 "deactivated old device registrations by push token"
             );
         }
-        Ok(())
+        Ok(rows.rows_affected())
     }
 
-    /// Deactivate all active devices for a given SIP username.
-    /// Called before registering a new device to prevent stale registrations.
-    pub async fn deactivate_devices_for_user(&self, sip_username: &str) -> anyhow::Result<()> {
+    /// Deactivate `user_id`'s active devices for a SIP username. Called before
+    /// registering a new device to prevent stale registrations. Other users'
+    /// devices are never touched.
+    pub async fn deactivate_user_devices_for_sip_user(
+        &self,
+        user_id: &str,
+        sip_username: &str,
+    ) -> anyhow::Result<u64> {
         let rows = sqlx::query(
-            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE sip_username = ? AND active = TRUE"
+            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP \
+             WHERE user_id = ? AND sip_username = ? AND active = TRUE",
         )
-            .bind(sip_username)
-            .execute(&self.pool)
-            .await?;
+        .bind(user_id)
+        .bind(sip_username)
+        .execute(&self.pool)
+        .await?;
         if rows.rows_affected() > 0 {
             tracing::info!(
-                user = %sip_username,
+                user = %user_id,
+                sip_user = %sip_username,
                 deactivated = rows.rows_affected(),
                 "deactivated old device registrations"
             );
         }
-        Ok(())
+        Ok(rows.rows_affected())
+    }
+
+    /// How many active devices of users other than `user_id` carry this push
+    /// token.
+    pub async fn count_other_users_devices_for_token(
+        &self,
+        user_id: &str,
+        push_token: &str,
+    ) -> anyhow::Result<i64> {
+        if push_token.is_empty() {
+            return Ok(0);
+        }
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM devices WHERE user_id <> ? AND push_token = ? AND active = TRUE",
+        )
+        .bind(user_id)
+        .bind(push_token)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 }

@@ -183,6 +183,11 @@ The JWT signing secret (`auth.secret`) is never accepted as `api_key`.
 | `DELETE` | `/v1/devices/{id}` | Unregister device |
 | `POST` | `/v1/devices/{id}/heartbeat` | Force a fresh SIP REGISTER after a network change |
 
+Registering a device deactivates the caller's own earlier devices with the
+same `sip_username` or the same `push_token`. It never touches another user's
+devices: if another user has an active device with the same push token, both
+registrations are kept and a warning is logged.
+
 `GET`, `DELETE` and `heartbeat` answer `404` for a device that doesn't exist
 or isn't the caller's. `DELETE` answers `204` on success; `heartbeat` answers
 `204`, `410` for an unregistered (inactive) device, or `502` if the SIP

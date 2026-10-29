@@ -254,22 +254,38 @@ async fn register_device(
         last_register_at: None,
     };
 
-    // Deactivate previous devices for the same username OR same push token.
-    // Same username: prevents stale registrations accumulating.
-    // Same push token: prevents one physical device being registered as multiple extensions.
+    // Replace the caller's own earlier registrations for the same SIP user or
+    // the same push token (one physical device shouldn't be registered as
+    // several extensions). Only the caller's devices are touched: a matching
+    // username or push token on another user's device is left alone, since
+    // nothing here proves the caller owns that SIP account or phone.
     if let Err(e) = state
         .db
-        .deactivate_devices_for_user(&record.sip_username)
+        .deactivate_user_devices_for_sip_user(&record.user_id, &record.sip_username)
         .await
     {
-        tracing::warn!(user = %record.sip_username, %e, "failed to deactivate old devices by user");
+        tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by SIP user");
     }
     if let Err(e) = state
         .db
-        .deactivate_devices_for_token(&record.push_token)
+        .deactivate_user_devices_for_token(&record.user_id, &record.push_token)
         .await
     {
-        tracing::warn!(%e, "failed to deactivate old devices by token");
+        tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by token");
+    }
+    match state
+        .db
+        .count_other_users_devices_for_token(&record.user_id, &record.push_token)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            user = %record.user_id,
+            device_id = %record.id,
+            other_devices = n,
+            "push token is also registered by another user — keeping both registrations"
+        ),
+        Err(e) => tracing::warn!(%e, "failed to check push token reuse"),
     }
 
     // Save to database
@@ -662,15 +678,33 @@ mod tests {
         }
 
         async fn add_device(&self, id: &str, user_id: &str, active: bool) {
+            self.add_device_with(
+                id,
+                user_id,
+                &format!("sip-{id}"),
+                &format!("push-{id}"),
+                active,
+            )
+            .await;
+        }
+
+        async fn add_device_with(
+            &self,
+            id: &str,
+            user_id: &str,
+            sip_username: &str,
+            push_token: &str,
+            active: bool,
+        ) {
             let now = chrono::Utc::now();
             self.db
                 .upsert_device(&DeviceRecord {
                     id: id.into(),
                     user_id: user_id.into(),
                     platform: "android".into(),
-                    push_token: format!("push-{id}"),
+                    push_token: push_token.into(),
                     bundle_id: None,
-                    sip_username: format!("sip-{id}"),
+                    sip_username: sip_username.into(),
                     sip_password: "pw".into(),
                     sip_domain: "pbx.example.com".into(),
                     sip_registrar: None,
@@ -1066,5 +1100,77 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(status, StatusCode::CONFLICT);
 
         first.abort();
+    }
+
+    // ── Device registration ─────────────────────────────────────────────────
+
+    async fn register_as(
+        app: &TestApp,
+        user: &str,
+        sip_username: &str,
+        push_token: &str,
+        pbx: &tokio::net::UdpSocket,
+    ) -> String {
+        let jwt = auth::create_token(user, JWT_SECRET, 3600).unwrap();
+        let body = serde_json::json!({
+            "platform": "android",
+            "push_token": push_token,
+            "sip_username": sip_username,
+            "sip_password": "pw",
+            "sip_domain": "pbx.example.com",
+            "sip_registrar": "127.0.0.1",
+            "sip_port": pbx.local_addr().unwrap().port(),
+        });
+        let (status, resp) = app
+            .send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/devices")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(recv_text(pbx).await.starts_with("REGISTER "));
+        let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        json["device_id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn registering_never_deactivates_another_users_devices() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Alice's device shares bob's SIP username and push token.
+        app.add_device_with("alice-dev", "alice", "1001", "shared-token", true)
+            .await;
+
+        let new_dev = register_as(&app, "bob", "1001", "shared-token", &pbx).await;
+
+        assert!(
+            app.device_active("alice-dev").await,
+            "alice's device must survive"
+        );
+        assert!(app.device_active(&new_dev).await);
+    }
+
+    #[tokio::test]
+    async fn registering_replaces_the_callers_own_stale_devices() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        app.add_device_with("bob-same-sip", "bob", "1001", "old-token", true)
+            .await;
+        app.add_device_with("bob-same-phone", "bob", "1002", "phone-token", true)
+            .await;
+        app.add_device_with("bob-other", "bob", "1003", "other-token", true)
+            .await;
+
+        let new_dev = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
+
+        assert!(!app.device_active("bob-same-sip").await);
+        assert!(!app.device_active("bob-same-phone").await);
+        assert!(app.device_active("bob-other").await);
+        assert!(app.device_active(&new_dev).await);
     }
 }
