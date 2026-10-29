@@ -163,6 +163,7 @@ All authenticated endpoints require `Authorization: Bearer <token>`.
 | `POST` | `/v1/calls/{token}/accept` | Accept call with SDP answer |
 | `POST` | `/v1/calls/{token}/reject` | Reject call (sends 603 to PBX) |
 | `POST` | `/v1/calls/{token}/hangup` | Hang up active call (sends BYE to PBX) |
+| `POST` | `/v1/calls/{token}/transfer` | Blind-transfer active call (sends REFER to PBX) |
 
 **Outgoing call body:**
 ```json
@@ -179,6 +180,24 @@ All authenticated endpoints require `Authorization: Bearer <token>`.
 **Response:** `{"call_token": "<token>", "sdp_answer": "<SDP>"}`
 
 **Accept body:** `{"sdp_answer": "<SDP>"}`
+
+**Transfer body:** `{"target": "1002"}` or `{"target": "sip:1002@pbx.example.com"}`
+
+A bare number/extension (letters, digits and `+ * # . - _`) is sent as
+`Refer-To: <sip:<target>@<account SIP domain>>`; a `sip:`/`sips:` URI is sent
+as-is. Targets containing whitespace, control characters, `<`, `>`, `"`, `,`,
+`?`, a `method=` parameter or unsafe percent-escapes are rejected.
+
+| Status | Meaning |
+|--------|---------|
+| `202` | PBX accepted the REFER. The call then ends through the normal flow: when the PBX reports the transfer succeeded (NOTIFY with `SIP/2.0 200`) the gateway sends BYE, or the PBX sends BYE itself. `/status` then reports `{"status": "ended", "reason": "transferred"}`. |
+| `400` | Missing, empty or invalid `target`, or a malformed JSON body |
+| `401` | Missing or invalid bearer token |
+| `404` | Unknown token, or the call is not active (e.g. still ringing) |
+| `502` | PBX rejected the REFER (non-2xx final response) or it could not be sent |
+| `504` | No final response from the PBX within 8 seconds |
+
+Only blind (unattended) transfer is supported.
 
 ### Health
 
