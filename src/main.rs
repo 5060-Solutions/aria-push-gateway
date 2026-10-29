@@ -33,9 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = config::GatewayConfig::load(&cli.config)?;
 
-    let listen_addr = cli
-        .listen
-        .unwrap_or_else(|| config.server.listen.clone());
+    let listen_addr = cli.listen.unwrap_or_else(|| config.server.listen.clone());
 
     tracing::info!("Aria Push Gateway v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Public URL: {}", config.server.public_url);

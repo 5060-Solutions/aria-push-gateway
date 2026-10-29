@@ -160,10 +160,12 @@ impl Database {
     }
 
     pub async fn deactivate_device(&self, id: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -179,7 +181,9 @@ impl Database {
     /// Deactivate all active devices with a given push token.
     /// Prevents one physical device from being registered as multiple extensions.
     pub async fn deactivate_devices_for_token(&self, push_token: &str) -> anyhow::Result<()> {
-        if push_token.is_empty() { return Ok(()); }
+        if push_token.is_empty() {
+            return Ok(());
+        }
         let rows = sqlx::query(
             "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE push_token = ? AND active = TRUE"
         )
@@ -213,5 +217,4 @@ impl Database {
         }
         Ok(())
     }
-
 }

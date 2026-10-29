@@ -79,9 +79,7 @@ impl HandoffManager {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let now = chrono::Utc::now();
                 let mut map = ended_ref.write().await;
-                map.retain(|_, info| {
-                    (now - info.ended_at).num_seconds() < 120
-                });
+                map.retain(|_, info| (now - info.ended_at).num_seconds() < 120);
             }
         });
 
@@ -149,11 +147,7 @@ impl HandoffManager {
     }
 
     /// Mobile app accepts the call with an SDP answer.
-    pub async fn accept_call(
-        &self,
-        call_token: &str,
-        sdp_answer: String,
-    ) -> anyhow::Result<()> {
+    pub async fn accept_call(&self, call_token: &str, sdp_answer: String) -> anyhow::Result<()> {
         let call = {
             let mut calls = self.pending.write().await;
             calls
@@ -170,21 +164,13 @@ impl HandoffManager {
         // Rewrite the app's SDP answer: replace phone's media address with
         // the gateway's PBX-side relay port (this is what the PBX sees).
         let rewritten_sdp = if call.rtp_relay.is_some() {
-            message::rewrite_sdp_media_address(
-                &sdp_answer,
-                &call.local_ip,
-                call.pbx_rtp_port,
-            )
+            message::rewrite_sdp_media_address(&sdp_answer, &call.local_ip, call.pbx_rtp_port)
         } else {
             sdp_answer.clone()
         };
 
         // Also extract PBX's RTP address from the original INVITE SDP offer
-        let invite_sdp = call
-            .invite_raw
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("");
+        let invite_sdp = call.invite_raw.split("\r\n\r\n").nth(1).unwrap_or("");
         let pbx_media = message::extract_sdp_media_address(invite_sdp);
 
         // Start the RTP relay if allocated
@@ -293,11 +279,7 @@ impl HandoffManager {
 
         // Rewrite the SDP offer with the gateway's phone-side relay address
         let sdp = if call.rtp_relay.is_some() {
-            message::rewrite_sdp_media_address(
-                &raw_sdp,
-                &call.local_ip,
-                call.phone_rtp_port,
-            )
+            message::rewrite_sdp_media_address(&raw_sdp, &call.local_ip, call.phone_rtp_port)
         } else {
             raw_sdp
         };
@@ -338,10 +320,13 @@ impl HandoffManager {
 
             // Record as ended so mobile app can detect cancellation
             let mut ended = self.ended_calls.write().await;
-            ended.insert(token, EndedCallInfo {
-                reason: "cancelled".to_string(),
-                ended_at: chrono::Utc::now(),
-            });
+            ended.insert(
+                token,
+                EndedCallInfo {
+                    reason: "cancelled".to_string(),
+                    ended_at: chrono::Utc::now(),
+                },
+            );
         }
     }
 
@@ -438,10 +423,13 @@ impl HandoffManager {
             // Record as ended so mobile app can detect remote hangup
             let mut ended = self.ended_calls.write().await;
             for token in tokens {
-                ended.insert(token, EndedCallInfo {
-                    reason: "bye_from_remote".to_string(),
-                    ended_at: chrono::Utc::now(),
-                });
+                ended.insert(
+                    token,
+                    EndedCallInfo {
+                        reason: "bye_from_remote".to_string(),
+                        ended_at: chrono::Utc::now(),
+                    },
+                );
             }
         }
 
@@ -455,8 +443,8 @@ impl HandoffManager {
             map.get(call_token).cloned()
         };
 
-        let call_id = call_id
-            .ok_or_else(|| anyhow::anyhow!("Call token not found or not active"))?;
+        let call_id =
+            call_id.ok_or_else(|| anyhow::anyhow!("Call token not found or not active"))?;
 
         let call = {
             let mut active = self.active.write().await;

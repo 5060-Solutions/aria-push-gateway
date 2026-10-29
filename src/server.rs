@@ -172,10 +172,18 @@ async fn register_device(
     // Deactivate previous devices for the same username OR same push token.
     // Same username: prevents stale registrations accumulating.
     // Same push token: prevents one physical device being registered as multiple extensions.
-    if let Err(e) = state.db.deactivate_devices_for_user(&record.sip_username).await {
+    if let Err(e) = state
+        .db
+        .deactivate_devices_for_user(&record.sip_username)
+        .await
+    {
         tracing::warn!(user = %record.sip_username, %e, "failed to deactivate old devices by user");
     }
-    if let Err(e) = state.db.deactivate_devices_for_token(&record.push_token).await {
+    if let Err(e) = state
+        .db
+        .deactivate_devices_for_token(&record.push_token)
+        .await
+    {
         tracing::warn!(%e, "failed to deactivate old devices by token");
     }
 
@@ -430,14 +438,10 @@ async fn hangup_call(
     _auth: AuthUser,
     Path(token): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state
-        .handoff
-        .hangup_call(&token)
-        .await
-        .map_err(|e| {
-            tracing::error!("Hangup failed: {}", e);
-            StatusCode::NOT_FOUND
-        })?;
+    state.handoff.hangup_call(&token).await.map_err(|e| {
+        tracing::error!("Hangup failed: {}", e);
+        StatusCode::NOT_FOUND
+    })?;
 
     Ok(StatusCode::OK)
 }

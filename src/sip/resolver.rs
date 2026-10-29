@@ -38,7 +38,8 @@ pub struct SrvResolver {
 impl SrvResolver {
     /// Create a new SRV resolver using system DNS configuration.
     pub fn new() -> anyhow::Result<Self> {
-        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Ok(Self {
             resolver,
             cache: RwLock::new(std::collections::HashMap::new()),
@@ -134,9 +135,7 @@ impl SrvResolver {
                     }
                     // Track minimum TTL from the A/AAAA records
                     let valid_until = ips.valid_until();
-                    let ttl_secs = valid_until
-                        .duration_since(Instant::now())
-                        .as_secs() as u32;
+                    let ttl_secs = valid_until.duration_since(Instant::now()).as_secs() as u32;
                     min_ttl = min_ttl.min(ttl_secs.max(30));
                 }
                 Err(e) => {
@@ -186,10 +185,7 @@ impl SrvResolver {
         // Cache the A record result too
         let ttl = {
             let valid_until = ips.valid_until();
-            let ttl_secs = valid_until
-                .duration_since(Instant::now())
-                .as_secs()
-                .max(30);
+            let ttl_secs = valid_until.duration_since(Instant::now()).as_secs().max(30);
             Duration::from_secs(ttl_secs)
         };
 

@@ -107,7 +107,8 @@ impl SipProxyManager {
 
         // Resolve server address via SRV lookup (with A record fallback)
         let registrar = config.effective_registrar().to_string();
-        let resolved = self.resolver
+        let resolved = self
+            .resolver
             .resolve(&registrar, config.port, &config.transport)
             .await?;
         let server_addr = resolved
@@ -168,9 +169,7 @@ impl SipProxyManager {
                             Err(_) => continue,
                         };
 
-                        if let Err(e) =
-                            Self::handle_message(&reg_clone, &text, from).await
-                        {
+                        if let Err(e) = Self::handle_message(&reg_clone, &text, from).await {
                             tracing::error!(
                                 device = %device_id_clone,
                                 "Error handling SIP message: {}",
@@ -243,9 +242,7 @@ impl SipProxyManager {
         }
     }
 
-    async fn send_register(
-        reg: &Arc<RwLock<ProxyRegistration>>,
-    ) -> anyhow::Result<()> {
+    async fn send_register(reg: &Arc<RwLock<ProxyRegistration>>) -> anyhow::Result<()> {
         let (msg, server_addr, socket) = {
             let mut r = reg.write().await;
             r.cseq += 1;
@@ -271,9 +268,7 @@ impl SipProxyManager {
         Ok(())
     }
 
-    async fn send_unregister(
-        reg: &Arc<RwLock<ProxyRegistration>>,
-    ) -> anyhow::Result<()> {
+    async fn send_unregister(reg: &Arc<RwLock<ProxyRegistration>>) -> anyhow::Result<()> {
         let (msg, server_addr, socket) = {
             let mut r = reg.write().await;
             r.cseq += 1;
@@ -352,7 +347,7 @@ impl SipProxyManager {
                         text.to_string(),
                         from,
                         reg.clone(),
-                        None,  // no RTP relay — SDP pass-through
+                        None, // no RTP relay — SDP pass-through
                         String::new(),
                         0,
                         0,
@@ -576,9 +571,7 @@ impl SipProxyManager {
                     (msg, r.server_addr, r.socket.clone())
                 };
 
-                socket
-                    .send_to(auth_header.as_bytes(), server_addr)
-                    .await?;
+                socket.send_to(auth_header.as_bytes(), server_addr).await?;
                 tracing::debug!("Sent authenticated REGISTER");
             }
             _ if status >= 400 => {
@@ -616,7 +609,8 @@ impl SipProxyManager {
         let effective_auth_user = auth_username.unwrap_or(username);
 
         // Resolve target via SRV lookup (with A record fallback)
-        let resolved = self.resolver
+        let resolved = self
+            .resolver
             .resolve(effective_registrar, port, transport)
             .await?;
         let server_addr = resolved
@@ -658,8 +652,18 @@ impl SipProxyManager {
         }
 
         let invite = Self::build_originate_invite(
-            &target_uri, &local_ip, local_port, &call_id, 1, &from_tag, &branch,
-            username, domain, display_name, sdp_offer, None,
+            &target_uri,
+            &local_ip,
+            local_port,
+            &call_id,
+            1,
+            &from_tag,
+            &branch,
+            username,
+            domain,
+            display_name,
+            sdp_offer,
+            None,
         );
 
         socket.send_to(invite.as_bytes(), server_addr).await?;
@@ -693,11 +697,7 @@ impl SipProxyManager {
                 }
                 200 => {
                     // Extract SDP from 200 OK
-                    let raw_sdp_answer = text
-                        .split("\r\n\r\n")
-                        .nth(1)
-                        .unwrap_or("")
-                        .to_string();
+                    let raw_sdp_answer = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
                     // Pass PBX's SDP answer through to phone unchanged.
                     // Phone will send RTP directly to PBX media relay.
@@ -709,8 +709,14 @@ impl SipProxyManager {
                     // Send ACK
                     let to_tag = message::extract_to_tag(text).unwrap_or_default();
                     let ack = Self::build_ack(
-                        &target_uri, &local_ip, local_port, &call_id, cseq,
-                        &from_tag, &to_tag, &branch,
+                        &target_uri,
+                        &local_ip,
+                        local_port,
+                        &call_id,
+                        cseq,
+                        &from_tag,
+                        &to_tag,
+                        &branch,
                     );
                     socket.send_to(ack.as_bytes(), server_addr).await?;
 
@@ -743,15 +749,17 @@ impl SipProxyManager {
                     }));
 
                     // Register the active call with the RTP relay handle
-                    handoff.register_active_call(
-                        call_token.clone(),
-                        call_id.clone(),
-                        format!("outgoing-{}", &call_token[..8]),
-                        text.to_string(),
-                        server_addr,
-                        proxy_reg,
-                        None,
-                    ).await;
+                    handoff
+                        .register_active_call(
+                            call_token.clone(),
+                            call_id.clone(),
+                            format!("outgoing-{}", &call_token[..8]),
+                            text.to_string(),
+                            server_addr,
+                            proxy_reg,
+                            None,
+                        )
+                        .await;
 
                     tracing::info!(call_id = %call_id, "Outgoing call connected");
 
@@ -771,7 +779,8 @@ impl SipProxyManager {
                                     };
 
                                     if message::is_request(&text) {
-                                        let method = message::extract_method(&text).unwrap_or_default();
+                                        let method =
+                                            message::extract_method(&text).unwrap_or_default();
                                         match method.as_str() {
                                             "BYE" => {
                                                 let cid = message::extract_header(&text, "Call-ID")
@@ -785,14 +794,21 @@ impl SipProxyManager {
                                                      Content-Length: 0\r\n\r\n",
                                                     Self::echo_headers(&text),
                                                 );
-                                                let _ = recv_socket.send_to(response.as_bytes(), from).await;
+                                                let _ = recv_socket
+                                                    .send_to(response.as_bytes(), from)
+                                                    .await;
 
                                                 // Clean up via handoff
-                                                let _ = recv_handoff.handle_bye_from_pbx(&cid, &text, from).await;
+                                                let _ = recv_handoff
+                                                    .handle_bye_from_pbx(&cid, &text, from)
+                                                    .await;
                                                 break;
                                             }
                                             _ => {
-                                                tracing::debug!("Outgoing call recv loop: ignoring {} request", method);
+                                                tracing::debug!(
+                                                    "Outgoing call recv loop: ignoring {} request",
+                                                    method
+                                                );
                                             }
                                         }
                                     }
@@ -833,8 +849,14 @@ impl SipProxyManager {
                     // Send ACK for the 401/407
                     let to_tag = message::extract_to_tag(text).unwrap_or_default();
                     let ack = Self::build_ack(
-                        &target_uri, &local_ip, local_port, &call_id, cseq,
-                        &from_tag, &to_tag, &branch,
+                        &target_uri,
+                        &local_ip,
+                        local_port,
+                        &call_id,
+                        cseq,
+                        &from_tag,
+                        &to_tag,
+                        &branch,
                     );
                     socket.send_to(ack.as_bytes(), server_addr).await?;
 
@@ -848,8 +870,16 @@ impl SipProxyManager {
                     };
 
                     let invite = Self::build_originate_invite(
-                        &target_uri, &local_ip, local_port, &call_id, cseq,
-                        &from_tag, &new_branch, username, domain, display_name,
+                        &target_uri,
+                        &local_ip,
+                        local_port,
+                        &call_id,
+                        cseq,
+                        &from_tag,
+                        &new_branch,
+                        username,
+                        domain,
+                        display_name,
                         sdp_offer,
                         Some((auth_header_name, &auth.to_header())),
                     );

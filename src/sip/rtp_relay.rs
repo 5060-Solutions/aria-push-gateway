@@ -39,11 +39,7 @@ impl RtpRelay {
         let phone_port = phone_socket.local_addr()?.port();
         let pbx_port = pbx_socket.local_addr()?.port();
 
-        tracing::info!(
-            phone_port,
-            pbx_port,
-            "Allocated RTP relay ports"
-        );
+        tracing::info!(phone_port, pbx_port, "Allocated RTP relay ports");
 
         let relay = Self {
             phone_socket,

@@ -87,9 +87,7 @@ impl PushManager {
                 bundle_id: apns_config.bundle_id.clone(),
                 sandbox: apns_config.sandbox,
                 private_key_pem: key_data,
-                http: reqwest::Client::builder()
-                    .http2_prior_knowledge()
-                    .build()?,
+                http: reqwest::Client::builder().http2_prior_knowledge().build()?,
                 cached_jwt: RwLock::new(None),
             })
         } else {
@@ -156,8 +154,14 @@ impl PushManager {
         };
 
         match device.platform.as_str() {
-            "ios" => self.send_apns(&device, call_token, caller_uri, caller_name).await,
-            "android" => self.send_fcm(&device, call_token, caller_uri, caller_name).await,
+            "ios" => {
+                self.send_apns(&device, call_token, caller_uri, caller_name)
+                    .await
+            }
+            "android" => {
+                self.send_fcm(&device, call_token, caller_uri, caller_name)
+                    .await
+            }
             _ => Err(anyhow::anyhow!("Unknown platform: {}", device.platform)),
         }
     }
@@ -198,10 +202,7 @@ impl PushManager {
         let jwt = self.get_apns_jwt(apns).await?;
 
         let url = format!("{}/3/device/{}", host, device.push_token);
-        let topic = device
-            .bundle_id
-            .as_deref()
-            .unwrap_or(&apns.bundle_id);
+        let topic = device.bundle_id.as_deref().unwrap_or(&apns.bundle_id);
 
         let resp = apns
             .http
@@ -382,7 +383,11 @@ impl PushManager {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("FCM token exchange failed {}: {}", status, body));
+            return Err(anyhow::anyhow!(
+                "FCM token exchange failed {}: {}",
+                status,
+                body
+            ));
         }
 
         let token_resp: GoogleTokenResponse = resp.json().await?;
@@ -394,7 +399,10 @@ impl PushManager {
             *cached = Some((token_resp.access_token.clone(), expires_at));
         }
 
-        tracing::debug!("Obtained new FCM access token (expires in {}s)", token_resp.expires_in);
+        tracing::debug!(
+            "Obtained new FCM access token (expires in {}s)",
+            token_resp.expires_in
+        );
         Ok(token_resp.access_token)
     }
 }
