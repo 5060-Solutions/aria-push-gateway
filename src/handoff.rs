@@ -90,6 +90,9 @@ pub struct ActiveCall {
     pub owner: CallOwner,
     pub pbx_addr: SocketAddr,
     pub proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+    /// The socket that owns this dialog; in-dialog requests are only
+    /// accepted when they arrive on it.
+    socket: Arc<tokio::net::UdpSocket>,
     /// Dialog identifiers and routing used for in-dialog requests (BYE, REFER).
     pub dialog: Dialog,
     /// Last CSeq number the gateway used for a request on this dialog.
@@ -111,6 +114,7 @@ impl ActiveCall {
         owner: CallOwner,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+        socket: Arc<tokio::net::UdpSocket>,
         dialog: Dialog,
         initial_cseq: u32,
         rtp_relay: Option<Arc<RtpRelay>>,
@@ -119,6 +123,7 @@ impl ActiveCall {
             owner,
             pbx_addr,
             proxy_reg,
+            socket,
             dialog,
             local_cseq: AtomicU32::new(initial_cseq),
             transfer_pending: Arc::new(AtomicBool::new(false)),
@@ -126,6 +131,19 @@ impl ActiveCall {
             transfer: std::sync::Mutex::new(TransferTrack::default()),
             _ended: None,
         }
+    }
+
+    /// Whether `request` from the PBX belongs to this call's dialog and
+    /// arrived on the socket that owns it: same Call-ID, the PBX's tag in
+    /// From and ours in To (RFC 3261 §12.2.2).
+    fn owns_request(&self, request: &str, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+        Arc::ptr_eq(&self.socket, socket)
+            && message::extract_header(request, "Call-ID").as_deref()
+                == Some(self.dialog.call_id.as_str())
+            && message::extract_header(request, "From")
+                .and_then(|v| message::header_param(&v, "tag"))
+                == message::header_param(&self.dialog.remote, "tag")
+            && message::extract_to_tag(request) == message::header_param(&self.dialog.local, "tag")
     }
 
     fn transfer_track(&self) -> std::sync::MutexGuard<'_, TransferTrack> {
@@ -483,8 +501,10 @@ pub fn refer_notify_status(notify: &str) -> Option<u16> {
     parse_refer_notify(notify)?.status
 }
 
-/// Outstanding REFER transactions: Via branch -> where the final response goes.
-type PendingRefers = HashMap<String, oneshot::Sender<String>>;
+/// Outstanding REFER transactions: Via branch -> where the final response
+/// goes, and the socket the REFER was sent on (the only one whose responses
+/// may complete it).
+type PendingRefers = HashMap<String, (oneshot::Sender<String>, Arc<tokio::net::UdpSocket>)>;
 
 fn lock_refers(
     refers: &std::sync::Mutex<PendingRefers>,
@@ -736,6 +756,7 @@ impl HandoffManager {
                 CallOwner::Device(call.device_id),
                 call.pbx_addr,
                 call.proxy_reg.clone(),
+                reg.socket.clone(),
                 dialog,
                 0,
                 call.rtp_relay,
@@ -920,15 +941,26 @@ impl HandoffManager {
 
     /// Handle an incoming BYE from the PBX for an active call.
     /// Returns the call's owner, or `None` if no such call is active.
+    ///
+    /// The BYE must match the call's dialog (Call-ID and both tags) and
+    /// arrive on the socket that owns it; otherwise it is treated as unknown.
     pub async fn handle_bye_from_pbx(
         &self,
         call_id: &str,
         bye_raw: &str,
         from: SocketAddr,
+        socket: &Arc<tokio::net::UdpSocket>,
     ) -> anyhow::Result<Option<CallOwner>> {
         let call = {
             let mut active = self.active.write().await;
-            active.remove(call_id)
+            match active.get(call_id) {
+                Some(c) if c.owns_request(bye_raw, socket) => active.remove(call_id),
+                Some(_) => {
+                    tracing::warn!(call_id = %call_id, "BYE does not match the call's dialog or socket");
+                    None
+                }
+                None => None,
+            }
         };
 
         let Some(call) = call else {
@@ -1010,6 +1042,12 @@ impl HandoffManager {
             .await
             .contains_key(&call_id)
             .then_some(call_id)
+    }
+
+    /// Number of calls waiting for the app to answer (tests only).
+    #[cfg(test)]
+    pub async fn pending_count(&self) -> usize {
+        self.pending.read().await.len()
     }
 
     /// Whether a call with this SIP Call-ID is still active.
@@ -1233,13 +1271,13 @@ impl HandoffManager {
     /// RFC 3261 §17.1.2 (UDP), until a final response arrives or we give up.
     async fn refer_transaction(
         &self,
-        socket: &tokio::net::UdpSocket,
+        socket: &Arc<tokio::net::UdpSocket>,
         pbx_addr: SocketAddr,
         refer: &str,
         branch: &str,
     ) -> Result<String, TransferError> {
         let (tx, mut rx) = oneshot::channel();
-        lock_refers(&self.pending_refers).insert(branch.to_string(), tx);
+        lock_refers(&self.pending_refers).insert(branch.to_string(), (tx, socket.clone()));
         let _slot = ReferSlot {
             refers: &self.pending_refers,
             branch,
@@ -1267,7 +1305,14 @@ impl HandoffManager {
 
     /// Deliver a response to a REFER the gateway sent. Provisional responses
     /// are ignored; the first final response completes the transaction.
-    pub async fn handle_refer_response(&self, response: &str) {
+    ///
+    /// Only a response arriving on the socket the REFER was sent from can
+    /// complete it.
+    pub async fn handle_refer_response_on(
+        &self,
+        response: &str,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) {
         let (Some(status), Some(branch)) = (
             message::parse_status_code(response),
             message::extract_via_branch(response),
@@ -1277,9 +1322,32 @@ impl HandoffManager {
         if status < 200 {
             return;
         }
-        let slot = lock_refers(&self.pending_refers).remove(&branch);
-        if let Some(tx) = slot {
+        let slot = {
+            let mut refers = lock_refers(&self.pending_refers);
+            match refers.get(&branch) {
+                Some((_, owner)) if Arc::ptr_eq(owner, socket) => refers.remove(&branch),
+                Some(_) => {
+                    tracing::warn!(%branch, "REFER response arrived on the wrong socket — ignored");
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some((tx, _)) = slot {
             let _ = tx.send(response.to_string());
+        }
+    }
+
+    /// [`Self::handle_refer_response_on`] on the REFER's own socket (tests).
+    #[cfg(test)]
+    pub async fn handle_refer_response(&self, response: &str) {
+        let socket = message::extract_via_branch(response).and_then(|b| {
+            lock_refers(&self.pending_refers)
+                .get(&b)
+                .map(|(_, socket)| socket.clone())
+        });
+        if let Some(socket) = socket {
+            self.handle_refer_response_on(response, &socket).await;
         }
     }
 
@@ -1328,10 +1396,29 @@ impl HandoffManager {
     /// - a 3xx–6xx sipfrag means it failed: report it and keep the call up;
     /// - a terminated subscription without a 2xx also means it failed (408
     ///   when no final status was reported).
-    pub async fn handle_notify(&self, call_id: &str, notify: &str) {
+    ///
+    /// Returns whether the NOTIFY belongs to a dialog owned by `socket`
+    /// (Call-ID and both tags); the caller answers 481 when it doesn't.
+    pub async fn handle_notify_on(
+        &self,
+        call_id: &str,
+        notify: &str,
+        socket: &Arc<tokio::net::UdpSocket>,
+    ) -> bool {
+        let in_dialog = self
+            .active
+            .read()
+            .await
+            .get(call_id)
+            .is_some_and(|c| c.owns_request(notify, socket));
+        if !in_dialog {
+            tracing::debug!(call_id = %call_id, "NOTIFY matches no dialog on this socket");
+            return false;
+        }
+
         let Some(report) = parse_refer_notify(notify) else {
             tracing::debug!(call_id = %call_id, "NOTIFY is not a refer progress report");
-            return;
+            return true;
         };
 
         let completed = {
@@ -1341,7 +1428,7 @@ impl HandoffManager {
                 .filter(|c| c.transfer_pending.load(Ordering::SeqCst))
             else {
                 tracing::debug!(call_id = %call_id, ?report, "refer NOTIFY for a call with no transfer in progress");
-                return;
+                return true;
             };
             call.transfer_track().notified = true;
 
@@ -1370,6 +1457,21 @@ impl HandoffManager {
                 tracing::warn!(call_id = %call_id, "Failed to end transferred call: {}", e);
             }
         }
+        true
+    }
+
+    /// [`Self::handle_notify_on`] on the call's own socket (tests only).
+    #[cfg(test)]
+    pub async fn handle_notify(&self, call_id: &str, notify: &str) {
+        let socket = self
+            .active
+            .read()
+            .await
+            .get(call_id)
+            .map(|c| c.socket.clone());
+        if let Some(socket) = socket {
+            self.handle_notify_on(call_id, notify, &socket).await;
+        }
     }
 
     /// Register an active call directly (used for outgoing calls that skip the
@@ -1397,8 +1499,16 @@ impl HandoffManager {
             .and_then(|v| v.split_whitespace().next()?.parse().ok())
             .unwrap_or(1);
         let (ended_tx, ended_rx) = oneshot::channel();
-        let mut active_call =
-            ActiveCall::new(owner, pbx_addr, proxy_reg, dialog, initial_cseq, rtp_relay);
+        let socket = proxy_reg.read().await.socket.clone();
+        let mut active_call = ActiveCall::new(
+            owner,
+            pbx_addr,
+            proxy_reg,
+            socket,
+            dialog,
+            initial_cseq,
+            rtp_relay,
+        );
         active_call._ended = Some(ended_tx);
 
         {
@@ -1796,7 +1906,7 @@ Content-Length: 0\r\n\r\n";
              Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-n\r\n\
              From: <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
              To: <sip:1001@pbx.example.com>;tag=gwtag\r\n\
-             Call-ID: inbound-call-1\r\n\
+             Call-ID: outbound-call-1\r\n\
              CSeq: 103 NOTIFY\r\n\
              Event: {event}\r\n\
              Subscription-State: {state}\r\n\
@@ -1831,7 +1941,9 @@ Content-Length: 0\r\n\r\n";
     async fn refer_final_response_is_delivered_by_branch() {
         let mgr = HandoffManager::new();
         let (tx, rx) = oneshot::channel();
-        lock_refers(&mgr.pending_refers).insert("z9hG4bK-ref".into(), tx);
+        let own = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let other = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        lock_refers(&mgr.pending_refers).insert("z9hG4bK-ref".into(), (tx, own.clone()));
 
         let resp = |status: &str, branch: &str| {
             format!(
@@ -1850,7 +1962,12 @@ Content-Length: 0\r\n\r\n";
             .await;
         assert!(lock_refers(&mgr.pending_refers).contains_key("z9hG4bK-ref"));
 
-        mgr.handle_refer_response(&resp("202 Accepted", "z9hG4bK-ref"))
+        // A response on another socket can't complete it either.
+        mgr.handle_refer_response_on(&resp("202 Accepted", "z9hG4bK-ref"), &other)
+            .await;
+        assert!(lock_refers(&mgr.pending_refers).contains_key("z9hG4bK-ref"));
+
+        mgr.handle_refer_response_on(&resp("202 Accepted", "z9hG4bK-ref"), &own)
             .await;
         assert_eq!(rx.await, Ok(resp("202 Accepted", "z9hG4bK-ref")));
         assert!(lock_refers(&mgr.pending_refers).is_empty());

@@ -49,6 +49,9 @@ pub struct ProxyRegistration {
     config: SipAccountConfig,
     pub(crate) socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
+    /// Addresses the PBX/registrar resolved to; SIP traffic from anywhere
+    /// else is dropped.
+    peers: Vec<SocketAddr>,
     pub(crate) local_addr: SocketAddr,
     call_id: String,
     from_tag: String,
@@ -60,6 +63,17 @@ pub struct ProxyRegistration {
 }
 
 impl ProxyRegistration {
+    /// Whether a packet from `from` may be processed on this registration.
+    fn is_trusted_peer(&self, from: SocketAddr) -> bool {
+        self.peers.contains(&from)
+    }
+
+    /// Accept SIP traffic from `peer` too (tests only).
+    #[cfg(test)]
+    pub(crate) fn trust_peer(&mut self, peer: SocketAddr) {
+        self.peers.push(peer);
+    }
+
     /// The SIP domain of the account this registration belongs to.
     pub(crate) fn sip_domain(&self) -> &str {
         &self.config.domain
@@ -96,6 +110,7 @@ impl ProxyRegistration {
             },
             socket,
             server_addr: local_addr,
+            peers: Vec::new(),
             local_addr,
             call_id: String::new(),
             from_tag: String::new(),
@@ -309,6 +324,7 @@ impl SipProxyManager {
             config,
             socket: socket.clone(),
             server_addr,
+            peers: resolved.iter().map(|r| r.addr).collect(),
             local_addr,
             call_id,
             from_tag,
@@ -474,6 +490,22 @@ impl SipProxyManager {
         text: &str,
         from: SocketAddr,
     ) -> anyhow::Result<()> {
+        // Only the PBX/registrar this registration resolved to may talk to
+        // it: anyone else could otherwise ring the phone, end its calls or
+        // probe the gateway with OPTIONS.
+        let (trusted, device_id) = {
+            let r = reg.read().await;
+            (r.is_trusted_peer(from), r.device_id.clone())
+        };
+        if !trusted {
+            tracing::warn!(
+                device = %device_id,
+                %from,
+                first_line = %text.lines().next().unwrap_or_default(),
+                "Dropping SIP message from an unexpected source"
+            );
+            return Ok(());
+        }
         if message::is_request(text) {
             Self::handle_request(reg, text, from).await
         } else {
@@ -558,12 +590,15 @@ impl SipProxyManager {
             "BYE" => {
                 // BYE from PBX — end the active call
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                let handoff = {
+                let (handoff, socket) = {
                     let r = reg.read().await;
-                    r.handoff.clone()
+                    (r.handoff.clone(), r.socket.clone())
                 };
 
-                match handoff.handle_bye_from_pbx(&call_id, text, from).await {
+                match handoff
+                    .handle_bye_from_pbx(&call_id, text, from, &socket)
+                    .await
+                {
                     Ok(Some(owner)) => {
                         tracing::info!(
                             owner = %owner,
@@ -634,21 +669,27 @@ impl SipProxyManager {
                 r.socket.send_to(response.as_bytes(), from).await?;
             }
             "NOTIFY" => {
-                // Always acknowledge NOTIFYs; refer-subscription progress may
-                // complete a blind transfer.
+                // An in-dialog NOTIFY (refer progress) must match one of this
+                // socket's dialogs, else 481. Out-of-dialog NOTIFYs from the
+                // PBX (e.g. unsolicited MWI) are acknowledged and ignored.
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                let handoff = {
+                let (handoff, socket) = {
                     let r = reg.read().await;
+                    (r.handoff.clone(), r.socket.clone())
+                };
+                let matched = message::extract_to_tag(text).is_none()
+                    || handoff.handle_notify_on(&call_id, text, &socket).await;
+                if matched {
                     let response = format!(
                         "SIP/2.0 200 OK\r\n\
                          {}\
                          Content-Length: 0\r\n\r\n",
                         Self::echo_headers(text),
                     );
-                    r.socket.send_to(response.as_bytes(), from).await?;
-                    r.handoff.clone()
-                };
-                handoff.handle_notify(&call_id, text).await;
+                    socket.send_to(response.as_bytes(), from).await?;
+                } else {
+                    Self::reply_481(reg, text, from).await?;
+                }
             }
             _ => {
                 tracing::debug!("Ignoring {} request", method);
@@ -678,11 +719,11 @@ impl SipProxyManager {
                 Ok(())
             }
             "REFER" => {
-                let handoff = {
+                let (handoff, socket) = {
                     let r = reg.read().await;
-                    r.handoff.clone()
+                    (r.handoff.clone(), r.socket.clone())
                 };
-                handoff.handle_refer_response(text).await;
+                handoff.handle_refer_response_on(text, &socket).await;
                 Ok(())
             }
             _ => Ok(()),
@@ -903,7 +944,7 @@ impl SipProxyManager {
 
         enum Event {
             Cancel(bool),
-            Recv(Result<std::io::Result<usize>, tokio::time::error::Elapsed>),
+            Recv(Result<std::io::Result<(usize, SocketAddr)>, tokio::time::error::Elapsed>),
         }
 
         loop {
@@ -923,7 +964,7 @@ impl SipProxyManager {
             let event = tokio::select! {
                 biased;
                 r = &mut cancel_rx, if cancel_armed => Event::Cancel(r.is_ok()),
-                r = tokio::time::timeout(wake.saturating_duration_since(now), socket.recv(&mut buf)) => Event::Recv(r),
+                r = tokio::time::timeout(wake.saturating_duration_since(now), socket.recv_from(&mut buf)) => Event::Recv(r),
             };
 
             let len = match event {
@@ -950,7 +991,13 @@ impl SipProxyManager {
                     }
                     continue;
                 }
-                Event::Recv(Ok(r)) => r?,
+                Event::Recv(Ok(r)) => match r? {
+                    (len, from) if from == server_addr => len,
+                    (_, from) => {
+                        tracing::warn!(call_id = %call_id, %from, "Dropping SIP message from an unexpected source");
+                        continue;
+                    }
+                },
             };
 
             let text = std::str::from_utf8(&buf[..len])?;
@@ -1037,6 +1084,7 @@ impl SipProxyManager {
                         },
                         socket: socket.clone(),
                         server_addr,
+                        peers: vec![server_addr],
                         local_addr: SocketAddr::new(local_ip.parse().unwrap(), local_port),
                         call_id: call_id.clone(),
                         from_tag: from_tag.clone(),
@@ -1064,6 +1112,7 @@ impl SipProxyManager {
 
                     Self::spawn_outgoing_call_loop(
                         socket.clone(),
+                        server_addr,
                         handoff.clone(),
                         call_id.clone(),
                         ended,
@@ -1156,9 +1205,14 @@ impl SipProxyManager {
             let retx_at = (tokio::time::Instant::now() + interval).min(give_up);
             loop {
                 let wait = retx_at.saturating_duration_since(tokio::time::Instant::now());
-                let Ok(Ok(len)) = tokio::time::timeout(wait, socket.recv(&mut buf)).await else {
+                let Ok(Ok((len, from))) =
+                    tokio::time::timeout(wait, socket.recv_from(&mut buf)).await
+                else {
                     break;
                 };
+                if from != server_addr {
+                    continue;
+                }
                 let Ok(text) = std::str::from_utf8(&buf[..len]) else {
                     continue;
                 };
@@ -1191,6 +1245,7 @@ impl SipProxyManager {
     /// completed — so the task and its socket don't outlive the call.
     fn spawn_outgoing_call_loop(
         socket: Arc<UdpSocket>,
+        peer: SocketAddr,
         handoff: Arc<HandoffManager>,
         call_id: String,
         mut ended: tokio::sync::oneshot::Receiver<()>,
@@ -1213,6 +1268,10 @@ impl SipProxyManager {
                 let Ok(text) = std::str::from_utf8(&buf[..len]) else {
                     continue;
                 };
+                if from != peer {
+                    tracing::warn!(call_id = %call_id, %from, "Dropping SIP message from an unexpected source");
+                    continue;
+                }
 
                 if message::is_request(text) {
                     let method = message::extract_method(text).unwrap_or_default();
@@ -1220,7 +1279,7 @@ impl SipProxyManager {
                     match method.as_str() {
                         "BYE" => {
                             // Ends the call and answers 200 OK if it is active.
-                            match handoff.handle_bye_from_pbx(&cid, text, from).await {
+                            match handoff.handle_bye_from_pbx(&cid, text, from, &socket).await {
                                 Ok(Some(_)) => {
                                     tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
                                 }
@@ -1236,21 +1295,26 @@ impl SipProxyManager {
                             }
                         }
                         "NOTIFY" => {
-                            let response = format!(
-                                "SIP/2.0 200 OK\r\n\
-                                 {}\
-                                 Content-Length: 0\r\n\r\n",
-                                Self::echo_headers(text),
-                            );
-                            let _ = socket.send_to(response.as_bytes(), from).await;
-                            handoff.handle_notify(&cid, text).await;
+                            let response = if handoff.handle_notify_on(&cid, text, &socket).await {
+                                Some(format!(
+                                    "SIP/2.0 200 OK\r\n\
+                                     {}\
+                                     Content-Length: 0\r\n\r\n",
+                                    Self::echo_headers(text),
+                                ))
+                            } else {
+                                message::build_481(text)
+                            };
+                            if let Some(response) = response {
+                                let _ = socket.send_to(response.as_bytes(), from).await;
+                            }
                         }
                         _ => {
                             tracing::debug!("Outgoing call recv loop: ignoring {} request", method);
                         }
                     }
                 } else if message::extract_cseq_method(text).as_deref() == Some("REFER") {
-                    handoff.handle_refer_response(text).await;
+                    handoff.handle_refer_response_on(text, &socket).await;
                 }
                 // Other responses (200 OK to our BYE, etc.) are ignored.
             }
@@ -1390,6 +1454,7 @@ Content-Length: 0\r\n\r\n";
             .await;
         let recv_loop = SipProxyManager::spawn_outgoing_call_loop(
             gw,
+            pbx.local_addr().unwrap(),
             handoff.clone(),
             "out-call-1".into(),
             ended,
@@ -1518,5 +1583,172 @@ Content-Length: 0\r\n\r\n";
             .await
             .unwrap();
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 481 "));
+    }
+
+    // ── Source and dialog checks ────────────────────────────────────────────
+
+    struct Registered {
+        handoff: Arc<HandoffManager>,
+        reg: Arc<RwLock<ProxyRegistration>>,
+        pbx: UdpSocket,
+        pbx_addr: SocketAddr,
+        foreign: UdpSocket,
+        foreign_addr: SocketAddr,
+    }
+
+    /// A registration that trusts `pbx`, with an active call on it, plus a
+    /// foreign socket on another port.
+    async fn registered_with_call() -> Registered {
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_addr = pbx.local_addr().unwrap();
+        let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let foreign_addr = foreign.local_addr().unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut r = ProxyRegistration::for_test(gw, "pbx.example.com", handoff.clone());
+        r.trust_peer(pbx_addr);
+        let reg = Arc::new(RwLock::new(r));
+        let _call_ended = handoff
+            .register_active_call(
+                "tok".into(),
+                "out-call-1".into(),
+                CallOwner::User("alice".into()),
+                OUTBOUND_200.into(),
+                pbx_addr,
+                reg.clone(),
+                None,
+            )
+            .await;
+        Registered {
+            handoff,
+            reg,
+            pbx,
+            pbx_addr,
+            foreign,
+            foreign_addr,
+        }
+    }
+
+    async fn nothing_arrives(sock: &UdpSocket) {
+        let mut buf = [0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), sock.recv(&mut buf))
+                .await
+                .is_err(),
+            "expected no reply"
+        );
+    }
+
+    const INBOUND_INVITE: &str = "INVITE sip:1001@127.0.0.1 SIP/2.0\r\n\
+        Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-spoof\r\n\
+        From: <sip:666@evil.example.com>;tag=e1\r\n\
+        To: <sip:1001@pbx.example.com>\r\n\
+        Call-ID: spoofed-invite\r\n\
+        CSeq: 1 INVITE\r\n\
+        Content-Length: 0\r\n\r\n";
+
+    fn options() -> &'static str {
+        "OPTIONS sip:1001@127.0.0.1 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-opt\r\n\
+         From: <sip:probe@x>;tag=p\r\nTo: <sip:1001@x>\r\nCall-ID: opt-1\r\n\
+         CSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n"
+    }
+
+    fn refer_notify(call_id: &str) -> String {
+        let frag = "SIP/2.0 200 OK\r\n";
+        format!(
+            "NOTIFY sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-n\r\n\
+             From: <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+             To: <sip:1001@pbx.example.com>;tag=gwtag\r\n\
+             Call-ID: {call_id}\r\nCSeq: 9 NOTIFY\r\nEvent: refer\r\n\
+             Subscription-State: terminated\r\n\
+             Content-Type: message/sipfrag\r\nContent-Length: {}\r\n\r\n{frag}",
+            frag.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn requests_from_foreign_sources_are_dropped() {
+        let r = registered_with_call().await;
+
+        for msg in [
+            INBOUND_INVITE.to_string(),
+            bye("out-call-1"),
+            refer_notify("out-call-1"),
+            options().to_string(),
+        ] {
+            SipProxyManager::handle_message(&r.reg, &msg, r.foreign_addr)
+                .await
+                .unwrap();
+        }
+        nothing_arrives(&r.foreign).await;
+        nothing_arrives(&r.pbx).await;
+        assert_eq!(r.handoff.pending_count().await, 0, "no call may be offered");
+        assert!(r.handoff.is_call_active("out-call-1").await);
+
+        // The same OPTIONS from the PBX is answered.
+        SipProxyManager::handle_message(&r.reg, options(), r.pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn bye_with_wrong_tags_gets_481_and_the_call_stays_up() {
+        let r = registered_with_call().await;
+        for bad in [
+            bye("out-call-1").replace("tag=pbxtag", "tag=someone-else"),
+            bye("out-call-1").replace("tag=gwtag", "tag=not-ours"),
+            bye("out-call-1").replace(";tag=gwtag", ""),
+        ] {
+            SipProxyManager::handle_message(&r.reg, &bad, r.pbx_addr)
+                .await
+                .unwrap();
+            assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 481 "));
+        }
+        assert!(r.handoff.is_call_active("out-call-1").await);
+
+        // A wrong-tag NOTIFY is refused too.
+        let notify = refer_notify("out-call-1").replace("tag=pbxtag", "tag=x");
+        SipProxyManager::handle_message(&r.reg, &notify, r.pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 481 "));
+    }
+
+    #[tokio::test]
+    async fn bye_on_another_registrations_socket_does_not_end_the_call() {
+        let r = registered_with_call().await;
+        let other_gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut other = ProxyRegistration::for_test(other_gw, "pbx.example.com", r.handoff.clone());
+        other.trust_peer(r.pbx_addr);
+        let other = Arc::new(RwLock::new(other));
+
+        SipProxyManager::handle_message(&other, &bye("out-call-1"), r.pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 481 "));
+        assert!(r.handoff.is_call_active("out-call-1").await);
+
+        // On its own socket it ends the call.
+        SipProxyManager::handle_message(&r.reg, &bye("out-call-1"), r.pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 200 OK"));
+        assert!(!r.handoff.is_call_active("out-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn outgoing_loop_drops_foreign_sources() {
+        let call = outgoing_call().await;
+        let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        foreign
+            .send_to(bye("out-call-1").as_bytes(), call.gw_addr)
+            .await
+            .unwrap();
+        nothing_arrives(&foreign).await;
+        assert!(call.handoff.is_call_active("out-call-1").await);
+        call.recv_loop.abort();
     }
 }

@@ -330,6 +330,7 @@ Only blind (unattended) transfer is supported.
 The gateway is designed to be self-hosted. Requirements:
 
 - **Network:** The gateway needs UDP connectivity to your SIP server for REGISTER/INVITE traffic. It also needs outbound HTTPS to APNs/FCM.
+- **SIP sources:** Each registration accepts SIP traffic only from the exact addresses (IP and port) its registrar resolved to, and each outgoing call only from the server it dialled. Everything else is dropped and logged. A PBX that sends requests from a different port than the one it registers on needs its registrar configured to resolve to that address.
 - **Database:** Uses SQLite (no external database needed). The file is created automatically.
 - **Push credentials:** You need an APNs auth key (`.p8` file) for iOS and/or a Firebase service account JSON for Android.
 - **Token issuer key:** Set `TOKEN_ISSUER_KEY` (or `auth.token_issuer_key`) and share it only with the Aria PBX API. Keep it distinct from `auth.secret`.
