@@ -6,8 +6,9 @@
 // Re-export shared parsing utilities
 pub use rsip::generators::{generate_branch, generate_call_id, generate_tag};
 pub use rsip::sip_parser::{
-    extract_cseq_method, extract_display_name, extract_from_uri, extract_header, extract_method,
-    extract_to_tag, is_request, parse_status_code,
+    extract_all_headers, extract_cseq_method, extract_display_name, extract_from_uri,
+    extract_header, extract_method, extract_to_tag, extract_via_branch, is_request,
+    parse_sipfrag_status, parse_status_code,
 };
 
 /// Build a REGISTER request.

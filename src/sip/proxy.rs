@@ -59,6 +59,46 @@ pub struct ProxyRegistration {
     handoff: Arc<HandoffManager>,
 }
 
+impl ProxyRegistration {
+    /// The SIP domain of the account this registration belongs to.
+    pub(crate) fn sip_domain(&self) -> &str {
+        &self.config.domain
+    }
+
+    /// A registration bound to `socket`, for exercising call handling in tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        socket: Arc<UdpSocket>,
+        domain: &str,
+        handoff: Arc<HandoffManager>,
+    ) -> Self {
+        let local_addr = socket.local_addr().expect("bound socket");
+        Self {
+            device_id: "test-device".into(),
+            config: SipAccountConfig {
+                username: "1001".into(),
+                password: String::new(),
+                domain: domain.into(),
+                registrar: None,
+                transport: "udp".into(),
+                port: 5060,
+                auth_username: None,
+                display_name: String::new(),
+            },
+            socket,
+            server_addr: local_addr,
+            local_addr,
+            call_id: String::new(),
+            from_tag: String::new(),
+            cseq: 0,
+            state: ProxyState::Registered,
+            auth_attempts: 0,
+            push_manager: Arc::new(PushManager::new_noop()),
+            handoff,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ProxyState {
     Registering,
@@ -457,6 +497,23 @@ impl SipProxyManager {
                 );
                 r.socket.send_to(response.as_bytes(), from).await?;
             }
+            "NOTIFY" => {
+                // Always acknowledge NOTIFYs; refer-subscription progress may
+                // complete a blind transfer.
+                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
+                let handoff = {
+                    let r = reg.read().await;
+                    let response = format!(
+                        "SIP/2.0 200 OK\r\n\
+                         {}\
+                         Content-Length: 0\r\n\r\n",
+                        Self::echo_headers(text),
+                    );
+                    r.socket.send_to(response.as_bytes(), from).await?;
+                    r.handoff.clone()
+                };
+                handoff.handle_notify(&call_id, text).await;
+            }
             _ => {
                 tracing::debug!("Ignoring {} request", method);
             }
@@ -482,6 +539,14 @@ impl SipProxyManager {
                 // 200 OK to our BYE — call ended cleanly
                 let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
                 tracing::debug!(call_id = %call_id, status, "BYE response received");
+                Ok(())
+            }
+            "REFER" => {
+                let handoff = {
+                    let r = reg.read().await;
+                    r.handoff.clone()
+                };
+                handoff.handle_refer_response(text).await;
                 Ok(())
             }
             _ => Ok(()),
@@ -804,6 +869,24 @@ impl SipProxyManager {
                                                     .await;
                                                 break;
                                             }
+                                            "NOTIFY" => {
+                                                let cid = message::extract_header(&text, "Call-ID")
+                                                    .unwrap_or_default();
+                                                let response = format!(
+                                                    "SIP/2.0 200 OK\r\n\
+                                                     {}\
+                                                     Content-Length: 0\r\n\r\n",
+                                                    Self::echo_headers(&text),
+                                                );
+                                                let _ = recv_socket
+                                                    .send_to(response.as_bytes(), from)
+                                                    .await;
+                                                recv_handoff.handle_notify(&cid, &text).await;
+                                                if !recv_handoff.is_call_active(&cid).await {
+                                                    // Transfer completed and our leg was ended.
+                                                    break;
+                                                }
+                                            }
                                             _ => {
                                                 tracing::debug!(
                                                     "Outgoing call recv loop: ignoring {} request",
@@ -811,8 +894,12 @@ impl SipProxyManager {
                                                 );
                                             }
                                         }
+                                    } else if message::extract_cseq_method(&text).as_deref()
+                                        == Some("REFER")
+                                    {
+                                        recv_handoff.handle_refer_response(&text).await;
                                     }
-                                    // Ignore responses (200 OK to our BYE, etc.)
+                                    // Other responses (200 OK to our BYE, etc.) are ignored.
                                 }
                                 Err(e) => {
                                     tracing::debug!(call_id = %recv_call_id, "Outgoing call socket error: {}", e);

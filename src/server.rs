@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthUser, JwtSecret};
 use crate::db::{Database, DeviceRecord};
-use crate::handoff::{self, HandoffManager};
+use crate::handoff::{self, HandoffManager, TransferError};
 use crate::push::PushManager;
 use crate::sip::SipProxyManager;
 
@@ -57,6 +57,7 @@ pub fn build_router(
         .route("/v1/calls/{token}/accept", post(accept_call))
         .route("/v1/calls/{token}/reject", post(reject_call))
         .route("/v1/calls/{token}/hangup", post(hangup_call))
+        .route("/v1/calls/{token}/transfer", post(transfer_call))
         .route("/v1/calls/{token}/status", get(get_call_status))
         // Health check
         .route("/health", get(health_check))
@@ -452,4 +453,40 @@ async fn get_call_status(
     Path(token): Path<String>,
 ) -> Json<handoff::CallStatus> {
     Json(state.handoff.get_call_status(&token).await)
+}
+
+#[derive(Deserialize)]
+struct TransferCallRequest {
+    /// Dial string / extension (`1002`) or full `sip:` URI.
+    #[serde(default)]
+    target: String,
+}
+
+/// Blind-transfer an active call by sending a REFER to the PBX.
+///
+/// Returns 202 once the PBX accepts the REFER; the call then ends through the
+/// normal BYE/NOTIFY flow and `/status` reports it as ended.
+async fn transfer_call(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(token): Path<String>,
+    body: Result<Json<TransferCallRequest>, JsonRejection>,
+) -> Result<StatusCode, StatusCode> {
+    let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    state
+        .handoff
+        .transfer_call(&token, &req.target)
+        .await
+        .map_err(|e| {
+            tracing::warn!(token = %token, "Transfer failed: {}", e);
+            match e {
+                TransferError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
+                TransferError::NotFound => StatusCode::NOT_FOUND,
+                TransferError::Rejected(_) | TransferError::Send(_) => StatusCode::BAD_GATEWAY,
+                TransferError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            }
+        })?;
+
+    Ok(StatusCode::ACCEPTED)
 }
