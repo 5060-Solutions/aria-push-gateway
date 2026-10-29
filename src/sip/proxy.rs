@@ -60,9 +60,33 @@ pub struct ProxyRegistration {
     auth_attempts: u32,
     push_manager: Arc<PushManager>,
     handoff: Arc<HandoffManager>,
+    /// Set to `true` to retire the registration: refreshes stop, and the
+    /// receive loop exits once no call or transaction uses the socket.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// An Expires: 0 REGISTER is in progress; no new calls are offered.
+    unregistering: bool,
+    /// Bumped on every successful REGISTER so only the latest refresh
+    /// timer fires.
+    refresh_generation: u64,
+    /// When to refresh after a successful REGISTER.
+    refresh_after: Duration,
 }
 
+/// Re-register at 80% of the 3600 s binding.
+const REFRESH_AFTER: Duration = Duration::from_secs(2880);
+/// How long a retiring registration waits for the 200 to its Expires: 0.
+const UNREGISTER_GRACE: Duration = Duration::from_secs(5);
+
 impl ProxyRegistration {
+    /// Expires value for this registration's next REGISTER.
+    fn expires(&self) -> u32 {
+        if self.unregistering {
+            0
+        } else {
+            3600
+        }
+    }
+
     /// Whether a packet from `from` may be processed on this registration.
     fn is_trusted_peer(&self, from: SocketAddr) -> bool {
         self.peers.contains(&from)
@@ -119,6 +143,10 @@ impl ProxyRegistration {
             auth_attempts: 0,
             push_manager: Arc::new(PushManager::new_noop()),
             handoff,
+            stop: tokio::sync::watch::channel(false).0,
+            unregistering: false,
+            refresh_generation: 0,
+            refresh_after: REFRESH_AFTER,
         }
     }
 }
@@ -218,6 +246,8 @@ pub struct SipProxyManager {
     next_invite_id: std::sync::atomic::AtomicU64,
     /// How long an outgoing call may ring before the gateway cancels it.
     ring_timeout: Duration,
+    /// When registrations refresh; shortened in tests.
+    refresh_after: Duration,
 }
 
 impl SipProxyManager {
@@ -229,7 +259,15 @@ impl SipProxyManager {
             pending_invites: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_invite_id: std::sync::atomic::AtomicU64::new(0),
             ring_timeout: super::outgoing::RING_TIMEOUT,
+            refresh_after: REFRESH_AFTER,
         }
+    }
+
+    /// Shorten the registration refresh interval (tests only).
+    #[cfg(test)]
+    pub fn with_refresh_after(mut self, after: Duration) -> Self {
+        self.refresh_after = after;
+        self
     }
 
     /// Shorten the ring timeout (tests only).
@@ -343,12 +381,22 @@ impl SipProxyManager {
             auth_attempts: 0,
             push_manager,
             handoff,
+            stop: tokio::sync::watch::channel(false).0,
+            unregistering: false,
+            refresh_generation: 0,
+            refresh_after: self.refresh_after,
         }));
 
-        // Store registration
-        {
+        // Store registration, retiring any previous one for this device
+        // (heartbeat/re-registration): its binding is removed and its
+        // refreshes, loop and socket end instead of running alongside.
+        let previous = {
             let mut regs = self.registrations.write().await;
-            regs.insert(device_id.clone(), reg.clone());
+            regs.insert(device_id.clone(), reg.clone())
+        };
+        if let Some(previous) = previous {
+            tracing::info!(device = %device_id, "Replacing previous registration");
+            Self::retire(&previous).await;
         }
 
         // Send initial REGISTER
@@ -358,11 +406,38 @@ impl SipProxyManager {
         let reg_clone = reg.clone();
         let socket_clone = socket;
         let device_id_clone = device_id;
+        let mut stop = reg.read().await.stop.subscribe();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let mut consecutive_errors: u32 = 0;
+            let mut stopping = false;
             loop {
-                match socket_clone.recv_from(&mut buf).await {
+                if stopping {
+                    let handoff = reg_clone.read().await.handoff.clone();
+                    if !handoff.socket_in_use(&socket_clone).await {
+                        break;
+                    }
+                }
+                // While retiring, wake up regularly to see if the socket is
+                // still needed by a call.
+                let wait = if stopping {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(3600)
+                };
+                let received = tokio::select! {
+                    changed = stop.changed(), if !stopping => {
+                        if changed.is_err() || *stop.borrow() {
+                            stopping = true;
+                        }
+                        continue;
+                    }
+                    r = tokio::time::timeout(wait, socket_clone.recv_from(&mut buf)) => match r {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    },
+                };
+                match received {
                     Ok((len, from)) => {
                         consecutive_errors = 0;
                         let text = match std::str::from_utf8(&buf[..len]) {
@@ -388,6 +463,9 @@ impl SipProxyManager {
                         );
 
                         if consecutive_errors >= 5 {
+                            if stopping {
+                                break;
+                            }
                             tracing::error!(
                                 device = %device_id_clone,
                                 "Too many consecutive socket errors — attempting re-registration"
@@ -407,9 +485,27 @@ impl SipProxyManager {
                     }
                 }
             }
+            tracing::debug!(device = %device_id_clone, "Registration receive loop ended");
         });
 
         Ok(())
+    }
+
+    /// Retire a registration: send REGISTER with Expires: 0 (answering any
+    /// challenge), and stop its refreshes and receive loop once the PBX
+    /// confirms, or after a short grace period.
+    async fn retire(reg: &Arc<RwLock<ProxyRegistration>>) {
+        if let Err(e) = Self::send_unregister(reg).await {
+            tracing::warn!("Failed to send unregister: {}", e);
+        }
+        let (stop, grace) = {
+            let r = reg.read().await;
+            (r.stop.clone(), UNREGISTER_GRACE.min(r.refresh_after))
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            stop.send_replace(true);
+        });
     }
 
     /// Unregister a device (send REGISTER with Expires: 0).
@@ -420,9 +516,8 @@ impl SipProxyManager {
         };
 
         if let Some(reg) = reg {
-            Self::send_unregister(&reg).await?;
-            let mut regs = self.registrations.write().await;
-            regs.remove(device_id);
+            self.registrations.write().await.remove(device_id);
+            Self::retire(&reg).await;
         }
 
         Ok(())
@@ -459,7 +554,7 @@ impl SipProxyManager {
                 r.cseq,
                 &r.from_tag,
                 None,
-                3600,
+                r.expires(),
             );
             (msg, r.server_addr, r.socket.clone())
         };
@@ -470,29 +565,8 @@ impl SipProxyManager {
     }
 
     async fn send_unregister(reg: &Arc<RwLock<ProxyRegistration>>) -> anyhow::Result<()> {
-        let (msg, server_addr, socket) = {
-            let mut r = reg.write().await;
-            r.cseq += 1;
-            let registrar = r.config.effective_registrar().to_string();
-            let msg = message::build_register(
-                &r.config.username,
-                &r.config.domain,
-                &registrar,
-                &r.local_addr.ip().to_string(),
-                r.local_addr.port(),
-                &r.config.transport,
-                &r.call_id,
-                r.cseq,
-                &r.from_tag,
-                None,
-                0, // Expires: 0 = unregister
-            );
-            (msg, r.server_addr, r.socket.clone())
-        };
-
-        socket.send_to(msg.as_bytes(), server_addr).await?;
-        tracing::debug!("Sent unregister to {}", server_addr);
-        Ok(())
+        reg.write().await.unregistering = true;
+        Self::send_register(reg).await
     }
 
     async fn handle_message(
@@ -664,6 +738,17 @@ impl SipProxyManager {
         text: &str,
         from: SocketAddr,
     ) -> anyhow::Result<()> {
+        if reg.read().await.unregistering {
+            // The binding is being removed; this registration takes no
+            // new calls.
+            if let Some(resp) = message::build_simple_response(text, 480, "Temporarily Unavailable")
+            {
+                handoff
+                    .server_transactions()
+                    .send_final(socket, from, text, resp);
+            }
+            return Ok(());
+        }
         tracing::info!("Incoming INVITE for proxy device");
         Self::reply(socket, message::build_100_trying(text), from).await?;
 
@@ -741,17 +826,37 @@ impl SipProxyManager {
         match status {
             200 => {
                 let mut r = reg.write().await;
-                r.state = ProxyState::Registered;
                 r.auth_attempts = 0;
+                if r.unregistering {
+                    // Binding removed: nothing more to refresh.
+                    tracing::info!(device = %r.device_id, "Proxy registration removed");
+                    r.state = ProxyState::Error("unregistered".into());
+                    r.stop.send_replace(true);
+                    return Ok(());
+                }
+                r.state = ProxyState::Registered;
                 tracing::info!(device = %r.device_id, "Proxy registration successful");
 
-                // Schedule re-registration before expiry
+                // Schedule re-registration before expiry. Only the latest
+                // timer fires, and none once the registration is retired.
+                r.refresh_generation += 1;
+                let generation = r.refresh_generation;
+                let after = r.refresh_after;
+                let mut stop = r.stop.subscribe();
                 let reg_clone = reg.clone();
                 tokio::spawn(async move {
-                    // Re-register at 80% of the 3600s expiry
-                    tokio::time::sleep(Duration::from_secs(2880)).await;
-                    if let Err(e) = Self::send_register(&reg_clone).await {
-                        tracing::error!("Re-registration failed: {}", e);
+                    tokio::select! {
+                        _ = tokio::time::sleep(after) => {}
+                        _ = stop.wait_for(|stopped| *stopped) => return,
+                    }
+                    let current = {
+                        let r = reg_clone.read().await;
+                        r.refresh_generation == generation && !r.unregistering && !*r.stop.borrow()
+                    };
+                    if current {
+                        if let Err(e) = Self::send_register(&reg_clone).await {
+                            tracing::error!("Re-registration failed: {}", e);
+                        }
                     }
                 });
             }
@@ -810,7 +915,7 @@ impl SipProxyManager {
                         r.cseq,
                         &r.from_tag,
                         Some(&auth.to_header()),
-                        3600,
+                        r.expires(),
                     );
 
                     (msg, r.server_addr, r.socket.clone())
@@ -940,6 +1045,10 @@ impl SipProxyManager {
             auth_attempts: 0,
             push_manager: Arc::new(PushManager::new_noop()),
             handoff: handoff.clone(),
+            stop: tokio::sync::watch::channel(false).0,
+            unregistering: false,
+            refresh_generation: 0,
+            refresh_after: REFRESH_AFTER,
         }));
         let ended = handoff
             .register_active_call(
@@ -1709,5 +1818,117 @@ Content-Length: 0\r\n\r\n";
             Err(crate::handoff::AcceptError::Conflict)
         );
         assert!(r.handoff.is_call_active("in-1").await);
+    }
+
+    // ── Registration lifecycle ──────────────────────────────────────────────
+
+    async fn recv_from(sock: &UdpSocket) -> (String, SocketAddr) {
+        let mut buf = vec![0u8; 65535];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for SIP message")
+            .unwrap();
+        (String::from_utf8(buf[..len].to_vec()).unwrap(), from)
+    }
+
+    fn account(pbx: &UdpSocket) -> SipAccountConfig {
+        SipAccountConfig {
+            username: "1001".into(),
+            password: "pw".into(),
+            domain: "pbx.example.com".into(),
+            registrar: Some("127.0.0.1".into()),
+            transport: "udp".into(),
+            port: pbx.local_addr().unwrap().port(),
+            auth_username: None,
+            display_name: String::new(),
+        }
+    }
+
+    /// Answer every REGISTER with 200 and return what arrived, for `ms`.
+    async fn registrar_traffic(pbx: &UdpSocket, ms: u64) -> Vec<(String, SocketAddr)> {
+        let mut seen = Vec::new();
+        let mut buf = vec![0u8; 65535];
+        let until = tokio::time::Instant::now() + Duration::from_millis(ms);
+        while let Ok(Ok((len, from))) =
+            tokio::time::timeout_at(until, pbx.recv_from(&mut buf)).await
+        {
+            let msg = String::from_utf8(buf[..len].to_vec()).unwrap();
+            if msg.starts_with("REGISTER ") {
+                let ok = message::build_simple_response(&msg, 200, "OK").unwrap();
+                pbx.send_to(ok.as_bytes(), from).await.unwrap();
+            }
+            seen.push((msg, from));
+        }
+        seen
+    }
+
+    fn expires(msg: &str) -> String {
+        message::extract_header(msg, "Expires").unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn unregistering_stops_refreshes_and_the_loop() {
+        let mgr = SipProxyManager::new().with_refresh_after(Duration::from_millis(150));
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mgr.register_device(
+            "dev1".into(),
+            account(&pbx),
+            Arc::new(PushManager::new_noop()),
+            handoff,
+        )
+        .await
+        .unwrap();
+
+        // Registered, then refreshed.
+        let seen = registrar_traffic(&pbx, 400).await;
+        assert!(seen.len() >= 2, "expected a refresh: {}", seen.len());
+        assert!(seen.iter().all(|(m, _)| expires(m) == "3600"));
+        let gw = seen[0].1;
+
+        mgr.unregister_device("dev1").await.unwrap();
+        let after = registrar_traffic(&pbx, 600).await;
+        assert_eq!(after.len(), 1, "only the unregister may follow: {after:?}");
+        assert_eq!(expires(&after[0].0), "0");
+        assert_eq!(mgr.get_status("dev1").await, None);
+
+        // The receive loop is gone: nothing answers on the old socket.
+        let opts = "OPTIONS sip:1001@127.0.0.1 SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-o\r\nFrom: <sip:x@y>;tag=1\r\n\
+            To: <sip:1001@y>\r\nCall-ID: o1\r\nCSeq: 1 OPTIONS\r\n\r\n";
+        pbx.send_to(opts.as_bytes(), gw).await.unwrap();
+        nothing_arrives(&pbx).await;
+    }
+
+    #[tokio::test]
+    async fn reregistering_replaces_the_previous_registration() {
+        let mgr = SipProxyManager::new().with_refresh_after(Duration::from_millis(150));
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let push = Arc::new(PushManager::new_noop());
+        mgr.register_device("dev1".into(), account(&pbx), push.clone(), handoff.clone())
+            .await
+            .unwrap();
+        let (first, old_gw) = recv_from(&pbx).await;
+        let ok = message::build_simple_response(&first, 200, "OK").unwrap();
+        pbx.send_to(ok.as_bytes(), old_gw).await.unwrap();
+
+        // Heartbeat: register again.
+        mgr.register_device("dev1".into(), account(&pbx), push, handoff)
+            .await
+            .unwrap();
+        let seen = registrar_traffic(&pbx, 700).await;
+        let from_old: Vec<_> = seen.iter().filter(|(_, f)| *f == old_gw).collect();
+        assert_eq!(
+            from_old.len(),
+            1,
+            "old registration only unregisters: {from_old:?}"
+        );
+        assert_eq!(expires(&from_old[0].0), "0");
+        let new_refreshes = seen
+            .iter()
+            .filter(|(m, f)| *f != old_gw && expires(m) == "3600")
+            .count();
+        assert!(new_refreshes >= 2, "new registration keeps refreshing");
     }
 }

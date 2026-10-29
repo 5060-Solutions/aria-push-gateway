@@ -1607,6 +1607,24 @@ impl HandoffManager {
         Ok(())
     }
 
+    /// Whether a ringing or active call, or an open client transaction,
+    /// still uses `socket` (so a retiring registration keeps it open).
+    pub async fn socket_in_use(&self, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+        self.has_client_transactions(socket)
+            || self
+                .pending
+                .read()
+                .await
+                .values()
+                .any(|c| Arc::ptr_eq(&c.socket, socket))
+            || self
+                .active
+                .read()
+                .await
+                .values()
+                .any(|c| Arc::ptr_eq(&c.socket, socket))
+    }
+
     /// Whether a client transaction (BYE/REFER) is still open on `socket`.
     pub fn has_client_transactions(&self, socket: &Arc<tokio::net::UdpSocket>) -> bool {
         lock_refers(&self.pending_refers)
