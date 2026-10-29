@@ -589,13 +589,15 @@ impl HandoffManager {
     }
 
     /// Mobile app accepts the call with an SDP answer.
+    ///
+    /// The pending-calls lock is held until the call is in the active map,
+    /// so nothing (status polls, ownership checks, hangup, CANCEL, the
+    /// handoff timeout) can observe the call as neither pending nor active.
     pub async fn accept_call(&self, call_token: &str, sdp_answer: String) -> anyhow::Result<()> {
-        let call = {
-            let mut calls = self.pending.write().await;
-            calls
-                .remove(call_token)
-                .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?
-        };
+        let mut pending = self.pending.write().await;
+        let call = pending
+            .remove(call_token)
+            .ok_or_else(|| anyhow::anyhow!("Call token not found or expired"))?;
 
         // Extract the phone's RTP address from its SDP answer
         let phone_media = message::extract_sdp_media_address(&sdp_answer);
@@ -668,7 +670,14 @@ impl HandoffManager {
             }
         }
 
+        drop(pending);
         Ok(())
+    }
+
+    /// Wait for any `accept_call` in flight to finish moving its call from
+    /// pending to active.
+    async fn settle_accepts(&self) {
+        drop(self.pending.read().await);
     }
 
     /// Mobile app rejects the call.
@@ -930,6 +939,7 @@ impl HandoffManager {
 
     /// Mobile app hangs up — send BYE to PBX.
     pub async fn hangup_call(&self, call_token: &str) -> anyhow::Result<()> {
+        self.settle_accepts().await;
         let call_id = {
             let map = self.token_to_call_id.read().await;
             map.get(call_token).cloned()
@@ -1016,6 +1026,7 @@ impl HandoffManager {
     /// [`Self::handle_notify`]).
     pub async fn transfer_call(&self, call_token: &str, target: &str) -> Result<(), TransferError> {
         let target = TransferTarget::parse(target).map_err(TransferError::InvalidTarget)?;
+        self.settle_accepts().await;
 
         let call_id = self
             .active_call_id(call_token)
@@ -2036,5 +2047,159 @@ Content-Length: 0\r\n\r\n";
         mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
             .await;
         assert_eq!(retry.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn accept_is_never_observed_half_done() {
+        use crate::sip::proxy::ProxyRegistration;
+        use tokio::net::UdpSocket;
+
+        for _ in 0..20 {
+            let mgr = Arc::new(HandoffManager::new());
+            let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+                gw,
+                "pbx.example.com",
+                mgr.clone(),
+            )));
+            let token = mgr
+                .create_pending_call(
+                    "dev".into(),
+                    "inbound-call-1".into(),
+                    INBOUND_INVITE.into(),
+                    pbx.local_addr().unwrap(),
+                    reg,
+                    None,
+                    String::new(),
+                    0,
+                    0,
+                )
+                .await;
+
+            // Pollers race the accept and must only ever see pending or active.
+            let pollers: Vec<_> = (0..4)
+                .map(|_| {
+                    let mgr = mgr.clone();
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            assert_eq!(
+                                mgr.call_owner(&token).await,
+                                Some(CallOwner::Device("dev".into())),
+                                "call owner vanished during accept"
+                            );
+                            match mgr.get_call_status(&token).await {
+                                CallStatus::Pending => tokio::task::yield_now().await,
+                                CallStatus::Active => break,
+                                _ => panic!("call reported neither pending nor active"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            tokio::task::yield_now().await;
+            mgr.accept_call(&token, "v=0\r\n".into()).await.unwrap();
+            for p in pollers {
+                p.await.unwrap();
+            }
+            assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hangup_racing_accept_finds_the_call() {
+        use crate::sip::proxy::ProxyRegistration;
+        use tokio::net::UdpSocket;
+
+        for _ in 0..20 {
+            let mgr = Arc::new(HandoffManager::new());
+            let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+                gw,
+                "pbx.example.com",
+                mgr.clone(),
+            )));
+            let token = mgr
+                .create_pending_call(
+                    "dev".into(),
+                    "inbound-call-1".into(),
+                    INBOUND_INVITE.into(),
+                    pbx.local_addr().unwrap(),
+                    reg,
+                    None,
+                    String::new(),
+                    0,
+                    0,
+                )
+                .await;
+            let hangup = {
+                let mgr = mgr.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    // Hang up as soon as the call stops looking pending; it
+                    // must then be found active, never unknown.
+                    while matches!(mgr.get_call_status(&token).await, CallStatus::Pending) {
+                        tokio::task::yield_now().await;
+                    }
+                    mgr.hangup_call(&token).await
+                })
+            };
+            tokio::task::yield_now().await;
+            mgr.accept_call(&token, "v=0\r\n".into()).await.unwrap();
+            hangup
+                .await
+                .unwrap()
+                .expect("hangup must find the accepted call");
+            assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK"));
+            assert!(recv_text(&pbx).await.starts_with("BYE "));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_after_accept_does_not_end_the_answered_call() {
+        use crate::sip::proxy::ProxyRegistration;
+        use tokio::net::UdpSocket;
+
+        let mgr = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+            gw,
+            "pbx.example.com",
+            mgr.clone(),
+        )));
+        let token = mgr
+            .create_pending_call(
+                "dev".into(),
+                "inbound-call-1".into(),
+                INBOUND_INVITE.into(),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+        let accept = {
+            let mgr = mgr.clone();
+            let token = token.clone();
+            tokio::spawn(async move { mgr.accept_call(&token, "v=0\r\n".into()).await })
+        };
+        let cancel = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.handle_cancel("inbound-call-1").await })
+        };
+        accept.await.unwrap().unwrap();
+        cancel.await.unwrap();
+        // Whichever ran first, the call is never left unknown: either the
+        // CANCEL won (ended) or the answer did (active).
+        match mgr.get_call_status(&token).await {
+            CallStatus::Active | CallStatus::Ended(_) => {}
+            _ => panic!("call left in an unknown state"),
+        }
     }
 }
