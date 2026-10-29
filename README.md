@@ -300,6 +300,18 @@ as-is. Targets containing whitespace, control characters, `<`, `>`, `"`, `,`,
 | `502` | PBX rejected the REFER (non-2xx final response, including a second auth challenge) or it could not be sent |
 | `504` | No final response from the PBX within 8 seconds |
 
+After a `202`, `GET /v1/calls/{token}/status` on the still-active call reports
+the outcome:
+
+| Body | Meaning |
+|------|---------|
+| `{"status":"active","transfer":"pending"}` | REFER accepted, outcome not known yet |
+| `{"status":"active","transfer":"failed","transfer_code":486}` | Transfer failed. The code is the NOTIFY's sipfrag status, or `408` if the refer subscription ended without a final status or no NOTIFY arrived within 30 s of the `202`. The call stays up and can be transferred again. |
+| `{"status":"ended","reason":"transferred"}` | Transfer succeeded |
+
+`transfer` and `transfer_code` are omitted when no transfer has been accepted
+on the call. A new accepted transfer resets the state to `pending`.
+
 If the PBX challenges the REFER (`401`/`407`), the gateway resends it once
 with digest credentials from the SIP account that carried the call. After a
 failed transfer (`502`/`504`, or a NOTIFY reporting the target failed) the

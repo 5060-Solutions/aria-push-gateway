@@ -62,6 +62,28 @@ struct PendingCall {
     pbx_rtp_port: u16,
 }
 
+/// What the app can learn about a blind transfer after the PBX accepted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferProgress {
+    /// No transfer accepted yet on this call.
+    #[default]
+    None,
+    /// The PBX accepted the REFER; the outcome is not known yet.
+    Pending,
+    /// The transfer failed with this SIP status (408 if it never reported).
+    Failed(u16),
+}
+
+/// Transfer bookkeeping for one active call.
+#[derive(Debug, Default)]
+struct TransferTrack {
+    /// Bumped per accepted REFER so a stale watchdog can't touch a newer one.
+    generation: u64,
+    progress: TransferProgress,
+    /// Whether any refer NOTIFY arrived for the current generation.
+    notified: bool,
+}
+
 /// An active call (post-200 OK) tracked for mid-dialog request forwarding.
 pub struct ActiveCall {
     /// The device (incoming) or user (outgoing) the call belongs to.
@@ -77,6 +99,8 @@ pub struct ActiveCall {
     transfer_pending: Arc<AtomicBool>,
     /// RTP relay for this call — stopped and dropped when the call ends.
     pub rtp_relay: Option<Arc<RtpRelay>>,
+    /// Outcome of the latest accepted transfer, for `/status`.
+    transfer: std::sync::Mutex<TransferTrack>,
     /// Dropped together with the call, which wakes the receiver returned by
     /// [`HandoffManager::register_active_call`] however the call ended.
     _ended: Option<oneshot::Sender<()>>,
@@ -99,8 +123,27 @@ impl ActiveCall {
             local_cseq: AtomicU32::new(initial_cseq),
             transfer_pending: Arc::new(AtomicBool::new(false)),
             rtp_relay,
+            transfer: std::sync::Mutex::new(TransferTrack::default()),
             _ended: None,
         }
+    }
+
+    fn transfer_track(&self) -> std::sync::MutexGuard<'_, TransferTrack> {
+        self.transfer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The transfer state the app sees.
+    pub fn transfer_progress(&self) -> TransferProgress {
+        self.transfer_track().progress
+    }
+
+    /// Mark the transfer failed with `code` and release the call for
+    /// another transfer attempt.
+    fn fail_transfer(&self, code: u16) {
+        self.transfer_track().progress = TransferProgress::Failed(code);
+        self.transfer_pending.store(false, Ordering::SeqCst);
     }
 
     /// Allocate the CSeq number for the next request the gateway sends.
@@ -435,14 +478,9 @@ const SIP_T2: Duration = Duration::from_secs(4);
 
 /// Status code from the `message/sipfrag` body of a `refer` NOTIFY, or
 /// `None` if the request is not a refer-subscription NOTIFY.
+#[cfg(test)]
 pub fn refer_notify_status(notify: &str) -> Option<u16> {
-    let event = message::extract_header(notify, "Event")?;
-    let package = event.split(';').next().unwrap_or_default().trim();
-    if !package.eq_ignore_ascii_case("refer") {
-        return None;
-    }
-    let body = notify.split_once("\r\n\r\n")?.1;
-    message::parse_sipfrag_status(body.trim_start())
+    parse_refer_notify(notify)?.status
 }
 
 /// Outstanding REFER transactions: Via branch -> where the final response goes.
@@ -484,6 +522,39 @@ impl Drop for ReferSlot<'_> {
     }
 }
 
+/// A NOTIFY for a `refer` event subscription (RFC 3515).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferNotify {
+    /// Status code from the `message/sipfrag` body, if it parses.
+    pub status: Option<u16>,
+    /// `Subscription-State: terminated` — no further NOTIFYs will come.
+    pub terminated: bool,
+}
+
+/// Parse a refer-subscription NOTIFY, or `None` for another event package.
+pub fn parse_refer_notify(notify: &str) -> Option<ReferNotify> {
+    let event = message::extract_header(notify, "Event")?;
+    let package = event.split(';').next().unwrap_or_default().trim();
+    if !package.eq_ignore_ascii_case("refer") {
+        return None;
+    }
+    let terminated = message::extract_header(notify, "Subscription-State").is_some_and(|v| {
+        v.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("terminated")
+    });
+    let status = notify
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| message::parse_sipfrag_status(body.trim_start()));
+    Some(ReferNotify { status, terminated })
+}
+
+/// How long after the PBX accepts a REFER the gateway waits for the first
+/// NOTIFY before reporting the transfer as failed (408).
+const REFER_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Manages pending call handoffs and active calls.
 pub struct HandoffManager {
     pending: Arc<RwLock<HashMap<String, PendingCall>>>,
@@ -497,6 +568,8 @@ pub struct HandoffManager {
     /// Outstanding REFER transactions keyed by Via branch; the sender gets
     /// the final response.
     pending_refers: Arc<std::sync::Mutex<PendingRefers>>,
+    /// See [`REFER_NOTIFY_TIMEOUT`]; shortened in tests.
+    refer_notify_timeout: Duration,
 }
 
 /// Info about a call that has ended, available for mobile app polling.
@@ -530,7 +603,15 @@ impl HandoffManager {
             token_to_call_id: Arc::new(RwLock::new(HashMap::new())),
             ended_calls: ended,
             pending_refers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            refer_notify_timeout: REFER_NOTIFY_TIMEOUT,
         }
+    }
+
+    /// Shorten the wait for the first refer NOTIFY (tests only).
+    #[cfg(test)]
+    fn with_refer_notify_timeout(mut self, timeout: Duration) -> Self {
+        self.refer_notify_timeout = timeout;
+        self
     }
 
     /// Create a pending call entry and return a unique call token.
@@ -801,8 +882,8 @@ impl HandoffManager {
             let map = self.token_to_call_id.read().await;
             if let Some(call_id) = map.get(call_token) {
                 let active = self.active.read().await;
-                if active.contains_key(call_id) {
-                    return CallStatus::Active;
+                if let Some(call) = active.get(call_id) {
+                    return CallStatus::active(call.transfer_progress());
                 }
             }
         }
@@ -1134,6 +1215,7 @@ impl HandoffManager {
                 // Stay claimed until the NOTIFY/BYE resolves the transfer.
                 claim.accepted = true;
                 tracing::info!(call_id = %call_id, "PBX accepted REFER");
+                self.watch_transfer(&call_id).await;
             }
             Err(e) => {
                 tracing::warn!(call_id = %call_id, "Transfer failed: {}", e);
@@ -1201,41 +1283,91 @@ impl HandoffManager {
         }
     }
 
+    /// Mark the call's transfer pending and start a watchdog: if no refer
+    /// NOTIFY arrives within the timeout, the transfer is reported failed
+    /// with 408 and the call is released for another attempt.
+    async fn watch_transfer(&self, call_id: &str) {
+        let generation = {
+            let active = self.active.read().await;
+            let Some(call) = active.get(call_id) else {
+                return;
+            };
+            let mut track = call.transfer_track();
+            track.generation += 1;
+            track.progress = TransferProgress::Pending;
+            track.notified = false;
+            track.generation
+        };
+
+        let active = Arc::clone(&self.active);
+        let call_id = call_id.to_string();
+        let timeout = self.refer_notify_timeout;
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let active = active.read().await;
+            let Some(call) = active.get(&call_id) else {
+                return;
+            };
+            let silent = {
+                let track = call.transfer_track();
+                track.generation == generation
+                    && track.progress == TransferProgress::Pending
+                    && !track.notified
+            };
+            if silent {
+                tracing::warn!(call_id = %call_id, "No NOTIFY after accepted REFER — transfer failed (408)");
+                call.fail_transfer(408);
+            }
+        });
+    }
+
     /// Handle a NOTIFY from the PBX (already answered with 200 OK by the
-    /// caller). For a `refer` subscription whose sipfrag reports a 2xx, the
-    /// transfer has completed: end our leg of the call with a BYE.
+    /// caller) for a refer subscription:
+    ///
+    /// - a 2xx sipfrag means the transfer completed: end our leg with a BYE;
+    /// - a 3xx–6xx sipfrag means it failed: report it and keep the call up;
+    /// - a terminated subscription without a 2xx also means it failed (408
+    ///   when no final status was reported).
     pub async fn handle_notify(&self, call_id: &str, notify: &str) {
-        let Some(status) = refer_notify_status(notify) else {
+        let Some(report) = parse_refer_notify(notify) else {
             tracing::debug!(call_id = %call_id, "NOTIFY is not a refer progress report");
             return;
         };
 
-        let transferring = self
-            .active
-            .read()
-            .await
-            .get(call_id)
-            .is_some_and(|c| c.transfer_pending.load(Ordering::SeqCst));
-        if !transferring {
-            tracing::debug!(call_id = %call_id, status, "refer NOTIFY for a call with no transfer in progress");
-            return;
-        }
+        let completed = {
+            let active = self.active.read().await;
+            let Some(call) = active
+                .get(call_id)
+                .filter(|c| c.transfer_pending.load(Ordering::SeqCst))
+            else {
+                tracing::debug!(call_id = %call_id, ?report, "refer NOTIFY for a call with no transfer in progress");
+                return;
+            };
+            call.transfer_track().notified = true;
 
-        match status {
-            100..=199 => {
-                tracing::debug!(call_id = %call_id, status, "Transfer in progress");
-            }
-            200..=299 => {
-                tracing::info!(call_id = %call_id, "Transfer completed — ending gateway leg");
-                if let Err(e) = self.end_call_with_bye(call_id, Some("transferred")).await {
-                    tracing::warn!(call_id = %call_id, "Failed to end transferred call: {}", e);
+            match report.status {
+                Some(200..=299) => true,
+                Some(status @ 300..) => {
+                    tracing::warn!(call_id = %call_id, status, "Transfer target failed — call stays up");
+                    call.fail_transfer(status);
+                    false
+                }
+                status if report.terminated => {
+                    tracing::warn!(call_id = %call_id, ?status, "Refer subscription ended without success — call stays up");
+                    call.fail_transfer(408);
+                    false
+                }
+                status => {
+                    tracing::debug!(call_id = %call_id, ?status, "Transfer in progress");
+                    false
                 }
             }
-            _ => {
-                tracing::warn!(call_id = %call_id, status, "Transfer target failed — call stays up");
-                if let Some(call) = self.active.read().await.get(call_id) {
-                    call.transfer_pending.store(false, Ordering::SeqCst);
-                }
+        };
+
+        if completed {
+            tracing::info!(call_id = %call_id, "Transfer completed — ending gateway leg");
+            if let Err(e) = self.end_call_with_bye(call_id, Some("transferred")).await {
+                tracing::warn!(call_id = %call_id, "Failed to end transferred call: {}", e);
             }
         }
     }
@@ -1290,6 +1422,20 @@ pub struct CallOffer {
     pub sdp_offer: String,
 }
 
+impl CallStatus {
+    fn active(progress: TransferProgress) -> Self {
+        let (transfer, transfer_code) = match progress {
+            TransferProgress::None => (None, None),
+            TransferProgress::Pending => (Some("pending"), None),
+            TransferProgress::Failed(code) => (Some("failed"), Some(code)),
+        };
+        Self::Active {
+            transfer,
+            transfer_code,
+        }
+    }
+}
+
 /// Status of a call from the gateway's perspective.
 #[derive(serde::Serialize)]
 #[serde(tag = "status")]
@@ -1297,7 +1443,15 @@ pub enum CallStatus {
     #[serde(rename = "pending")]
     Pending,
     #[serde(rename = "active")]
-    Active,
+    Active {
+        /// `"pending"` or `"failed"` once a transfer was accepted; omitted
+        /// otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transfer: Option<&'static str>,
+        /// SIP status of a failed transfer (408 if it never reported).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transfer_code: Option<u16>,
+    },
     #[serde(rename = "ended")]
     Ended(EndedCallInfo),
     #[serde(rename = "unknown")]
@@ -1633,6 +1787,10 @@ Content-Length: 0\r\n\r\n";
     // ── NOTIFY / response handling ──────────────────────────────────────────
 
     fn notify(event: &str, frag: &str) -> String {
+        notify_with_state(event, frag, "active;expires=60")
+    }
+
+    fn notify_with_state(event: &str, frag: &str, state: &str) -> String {
         format!(
             "NOTIFY sip:aria-gateway@192.168.1.10:40000 SIP/2.0\r\n\
              Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-n\r\n\
@@ -1641,7 +1799,7 @@ Content-Length: 0\r\n\r\n";
              Call-ID: inbound-call-1\r\n\
              CSeq: 103 NOTIFY\r\n\
              Event: {event}\r\n\
-             Subscription-State: terminated;reason=noresource\r\n\
+             Subscription-State: {state}\r\n\
              Content-Type: message/sipfrag;version=2.0\r\n\
              Content-Length: {}\r\n\r\n{frag}",
             frag.len()
@@ -1721,10 +1879,14 @@ Content-Length: 0\r\n\r\n";
     }
 
     async fn outgoing_call_harness() -> Harness {
+        outgoing_call_harness_with(HandoffManager::new()).await
+    }
+
+    async fn outgoing_call_harness_with(mgr: HandoffManager) -> Harness {
         use crate::sip::proxy::ProxyRegistration;
         use tokio::net::UdpSocket;
 
-        let mgr = Arc::new(HandoffManager::new());
+        let mgr = Arc::new(mgr);
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
@@ -1790,7 +1952,7 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(task.await.unwrap(), Ok(()));
         assert!(matches!(
             mgr.get_call_status("tok").await,
-            CallStatus::Active
+            CallStatus::Active { .. }
         ));
 
         // Progress NOTIFYs leave the call alone; a 200 sipfrag ends it.
@@ -2091,7 +2253,7 @@ Content-Length: 0\r\n\r\n";
                             );
                             match mgr.get_call_status(&token).await {
                                 CallStatus::Pending => tokio::task::yield_now().await,
-                                CallStatus::Active => break,
+                                CallStatus::Active { .. } => break,
                                 _ => panic!("call reported neither pending nor active"),
                             }
                         }
@@ -2198,8 +2360,162 @@ Content-Length: 0\r\n\r\n";
         // Whichever ran first, the call is never left unknown: either the
         // CANCEL won (ended) or the answer did (active).
         match mgr.get_call_status(&token).await {
-            CallStatus::Active | CallStatus::Ended(_) => {}
+            CallStatus::Active { .. } | CallStatus::Ended(_) => {}
             _ => panic!("call left in an unknown state"),
         }
+    }
+
+    // ── Transfer outcome reporting ──────────────────────────────────────────
+
+    fn status_json(status: &CallStatus) -> String {
+        serde_json::to_string(status).unwrap()
+    }
+
+    /// Start a transfer and have the PBX accept the REFER.
+    async fn accepted_transfer(
+        mgr: &Arc<HandoffManager>,
+        pbx: &tokio::net::UdpSocket,
+        target: &str,
+    ) {
+        let task = {
+            let mgr = mgr.clone();
+            let target = target.to_string();
+            tokio::spawn(async move { mgr.transfer_call("tok", &target).await })
+        };
+        let refer = recv_text(pbx).await;
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_transfer_until_one_is_accepted() {
+        let Harness { mgr, .. } = outgoing_call_harness().await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_transfer_is_reported_and_releases_the_call() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        accepted_transfer(&mgr, &pbx, "1002").await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"pending"}"#
+        );
+
+        // Progress keeps it pending; a 486 sipfrag fails it.
+        mgr.handle_notify(
+            "outbound-call-1",
+            &notify("refer", "SIP/2.0 180 Ringing\r\n"),
+        )
+        .await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"pending"}"#
+        );
+        mgr.handle_notify(
+            "outbound-call-1",
+            &notify_with_state(
+                "refer",
+                "SIP/2.0 486 Busy Here\r\n",
+                "terminated;reason=noresource",
+            ),
+        )
+        .await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"failed","transfer_code":486}"#
+        );
+        assert!(mgr.is_call_active("outbound-call-1").await);
+
+        // A new transfer is allowed and resets the state to pending.
+        accepted_transfer(&mgr, &pbx, "1003").await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"pending"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn terminated_subscription_without_success_fails_with_408() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        accepted_transfer(&mgr, &pbx, "1002").await;
+        mgr.handle_notify(
+            "outbound-call-1",
+            &notify_with_state(
+                "refer",
+                "SIP/2.0 180 Ringing\r\n",
+                "terminated;reason=timeout",
+            ),
+        )
+        .await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"failed","transfer_code":408}"#
+        );
+        assert!(mgr.is_call_active("outbound-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn no_notify_after_accept_fails_with_408_and_clears_the_lock() {
+        let Harness { mgr, pbx } = outgoing_call_harness_with(
+            HandoffManager::new().with_refer_notify_timeout(Duration::from_millis(100)),
+        )
+        .await;
+        accepted_transfer(&mgr, &pbx, "1002").await;
+        assert_eq!(
+            mgr.transfer_call("tok", "1003").await,
+            Err(TransferError::InProgress)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"failed","transfer_code":408}"#
+        );
+        // No longer locked: another transfer goes out.
+        accepted_transfer(&mgr, &pbx, "1003").await;
+    }
+
+    #[tokio::test]
+    async fn a_notify_before_the_timeout_disarms_the_watchdog() {
+        let Harness { mgr, pbx } = outgoing_call_harness_with(
+            HandoffManager::new().with_refer_notify_timeout(Duration::from_millis(100)),
+        )
+        .await;
+        accepted_transfer(&mgr, &pbx, "1002").await;
+        mgr.handle_notify(
+            "outbound-call-1",
+            &notify("refer", "SIP/2.0 100 Trying\r\n"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"pending"}"#
+        );
+    }
+
+    #[test]
+    fn refer_notify_reads_subscription_state() {
+        let n = parse_refer_notify(&notify_with_state("refer", "garbage", "terminated")).unwrap();
+        assert_eq!(
+            n,
+            ReferNotify {
+                status: None,
+                terminated: true
+            }
+        );
+        let n = parse_refer_notify(&notify("refer", "SIP/2.0 200 OK\r\n")).unwrap();
+        assert_eq!(
+            n,
+            ReferNotify {
+                status: Some(200),
+                terminated: false
+            }
+        );
+        assert!(parse_refer_notify(&notify("dialog", "SIP/2.0 200 OK\r\n")).is_none());
     }
 }
