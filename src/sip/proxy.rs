@@ -65,6 +65,15 @@ impl ProxyRegistration {
         &self.config.domain
     }
 
+    /// Digest credentials `(auth username, password)` for this account, used
+    /// to answer challenges to in-dialog requests such as REFER.
+    pub(crate) fn digest_credentials(&self) -> (String, String) {
+        (
+            self.config.effective_auth_username().to_string(),
+            self.config.password.clone(),
+        )
+    }
+
     /// A registration bound to `socket`, for exercising call handling in tests.
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -77,7 +86,7 @@ impl ProxyRegistration {
             device_id: "test-device".into(),
             config: SipAccountConfig {
                 username: "1001".into(),
-                password: String::new(),
+                password: "secret".into(),
                 domain: domain.into(),
                 registrar: None,
                 transport: "udp".into(),

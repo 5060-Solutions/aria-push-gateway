@@ -3,7 +3,7 @@
 //! Maintains SIP registrations on behalf of mobile devices and intercepts
 //! incoming INVITEs to trigger push notifications.
 
-mod digest;
+pub mod digest;
 pub mod message;
 pub mod proxy;
 pub mod resolver;

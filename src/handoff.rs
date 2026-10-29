@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
+use crate::sip::digest::DigestAuth;
 use crate::sip::message;
 use crate::sip::rtp_relay::RtpRelay;
 
@@ -253,14 +254,18 @@ pub fn build_in_dialog_request(
 }
 
 /// Build a blind-transfer REFER (RFC 3515) on `dialog`.
+///
+/// `auth` is an optional `(header name, value)` pair answering a digest
+/// challenge, e.g. `("Authorization", "Digest ...")`.
 pub fn build_refer(
     dialog: &Dialog,
     cseq: u32,
     local_addr: SocketAddr,
     branch: &str,
     refer_to: &str,
+    auth: Option<(&str, &str)>,
 ) -> String {
-    let extra = format!(
+    let mut extra = format!(
         "Contact: <sip:aria-gateway@{ip}:{port}>\r\n\
          Refer-To: <{refer_to}>\r\n\
          Referred-By: <{referred_by}>\r\n\
@@ -269,6 +274,9 @@ pub fn build_refer(
         port = local_addr.port(),
         referred_by = dialog.local_uri(),
     );
+    if let Some((name, value)) = auth {
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
     build_in_dialog_request("REFER", dialog, cseq, local_addr, branch, &extra)
 }
 
@@ -441,8 +449,8 @@ pub struct HandoffManager {
     /// Mobile app polls this to detect remote hangup.
     ended_calls: Arc<RwLock<HashMap<String, EndedCallInfo>>>,
     /// Outstanding REFER transactions keyed by Via branch; the sender gets
-    /// the final status code.
-    pending_refers: Arc<Mutex<HashMap<String, oneshot::Sender<u16>>>>,
+    /// the final response.
+    pending_refers: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
 }
 
 /// Info about a call that has ended, available for mobile app polling.
@@ -967,24 +975,20 @@ impl HandoffManager {
             .await
             .ok_or(TransferError::NotFound)?;
 
-        let (dialog, cseq, pbx_addr, proxy_reg) = {
+        let (dialog, pbx_addr, proxy_reg) = {
             let active = self.active.read().await;
             let call = active.get(&call_id).ok_or(TransferError::NotFound)?;
             call.transfer_pending.store(true, Ordering::SeqCst);
-            (
-                call.dialog.clone(),
-                call.next_cseq(),
-                call.pbx_addr,
-                call.proxy_reg.clone(),
-            )
+            (call.dialog.clone(), call.pbx_addr, call.proxy_reg.clone())
         };
 
-        let (socket, local_addr, domain) = {
+        let (socket, local_addr, domain, (auth_user, password)) = {
             let reg = proxy_reg.read().await;
             (
                 reg.socket.clone(),
                 reg.local_addr,
                 reg.sip_domain().to_string(),
+                reg.digest_credentials(),
             )
         };
         let domain = if domain.is_empty() {
@@ -994,36 +998,61 @@ impl HandoffManager {
         };
         let refer_to = target.refer_to_uri(&domain);
 
-        let branch = message::generate_branch();
-        let refer = build_refer(&dialog, cseq, local_addr, &branch, &refer_to);
-
-        let (tx, mut rx) = oneshot::channel();
-        self.pending_refers.lock().await.insert(branch.clone(), tx);
-
         tracing::info!(call_id = %call_id, refer_to = %refer_to, "Sending REFER to PBX");
 
-        // Send, retransmitting per RFC 3261 §17.1.2 (UDP) until a final
-        // response arrives or we give up.
-        let deadline = tokio::time::Instant::now() + REFER_TIMEOUT;
-        let mut interval = SIP_T1;
+        // Send the REFER; if the PBX challenges it, resend once with digest
+        // credentials from the registration that carried the call.
+        let mut credentials: Option<(&'static str, String)> = None;
         let result = loop {
-            if let Err(e) = socket.send_to(refer.as_bytes(), pbx_addr).await {
-                break Err(TransferError::Send(e.to_string()));
-            }
-            let wait =
-                interval.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            match tokio::time::timeout(wait, &mut rx).await {
-                Ok(Ok(status)) if (200..300).contains(&status) => break Ok(()),
-                Ok(Ok(status)) => break Err(TransferError::Rejected(status)),
-                Ok(Err(_)) => break Err(TransferError::Send("transaction dropped".into())),
-                Err(_) if tokio::time::Instant::now() >= deadline => {
-                    break Err(TransferError::Timeout)
+            let Some(cseq) = self.next_cseq(&call_id).await else {
+                break Err(TransferError::NotFound);
+            };
+            let branch = message::generate_branch();
+            let refer = build_refer(
+                &dialog,
+                cseq,
+                local_addr,
+                &branch,
+                &refer_to,
+                credentials.as_ref().map(|(n, v)| (*n, v.as_str())),
+            );
+            let response = match self
+                .refer_transaction(&socket, pbx_addr, &refer, &branch)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => break Err(e),
+            };
+            let status = message::parse_status_code(&response).unwrap_or_default();
+            match status {
+                200..=299 => break Ok(()),
+                401 | 407 if credentials.is_none() => {
+                    let (challenge_header, auth_header) = if status == 401 {
+                        ("WWW-Authenticate", "Authorization")
+                    } else {
+                        ("Proxy-Authenticate", "Proxy-Authorization")
+                    };
+                    let auth = message::extract_header(&response, challenge_header).and_then(
+                        |challenge| {
+                            DigestAuth::from_challenge(
+                                &challenge,
+                                &auth_user,
+                                &password,
+                                &dialog.remote_target,
+                                "REFER",
+                            )
+                        },
+                    );
+                    let Some(auth) = auth else {
+                        tracing::warn!(call_id = %call_id, status, "REFER challenge could not be parsed");
+                        break Err(TransferError::Rejected(status));
+                    };
+                    tracing::debug!(call_id = %call_id, status, "REFER challenged — resending with credentials");
+                    credentials = Some((auth_header, auth.to_header()));
                 }
-                Err(_) => interval = (interval * 2).min(SIP_T2),
+                _ => break Err(TransferError::Rejected(status)),
             }
         };
-
-        self.pending_refers.lock().await.remove(&branch);
 
         match &result {
             Ok(()) => {
@@ -1036,6 +1065,48 @@ impl HandoffManager {
                 }
             }
         }
+        result
+    }
+
+    /// Allocate the next local CSeq on an active call's dialog.
+    async fn next_cseq(&self, call_id: &str) -> Option<u32> {
+        self.active.read().await.get(call_id).map(|c| c.next_cseq())
+    }
+
+    /// Run one REFER client transaction: send `refer`, retransmitting per
+    /// RFC 3261 §17.1.2 (UDP), until a final response arrives or we give up.
+    async fn refer_transaction(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        pbx_addr: SocketAddr,
+        refer: &str,
+        branch: &str,
+    ) -> Result<String, TransferError> {
+        let (tx, mut rx) = oneshot::channel();
+        self.pending_refers
+            .lock()
+            .await
+            .insert(branch.to_string(), tx);
+
+        let deadline = tokio::time::Instant::now() + REFER_TIMEOUT;
+        let mut interval = SIP_T1;
+        let result = loop {
+            if let Err(e) = socket.send_to(refer.as_bytes(), pbx_addr).await {
+                break Err(TransferError::Send(e.to_string()));
+            }
+            let wait =
+                interval.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            match tokio::time::timeout(wait, &mut rx).await {
+                Ok(Ok(response)) => break Ok(response),
+                Ok(Err(_)) => break Err(TransferError::Send("transaction dropped".into())),
+                Err(_) if tokio::time::Instant::now() >= deadline => {
+                    break Err(TransferError::Timeout)
+                }
+                Err(_) => interval = (interval * 2).min(SIP_T2),
+            }
+        };
+
+        self.pending_refers.lock().await.remove(branch);
         result
     }
 
@@ -1052,7 +1123,7 @@ impl HandoffManager {
             return;
         }
         if let Some(tx) = self.pending_refers.lock().await.remove(&branch) {
-            let _ = tx.send(status);
+            let _ = tx.send(response.to_string());
         }
     }
 
@@ -1388,6 +1459,7 @@ Content-Length: 0\r\n\r\n";
             local_addr(),
             "z9hG4bK-ref",
             "sip:1002@pbx.example.com",
+            None,
         );
         let lines = header_lines(&refer);
 
@@ -1441,7 +1513,14 @@ Content-Length: 0\r\n\r\n";
     #[test]
     fn refer_for_outgoing_call_does_not_swap_parties() {
         let d = Dialog::from_uac(OUTBOUND_200, pbx_addr());
-        let refer = build_refer(&d, 3, local_addr(), "z9hG4bK-x", "sip:1002@pbx.example.com");
+        let refer = build_refer(
+            &d,
+            3,
+            local_addr(),
+            "z9hG4bK-x",
+            "sip:1002@pbx.example.com",
+            None,
+        );
         let lines = header_lines(&refer);
         assert_eq!(lines[0], "REFER sip:2000@10.0.0.1:5060 SIP/2.0");
         assert!(lines.contains(&"From: \"Alice\" <sip:1001@pbx.example.com>;tag=gwtag"));
@@ -1454,7 +1533,7 @@ Content-Length: 0\r\n\r\n";
     fn refer_header_cannot_be_split_by_a_validated_target() {
         let d = Dialog::from_uas(INBOUND_INVITE, INBOUND_200, pbx_addr());
         let target = TransferTarget::parse("sip:1002@pbx.example.com;user=phone").unwrap();
-        let refer = build_refer(&d, 1, local_addr(), "b", &target.refer_to_uri("pbx"));
+        let refer = build_refer(&d, 1, local_addr(), "b", &target.refer_to_uri("pbx"), None);
         let lines = header_lines(&refer);
         assert!(lines.contains(&"Refer-To: <sip:1002@pbx.example.com;user=phone>"));
     }
@@ -1537,7 +1616,7 @@ Content-Length: 0\r\n\r\n";
 
         mgr.handle_refer_response(&resp("202 Accepted", "z9hG4bK-ref"))
             .await;
-        assert_eq!(rx.await, Ok(202));
+        assert_eq!(rx.await, Ok(resp("202 Accepted", "z9hG4bK-ref")));
         assert!(mgr.pending_refers.lock().await.is_empty());
     }
 
@@ -1689,5 +1768,116 @@ Content-Length: 0\r\n\r\n";
         mgr.handle_refer_response(&response_to(&second, "202 Accepted"))
             .await;
         assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    fn challenge_to(request: &str, status: &str, header: &str) -> String {
+        response_to(request, status).replace(
+            "Content-Length: 0\r\n",
+            &format!(
+                "{header}: Digest realm=\"pbx.example.com\", nonce=\"n0nce\"\r\nContent-Length: 0\r\n"
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn challenged_refer_is_resent_with_digest_credentials() {
+        for (status, challenge, authorization) in [
+            ("401 Unauthorized", "WWW-Authenticate", "Authorization"),
+            (
+                "407 Proxy Authentication Required",
+                "Proxy-Authenticate",
+                "Proxy-Authorization",
+            ),
+        ] {
+            let Harness { mgr, pbx } = outgoing_call_harness().await;
+            let task = {
+                let mgr = mgr.clone();
+                tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+            };
+
+            let first = recv_text(&pbx).await;
+            assert_eq!(message::extract_header(&first, "CSeq").unwrap(), "3 REFER");
+            assert!(message::extract_header(&first, authorization).is_none());
+            mgr.handle_refer_response(&challenge_to(&first, status, challenge))
+                .await;
+
+            let second = recv_text(&pbx).await;
+            assert_eq!(message::extract_header(&second, "CSeq").unwrap(), "4 REFER");
+            assert_ne!(
+                message::extract_via_branch(&first),
+                message::extract_via_branch(&second),
+                "a new transaction needs a new branch"
+            );
+            assert_eq!(
+                message::extract_header(&second, "Refer-To"),
+                message::extract_header(&first, "Refer-To")
+            );
+            let creds = message::extract_header(&second, authorization)
+                .unwrap_or_else(|| panic!("missing {authorization} in\n{second}"));
+            let expected = DigestAuth::from_challenge(
+                "Digest realm=\"pbx.example.com\", nonce=\"n0nce\"",
+                "1001",
+                "secret",
+                "sip:2000@10.0.0.1:5060",
+                "REFER",
+            )
+            .unwrap();
+            assert_eq!(creds, expected.to_header());
+            assert!(creds.contains("uri=\"sip:2000@10.0.0.1:5060\""));
+
+            mgr.handle_refer_response(&response_to(&second, "202 Accepted"))
+                .await;
+            assert_eq!(task.await.unwrap(), Ok(()), "{status}");
+            assert!(mgr.is_call_active("outbound-call-1").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn refer_is_retried_with_credentials_only_once() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+
+        let first = recv_text(&pbx).await;
+        mgr.handle_refer_response(&challenge_to(
+            &first,
+            "401 Unauthorized",
+            "WWW-Authenticate",
+        ))
+        .await;
+        let second = recv_text(&pbx).await;
+        assert!(message::extract_header(&second, "Authorization").is_some());
+        mgr.handle_refer_response(&challenge_to(
+            &second,
+            "407 Proxy Authentication Required",
+            "Proxy-Authenticate",
+        ))
+        .await;
+
+        assert_eq!(task.await.unwrap(), Err(TransferError::Rejected(407)));
+        // No third attempt, and the call is left up.
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), pbx.recv(&mut buf))
+                .await
+                .is_err(),
+            "no further REFER may be sent"
+        );
+        assert!(mgr.is_call_active("outbound-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn challenge_without_a_parseable_header_fails_the_transfer() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        let first = recv_text(&pbx).await;
+        mgr.handle_refer_response(&response_to(&first, "401 Unauthorized"))
+            .await;
+        assert_eq!(task.await.unwrap(), Err(TransferError::Rejected(401)));
     }
 }
