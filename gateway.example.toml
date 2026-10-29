@@ -14,6 +14,12 @@ url = "sqlite:gateway.db?mode=rwc"
 secret = "CHANGE-ME-TO-A-STRONG-RANDOM-SECRET"
 # Token expiry in seconds (default: 30 days)
 token_expiry_secs = 2592000
+# Shared key the Aria PBX API presents to POST /v1/auth/token to mint tokens
+# (it sends it as "api_key"). Use a long random value, e.g.
+# `openssl rand -hex 32`, and keep it different from `secret`. The
+# TOKEN_ISSUER_KEY environment variable overrides this. If neither is set,
+# the token endpoint refuses every request (503).
+# token_issuer_key = "CHANGE-ME-TO-A-DIFFERENT-STRONG-RANDOM-KEY"
 
 # ── Push Notification Providers ──────────────────────────────────────────────
 
