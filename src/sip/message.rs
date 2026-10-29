@@ -1,15 +1,128 @@
 //! SIP message building and parsing for the gateway.
 //!
-//! Parsing utilities are re-exported from `aria-sip-core`.
-//! Message builders are gateway-specific (REGISTER, provisional responses).
+//! Start-line parsing and generators are re-exported from `sip-5060`. Header
+//! lookup is local: it reads only the header section (never the body),
+//! unfolds continuation lines, accepts whitespace before the colon and the
+//! RFC 3261 compact header names, and can return every value of a header.
 
-// Re-export shared parsing utilities
 pub use rsip::generators::{generate_branch, generate_call_id, generate_tag};
-pub use rsip::sip_parser::{
-    extract_all_headers, extract_cseq_method, extract_display_name, extract_from_uri,
-    extract_header, extract_method, extract_to_tag, extract_via_branch, is_request,
-    parse_sipfrag_status, parse_status_code,
-};
+pub use rsip::sip_parser::{extract_method, is_request, parse_sipfrag_status, parse_status_code};
+
+/// Long name for an RFC 3261 §7.3.3 / RFC 3515 compact header name.
+fn expand_compact(name: &str) -> &str {
+    match name.to_ascii_lowercase().as_str() {
+        "v" => "Via",
+        "f" => "From",
+        "t" => "To",
+        "i" => "Call-ID",
+        "m" => "Contact",
+        "l" => "Content-Length",
+        "c" => "Content-Type",
+        "e" => "Content-Encoding",
+        "k" => "Supported",
+        "s" => "Subject",
+        "r" => "Refer-To",
+        "b" => "Referred-By",
+        "o" => "Event",
+        "u" => "Allow-Events",
+        "x" => "Session-Expires",
+        _ => name,
+    }
+}
+
+/// The header lines of `msg` (start line excluded, body excluded), with
+/// folded continuation lines joined, as `(name, value)` pairs in order.
+fn header_fields(msg: &str) -> Vec<(&str, String)> {
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    for line in msg.split('\n').skip(1) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            break; // end of headers; the body follows
+        }
+        if line.starts_with([' ', '\t']) {
+            if let Some((_, value)) = fields.last_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            fields.push((name.trim(), value.trim().to_string()));
+        }
+    }
+    fields
+}
+
+fn header_matches(field: &str, name: &str) -> bool {
+    expand_compact(field).eq_ignore_ascii_case(expand_compact(name))
+}
+
+/// Every value of header `name` (long or compact form), in message order.
+/// A line carrying several comma-separated values is returned as one value.
+pub fn extract_all_headers(msg: &str, name: &str) -> Vec<String> {
+    header_fields(msg)
+        .into_iter()
+        .filter(|(field, _)| header_matches(field, name))
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// The first value of header `name` (long or compact form).
+pub fn extract_header(msg: &str, name: &str) -> Option<String> {
+    header_fields(msg)
+        .into_iter()
+        .find(|(field, _)| header_matches(field, name))
+        .map(|(_, value)| value)
+}
+
+/// A parameter of a header value (`tag`, `branch`, ...), looking only at the
+/// header's own parameters: after the `>` of a name-addr, or after the URI
+/// of an addr-spec — never inside the URI.
+pub fn header_param(value: &str, param: &str) -> Option<String> {
+    let params = match value.rfind('>') {
+        Some(end) => &value[end + 1..],
+        None => value.split_once(';').map_or("", |(_, rest)| rest),
+    };
+    params
+        .split([';', ','])
+        .map(str::trim)
+        .filter_map(|p| p.split_once('=').or(Some((p, ""))))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(param))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The method in the CSeq header.
+pub fn extract_cseq_method(msg: &str) -> Option<String> {
+    let cseq = extract_header(msg, "CSeq")?;
+    cseq.split_whitespace().nth(1).map(str::to_string)
+}
+
+/// The tag of the To header.
+pub fn extract_to_tag(msg: &str) -> Option<String> {
+    header_param(&extract_header(msg, "To")?, "tag")
+}
+
+/// The branch of the topmost Via.
+pub fn extract_via_branch(msg: &str) -> Option<String> {
+    let via = extract_header(msg, "Via")?;
+    let top = via.split(',').next().unwrap_or_default();
+    top.split(';')
+        .skip(1)
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("branch"))
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// User and domain of the From header's `sip:` URI.
+pub fn extract_from_uri(msg: &str) -> Option<(String, String)> {
+    rsip::sip_parser::extract_sip_uri(&extract_header(msg, "From")?)
+}
+
+/// Quoted display name of the From header.
+pub fn extract_display_name(msg: &str) -> Option<String> {
+    rsip::sip_parser::extract_display_name_from_value(&extract_header(msg, "From")?)
+}
 
 /// Build a REGISTER request.
 #[allow(clippy::too_many_arguments)]
@@ -250,6 +363,43 @@ pub fn build_cancel(invite: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FOLDED: &str = "INVITE sip:a@b SIP/2.0\r\n\
+        v: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1, SIP/2.0/UDP 10.0.0.2;branch=z9hG4bK-2\r\n\
+        Via : SIP/2.0/UDP 10.0.0.3;branch=z9hG4bK-3\r\n\
+        f: \"Bob\" <sip:bob@b;tag=uri-param>;tag=ftag\r\n\
+        t: <sip:a@b>\r\n\
+        i: cid-9\r\n\
+        Subject: first\r\n\t continued\r\n\
+        CSeq: 7 INVITE\r\n\
+        l: 30\r\n\r\n\
+        Call-ID: in-the-body\r\nTo: <sip:x@y>;tag=body\r\n";
+
+    #[test]
+    fn header_lookup_handles_compact_forms_folding_and_the_body() {
+        assert_eq!(extract_header(FOLDED, "Call-ID").as_deref(), Some("cid-9"));
+        assert_eq!(extract_header(FOLDED, "i").as_deref(), Some("cid-9"));
+        assert_eq!(
+            extract_header(FOLDED, "Subject").as_deref(),
+            Some("first continued")
+        );
+        assert_eq!(
+            extract_all_headers(FOLDED, "Via"),
+            vec![
+                "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1, SIP/2.0/UDP 10.0.0.2;branch=z9hG4bK-2",
+                "SIP/2.0/UDP 10.0.0.3;branch=z9hG4bK-3",
+            ]
+        );
+        assert_eq!(extract_via_branch(FOLDED).as_deref(), Some("z9hG4bK-1"));
+        assert_eq!(
+            header_param(&extract_header(FOLDED, "f").unwrap(), "tag").as_deref(),
+            Some("ftag")
+        );
+        // Nothing is read from the body.
+        assert_eq!(extract_to_tag(FOLDED), None);
+        assert_eq!(extract_cseq_method(FOLDED).as_deref(), Some("INVITE"));
+        assert_eq!(extract_display_name(FOLDED).as_deref(), Some("Bob"));
+    }
 
     #[test]
     fn cancel_matches_the_invite_transaction() {
