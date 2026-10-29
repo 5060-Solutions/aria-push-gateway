@@ -335,6 +335,34 @@ pub fn build_200_ok_invite(
     )
 }
 
+/// Build the ACK for a non-2xx final `response` to `invite` (RFC 3261
+/// §17.1.1.3): same Request-URI, top Via (branch), Route, From, Call-ID and
+/// CSeq number as the INVITE, and the response's To (with its tag).
+pub fn build_non2xx_ack(invite: &str, response: &str) -> Option<String> {
+    let request_uri = invite
+        .lines()
+        .next()?
+        .strip_prefix("INVITE ")?
+        .strip_suffix(" SIP/2.0")?;
+    let via = extract_header(invite, "Via")?;
+    let from = extract_header(invite, "From")?;
+    let to = extract_header(response, "To")?;
+    let call_id = extract_header(invite, "Call-ID")?;
+    let cseq_num = extract_header(invite, "CSeq")?
+        .split_whitespace()
+        .next()?
+        .to_string();
+    let mut msg = format!("ACK {request_uri} SIP/2.0\r\nVia: {via}\r\nMax-Forwards: 70\r\n");
+    for route in extract_all_headers(invite, "Route") {
+        msg.push_str(&format!("Route: {route}\r\n"));
+    }
+    msg.push_str(&format!(
+        "From: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq_num} ACK\r\n\
+         Content-Length: 0\r\n\r\n"
+    ));
+    Some(msg)
+}
+
 /// Build a CANCEL for a pending INVITE (RFC 3261 §9.1): same Request-URI,
 /// top Via (so the same branch), Route set, From, To, Call-ID and CSeq
 /// number as the INVITE, with method CANCEL.

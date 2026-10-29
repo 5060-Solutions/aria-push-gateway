@@ -5,6 +5,7 @@
 
 pub mod digest;
 pub mod message;
+pub mod outgoing;
 pub mod proxy;
 pub mod resolver;
 pub mod rtp_relay;

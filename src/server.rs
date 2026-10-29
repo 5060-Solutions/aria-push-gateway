@@ -716,11 +716,15 @@ mod tests {
     }
 
     async fn test_app(issuer_key: Option<&str>) -> TestApp {
+        test_app_with(issuer_key, SipProxyManager::new()).await
+    }
+
+    async fn test_app_with(issuer_key: Option<&str>, sip: SipProxyManager) -> TestApp {
         let db = Database::connect_in_memory().await.unwrap();
         let handoff = Arc::new(HandoffManager::new());
         let router = build_router(
             db.clone(),
-            Arc::new(SipProxyManager::new()),
+            Arc::new(sip),
             Arc::new(PushManager::new_noop()),
             handoff.clone(),
             JWT_SECRET.to_string(),
@@ -1776,5 +1780,230 @@ Content-Length: 0\r\n\r\n";
             )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Outgoing INVITE transaction ─────────────────────────────────────────
+
+    /// Bob places a call (no response yet); returns the PBX, gateway
+    /// address, first INVITE and the pending HTTP request.
+    async fn place_call(
+        app: &TestApp,
+        extra: serde_json::Value,
+    ) -> (
+        tokio::net::UdpSocket,
+        std::net::SocketAddr,
+        String,
+        tokio::task::JoinHandle<axum::response::Response>,
+    ) {
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+        let req = post_as("bob", "/v1/calls", &make_call_body(extra));
+        let http = {
+            let router = app.router.clone();
+            tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+        };
+        let (invite, gw) = recv_from(&pbx).await;
+        assert!(invite.starts_with("INVITE "));
+        (pbx, gw, invite, http)
+    }
+
+    async fn quiet_for(sock: &tokio::net::UdpSocket, ms: u64) {
+        let mut buf = vec![0u8; 65535];
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(std::time::Duration::from_millis(ms), sock.recv(&mut buf)).await
+        {
+            panic!(
+                "unexpected message: {}",
+                String::from_utf8_lossy(&buf[..len])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_is_retransmitted_until_answered_and_finals_are_acked() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, gw, invite, http) = place_call(&app, serde_json::json!({})).await;
+        let (again, _) = recv_from(&pbx).await;
+        assert_eq!(again, invite, "Timer A retransmission");
+
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        quiet_for(&pbx, 1200).await;
+
+        let busy = pbx_reply(&invite, "486 Busy Here", "", "");
+        pbx.send_to(busy.as_bytes(), gw).await.unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK sip:2000@pbx.example.com SIP/2.0"));
+        assert_eq!(h(&ack, "Via"), h(&invite, "Via"));
+        assert_eq!(h(&ack, "From"), h(&invite, "From"));
+        assert_eq!(h(&ack, "To"), h(&busy, "To"));
+        assert_eq!(h(&ack, "CSeq"), "1 ACK");
+        let (status, _) = http_result(http).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        // Timer D: a retransmitted final is ACKed again.
+        pbx.send_to(busy.as_bytes(), gw).await.unwrap();
+        let (ack2, _) = recv_from(&pbx).await;
+        assert_eq!(ack2, ack);
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_a_provisional_response() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, gw, invite, http) =
+            place_call(&app, serde_json::json!({ "client_ref": "early" })).await;
+        assert_eq!(cancel_as(&app, "bob", "early").await, StatusCode::ACCEPTED);
+
+        // No CANCEL before a 1xx: only INVITE retransmissions.
+        let mut buf = vec![0u8; 65535];
+        let until = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
+        while let Ok(Ok(len)) = tokio::time::timeout_at(until, pbx.recv(&mut buf)).await {
+            let msg = String::from_utf8_lossy(&buf[..len]).to_string();
+            assert!(msg.starts_with("INVITE "), "{msg}");
+        }
+
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        let (cancel, _) = recv_from(&pbx).await;
+        assert!(cancel.starts_with("CANCEL "), "{cancel}");
+        assert_eq!(h(&cancel, "Via"), h(&invite, "Via"));
+        pbx.send_to(pbx_reply(&cancel, "200 OK", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        pbx.send_to(
+            pbx_reply(&invite, "487 Request Terminated", "", "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "));
+        let (status, body) = http_result(http).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"cancelled"}"#);
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cancels_the_ringing_call() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, gw, invite, http) = place_call(&app, serde_json::json!({})).await;
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        http.abort();
+        let _ = http.await;
+
+        let (cancel, _) = recv_from(&pbx).await;
+        assert!(cancel.starts_with("CANCEL "), "{cancel}");
+        assert_eq!(h(&cancel, "CSeq"), "1 CANCEL");
+        // Unanswered, the CANCEL is retransmitted.
+        assert_eq!(recv_from(&pbx).await.0, cancel);
+        pbx.send_to(pbx_reply(&cancel, "200 OK", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        pbx.send_to(
+            pbx_reply(&invite, "487 Request Terminated", "", "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "));
+    }
+
+    #[tokio::test]
+    async fn ring_timeout_cancels_and_hangs_up_a_late_answer() {
+        let app = test_app_with(
+            Some(ISSUER_KEY),
+            SipProxyManager::new().with_ring_timeout(std::time::Duration::from_millis(300)),
+        )
+        .await;
+        let (pbx, gw, invite, http) = place_call(&app, serde_json::json!({})).await;
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        let (status, _) = http_result(http).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let (cancel, _) = recv_from(&pbx).await;
+        assert!(cancel.starts_with("CANCEL "), "{cancel}");
+
+        // The callee answered anyway: ACK, then BYE straight away.
+        let ok = pbx_reply(
+            &invite,
+            "200 OK",
+            "Content-Type: application/sdp\r\n",
+            "v=0\r\n",
+        );
+        pbx.send_to(ok.as_bytes(), gw).await.unwrap();
+        let bye = loop {
+            let (msg, _) = recv_from(&pbx).await;
+            if msg.starts_with("BYE ") {
+                break msg;
+            }
+            assert!(
+                msg.starts_with("ACK ") || msg.starts_with("CANCEL "),
+                "{msg}"
+            );
+        };
+        assert_eq!(h(&bye, "CSeq"), "2 BYE");
+        pbx.send_to(pbx_reply(&bye, "200 OK", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        assert!(!app.handoff.is_call_active(&h(&invite, "Call-ID")).await);
+    }
+
+    #[tokio::test]
+    async fn ack_for_a_2xx_follows_the_dialog_and_is_repeated() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, gw, invite, http) = place_call(&app, serde_json::json!({})).await;
+        let rr = "Record-Route: <sip:edge.example.com;lr>\r\n\
+                  Record-Route: <sip:core.example.com;lr>\r\n\
+                  Content-Type: application/sdp\r\n";
+        let ok = pbx_reply(&invite, "200 OK", rr, "v=0\r\n").replace(
+            "Contact: <sip:2000@127.0.0.1>",
+            "Contact: <sip:2000@10.20.30.40:5070>",
+        );
+        pbx.send_to(ok.as_bytes(), gw).await.unwrap();
+
+        let (ack, _) = recv_from(&pbx).await;
+        let lines: Vec<&str> = ack.split("\r\n").collect();
+        assert_eq!(lines[0], "ACK sip:2000@10.20.30.40:5070 SIP/2.0");
+        let routes: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("Route:"))
+            .collect();
+        assert_eq!(
+            routes,
+            vec![
+                "Route: <sip:core.example.com;lr>",
+                "Route: <sip:edge.example.com;lr>"
+            ]
+        );
+        assert_eq!(h(&ack, "From"), h(&invite, "From"));
+        assert!(h(&ack, "To").contains("tag=pbxtag"));
+        assert_eq!(h(&ack, "CSeq"), "1 ACK");
+        assert_ne!(
+            h(&ack, "Via"),
+            h(&invite, "Via"),
+            "2xx ACK is a new transaction"
+        );
+
+        let (status, _) = http_result(http).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The PBX didn't see it and repeats the 200: ACK again.
+        pbx.send_to(ok.as_bytes(), gw).await.unwrap();
+        let (ack2, _) = recv_from(&pbx).await;
+        assert!(ack2.starts_with("ACK sip:2000@10.20.30.40:5070 SIP/2.0"));
     }
 }

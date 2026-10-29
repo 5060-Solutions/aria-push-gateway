@@ -164,8 +164,8 @@ struct PendingInvite {
 
 /// An outgoing INVITE's entry in [`SipProxyManager::pending_invites`];
 /// removes the entry when dropped, whatever the outcome.
-struct InviteSlot<'a> {
-    invites: &'a std::sync::Mutex<PendingInvites>,
+pub(crate) struct InviteSlot {
+    invites: Arc<std::sync::Mutex<PendingInvites>>,
     key: (String, String),
     id: u64,
 }
@@ -174,12 +174,12 @@ fn lock_invites(m: &std::sync::Mutex<PendingInvites>) -> std::sync::MutexGuard<'
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-impl InviteSlot<'_> {
+impl InviteSlot {
     /// The INVITE was answered: drop the entry so it can no longer be
     /// cancelled, and report whether a cancel had already been requested
     /// (a 200 OK crossing our CANCEL).
-    fn claim_answer(&self) -> bool {
-        let mut invites = lock_invites(self.invites);
+    pub(crate) fn claim_answer(&self) -> bool {
+        let mut invites = lock_invites(&self.invites);
         match invites.get(&self.key) {
             Some(entry) if entry.id == self.id => {
                 let cancel_requested = entry.cancel.is_none();
@@ -191,9 +191,9 @@ impl InviteSlot<'_> {
     }
 }
 
-impl Drop for InviteSlot<'_> {
+impl Drop for InviteSlot {
     fn drop(&mut self) {
-        let mut invites = lock_invites(self.invites);
+        let mut invites = lock_invites(&self.invites);
         if invites.get(&self.key).is_some_and(|e| e.id == self.id) {
             invites.remove(&self.key);
         }
@@ -214,8 +214,10 @@ pub struct SipProxyManager {
     resolver: Arc<SrvResolver>,
     /// Outgoing INVITEs still waiting for a final response that the app
     /// can cancel by `client_ref`.
-    pending_invites: std::sync::Mutex<PendingInvites>,
+    pending_invites: Arc<std::sync::Mutex<PendingInvites>>,
     next_invite_id: std::sync::atomic::AtomicU64,
+    /// How long an outgoing call may ring before the gateway cancels it.
+    ring_timeout: Duration,
 }
 
 impl SipProxyManager {
@@ -224,9 +226,17 @@ impl SipProxyManager {
         Self {
             registrations: RwLock::new(HashMap::new()),
             resolver: Arc::new(resolver),
-            pending_invites: std::sync::Mutex::new(HashMap::new()),
+            pending_invites: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_invite_id: std::sync::atomic::AtomicU64::new(0),
+            ring_timeout: super::outgoing::RING_TIMEOUT,
         }
+    }
+
+    /// Shorten the ring timeout (tests only).
+    #[cfg(test)]
+    pub fn with_ring_timeout(mut self, timeout: Duration) -> Self {
+        self.ring_timeout = timeout;
+        self
     }
 
     /// Ask the pending outgoing INVITE that `user_id` placed under
@@ -248,7 +258,7 @@ impl SipProxyManager {
         user_id: &str,
         client_ref: &str,
         cancel: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<InviteSlot<'_>, OriginateRefusal> {
+    ) -> Result<InviteSlot, OriginateRefusal> {
         let key = (user_id.to_string(), client_ref.to_string());
         let id = self
             .next_invite_id
@@ -265,7 +275,7 @@ impl SipProxyManager {
             },
         );
         Ok(InviteSlot {
-            invites: &self.pending_invites,
+            invites: Arc::clone(&self.pending_invites),
             key,
             id,
         })
@@ -822,15 +832,15 @@ impl SipProxyManager {
 
     /// Originate an outgoing call on behalf of a mobile client.
     ///
-    /// Opens a temporary UDP socket, sends a SIP INVITE with the mobile
-    /// client's SDP offer from `account` (the caller's registered device),
-    /// handles auth challenges, and waits for a 200 OK.
+    /// The INVITE transaction runs in its own task (see
+    /// [`super::outgoing`]), which owns the socket until the transaction is
+    /// over. This future only waits for its outcome: dropping it (the HTTP
+    /// client went away) cancels a ringing call instead of abandoning it.
     /// Returns (call_token, sdp_answer).
     ///
-    /// With a `client_ref`, the pending INVITE can be cancelled through
-    /// [`Self::cancel_outgoing_call`]: the gateway sends CANCEL, ACKs the
-    /// final response, and BYEs a 200 OK that crosses the CANCEL. The call
-    /// then fails with [`OriginateRefusal::Cancelled`].
+    /// With a `client_ref`, the pending INVITE can also be cancelled through
+    /// [`Self::cancel_outgoing_call`]; the call then fails with
+    /// [`OriginateRefusal::Cancelled`].
     pub async fn originate_call(
         &self,
         destination_uri: &str,
@@ -843,393 +853,122 @@ impl SipProxyManager {
         // Track the INVITE under its client_ref first, so a cancel works from
         // the moment the request is accepted. The slot is removed on every
         // outcome when it drops.
-        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-        let (slot, _no_cancel) = match client_ref {
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (slot, keep_cancel) = match client_ref {
             Some(r) => (Some(self.track_invite(owner_user_id, r, cancel_tx)?), None),
             None => (None, Some(cancel_tx)),
         };
 
-        let username = account.username.as_str();
-        let password = account.password.as_str();
-        let domain = account.domain.as_str();
-        let registrar = account.registrar.as_deref().filter(|r| !r.is_empty());
-        let transport = account.transport.as_str();
-        let port = account.port;
-        let auth_username = account.auth_username.as_deref().filter(|a| !a.is_empty());
-        let display_name = account.display_name.as_str();
-        let effective_registrar = registrar.unwrap_or(domain);
-        let effective_auth_user = auth_username.unwrap_or(username);
-
-        // Resolve target via SRV lookup (with A record fallback)
+        let registrar = account
+            .registrar
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(&account.domain)
+            .to_string();
         let resolved = self
             .resolver
-            .resolve(effective_registrar, port, transport)
+            .resolve(&registrar, account.port, &account.transport)
             .await?;
         let server_addr = resolved
             .first()
-            .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", effective_registrar))?
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", registrar))?
             .addr;
 
-        // Bind temporary socket
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let local_port = socket.local_addr()?.port();
-
-        // Discover local IP
         let probe = UdpSocket::bind("0.0.0.0:0").await?;
         probe.connect(server_addr).await?;
-        let local_ip = probe.local_addr()?.ip().to_string();
+        let local_addr = SocketAddr::new(probe.local_addr()?.ip(), local_port);
 
-        let call_id = message::generate_call_id();
-        let from_tag = format!("{:08x}", rand::random::<u32>());
-        let branch = message::generate_branch();
-        let _ = transport; // UDP only for now
-
-        // Normalize URI
         let target_uri = if destination_uri.starts_with("sip:") {
             destination_uri.to_string()
         } else {
             format!("sip:{}", destination_uri)
         };
 
-        // Extract phone's RTP address from its SDP offer
-        let phone_media = message::extract_sdp_media_address(sdp_offer);
-        if let Some((ref ip, port)) = phone_media {
-            tracing::info!(ip = %ip, port, "Phone SDP offer media address");
-        }
-
-        // Pass phone's SDP offer through to PBX unchanged.
-        // RTP flows directly between phone and PBX media relay — no gateway relay needed.
-        if let Some((ip, port)) = message::extract_sdp_media_address(sdp_offer) {
-            tracing::info!(ip, port, "Phone SDP offer media address (pass-through)");
-        }
-
-        let mut invite = Self::build_originate_invite(
-            &target_uri,
-            &local_ip,
-            local_port,
-            &call_id,
-            1,
-            &from_tag,
-            &branch,
-            username,
-            domain,
-            display_name,
-            sdp_offer,
-            None,
-        );
-        let mut invite_branch = branch;
-
-        socket.send_to(invite.as_bytes(), server_addr).await?;
-        tracing::info!(uri = %target_uri, "Sent outgoing INVITE (SDP pass-through)");
-
-        // Wait for final response (up to 30s)
-        let mut buf = vec![0u8; 65535];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut cseq: u32 = 1;
-
-        // Cancellation state: the CANCEL we sent (retransmitted until the
-        // PBX answers it) and when to retransmit next.
-        let mut cancel_armed = slot.is_some();
-        let mut cancel: Option<String> = None;
-        let mut cancel_answered = false;
-        let mut cancel_interval = Duration::from_millis(500);
-        let mut cancel_retx_at = deadline;
-
-        enum Event {
-            Cancel(bool),
-            Recv(Result<std::io::Result<(usize, SocketAddr)>, tokio::time::error::Elapsed>),
-        }
-
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                if cancel.is_some() {
-                    return Err(OriginateRefusal::Cancelled.into());
-                }
-                anyhow::bail!("Outgoing call timed out");
-            }
-            let wake = if cancel.is_some() && !cancel_answered {
-                cancel_retx_at.min(deadline)
-            } else {
-                deadline
-            };
-
-            let event = tokio::select! {
-                biased;
-                r = &mut cancel_rx, if cancel_armed => Event::Cancel(r.is_ok()),
-                r = tokio::time::timeout(wake.saturating_duration_since(now), socket.recv_from(&mut buf)) => Event::Recv(r),
-            };
-
-            let len = match event {
-                Event::Cancel(requested) => {
-                    cancel_armed = false;
-                    if requested {
-                        let msg = message::build_cancel(&invite)
-                            .ok_or_else(|| anyhow::anyhow!("cannot build CANCEL"))?;
-                        socket.send_to(msg.as_bytes(), server_addr).await?;
-                        tracing::info!(call_id = %call_id, "Outgoing call cancelled by app — sent CANCEL");
-                        cancel_retx_at = tokio::time::Instant::now() + cancel_interval;
-                        cancel = Some(msg);
-                    }
-                    continue;
-                }
-                Event::Recv(Err(_)) => {
-                    // Timer: retransmit the CANCEL, or loop round to the deadline.
-                    if let (Some(msg), false) = (&cancel, cancel_answered) {
-                        if tokio::time::Instant::now() >= cancel_retx_at {
-                            socket.send_to(msg.as_bytes(), server_addr).await?;
-                            cancel_interval = (cancel_interval * 2).min(Duration::from_secs(4));
-                            cancel_retx_at = tokio::time::Instant::now() + cancel_interval;
-                        }
-                    }
-                    continue;
-                }
-                Event::Recv(Ok(r)) => match r? {
-                    (len, from) if from == server_addr => len,
-                    (_, from) => {
-                        tracing::warn!(call_id = %call_id, %from, "Dropping SIP message from an unexpected source");
-                        continue;
-                    }
-                },
-            };
-
-            let text = std::str::from_utf8(&buf[..len])?;
-            let status = match message::parse_status_code(text) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            match message::extract_cseq_method(text).as_deref() {
-                Some("INVITE") => {}
-                Some("CANCEL") => {
-                    tracing::debug!(status, "Response to our CANCEL");
-                    cancel_answered = true;
-                    continue;
-                }
-                _ => continue,
-            }
-
-            let cancelled = cancel.is_some();
-            match status {
-                100..=199 => {
-                    tracing::debug!(status, "Provisional response for outgoing call");
-                    continue;
-                }
-                200..=299 => {
-                    let to_tag = message::extract_to_tag(text).unwrap_or_default();
-                    let ack = Self::build_ack(
-                        &target_uri,
-                        &local_ip,
-                        local_port,
-                        &call_id,
-                        cseq,
-                        &from_tag,
-                        &to_tag,
-                        &message::generate_branch(),
-                    );
-                    socket.send_to(ack.as_bytes(), server_addr).await?;
-
-                    // Answered: from here on the call can't be cancelled. If
-                    // a cancel was asked for (even one still in flight), the
-                    // answer crossed it — end the call right away.
-                    let cancel_requested = slot.as_ref().is_some_and(|s| s.claim_answer());
-                    if cancelled || cancel_requested {
-                        tracing::info!(call_id = %call_id, "200 OK crossed our CANCEL — sending BYE");
-                        let local_addr = SocketAddr::new(local_ip.parse()?, local_port);
-                        let dialog = crate::handoff::Dialog::from_uac(text, server_addr);
-                        let bye = crate::handoff::build_in_dialog_request(
-                            "BYE",
-                            &dialog,
-                            cseq + 1,
-                            local_addr,
-                            &message::generate_branch(),
-                            "",
-                        );
-                        Self::bye_cancelled_answer(&socket, server_addr, &bye, &ack).await;
-                        return Err(OriginateRefusal::Cancelled.into());
-                    }
-
-                    // Extract SDP from 200 OK
-                    let raw_sdp_answer = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-
-                    // Pass PBX's SDP answer through to phone unchanged.
-                    // Phone will send RTP directly to PBX media relay.
-                    let sdp_answer = raw_sdp_answer;
-                    if let Some((ip, port)) = message::extract_sdp_media_address(&sdp_answer) {
-                        tracing::info!(ip, port, "PBX SDP answer media address (pass-through)");
-                    }
-
-                    // Create a call token for hangup tracking
-                    let call_token = uuid::Uuid::new_v4().to_string();
-
-                    // Store as an active call for BYE handling
-                    let proxy_reg = Arc::new(RwLock::new(ProxyRegistration {
-                        device_id: format!("outgoing-{}", &call_token[..8]),
-                        config: SipAccountConfig {
-                            username: username.to_string(),
-                            password: password.to_string(),
-                            domain: domain.to_string(),
-                            registrar: registrar.map(|s| s.to_string()),
-                            transport: "udp".to_string(),
-                            port,
-                            auth_username: auth_username.map(|s| s.to_string()),
-                            display_name: display_name.to_string(),
-                        },
-                        socket: socket.clone(),
-                        server_addr,
-                        peers: vec![server_addr],
-                        local_addr: SocketAddr::new(local_ip.parse().unwrap(), local_port),
-                        call_id: call_id.clone(),
-                        from_tag: from_tag.clone(),
-                        cseq,
-                        state: ProxyState::Registered,
-                        auth_attempts: 0,
-                        push_manager: Arc::new(PushManager::new_noop()),
-                        handoff: handoff.clone(),
-                    }));
-
-                    // Register the active call with the RTP relay handle
-                    let ended = handoff
-                        .register_active_call(
-                            call_token.clone(),
-                            call_id.clone(),
-                            CallOwner::User(owner_user_id.to_string()),
-                            text.to_string(),
-                            server_addr,
-                            proxy_reg,
-                            None,
-                            sdp_offer.to_string(),
-                            format!("sip:{username}@{local_ip}:{local_port};transport=udp"),
-                        )
-                        .await;
-
-                    tracing::info!(call_id = %call_id, "Outgoing call connected");
-
-                    Self::spawn_outgoing_call_loop(
-                        socket.clone(),
-                        server_addr,
-                        handoff.clone(),
-                        call_id.clone(),
-                        ended,
-                    );
-
-                    return Ok((call_token, sdp_answer));
-                }
-                _ => {
-                    // Every non-2xx final response is ACKed on the INVITE's
-                    // own transaction (same branch).
-                    let to_tag = message::extract_to_tag(text).unwrap_or_default();
-                    let ack = Self::build_ack(
-                        &target_uri,
-                        &local_ip,
-                        local_port,
-                        &call_id,
-                        cseq,
-                        &from_tag,
-                        &to_tag,
-                        &invite_branch,
-                    );
-                    socket.send_to(ack.as_bytes(), server_addr).await?;
-
-                    if cancelled {
-                        tracing::info!(call_id = %call_id, status, "Outgoing call ended after CANCEL");
-                        return Err(OriginateRefusal::Cancelled.into());
-                    }
-                    if status != 401 && status != 407 {
-                        anyhow::bail!("Outgoing call rejected with status {}", status);
-                    }
-
-                    tracing::debug!(status, "Auth challenge for outgoing INVITE");
-                    let (header_name, auth_header_name) = if status == 401 {
-                        ("WWW-Authenticate", "Authorization")
-                    } else {
-                        ("Proxy-Authenticate", "Proxy-Authorization")
-                    };
-                    let www_auth = message::extract_header(text, header_name)
-                        .ok_or_else(|| anyhow::anyhow!("No auth challenge header"))?;
-                    let auth = DigestAuth::from_challenge(
-                        &www_auth,
-                        effective_auth_user,
-                        password,
-                        &target_uri,
-                        "INVITE",
-                    )
-                    .ok_or_else(|| anyhow::anyhow!("Failed to parse auth challenge"))?;
-
-                    // Re-send INVITE with auth on a new transaction; a later
-                    // CANCEL must match this one.
-                    cseq += 1;
-                    invite_branch = message::generate_branch();
-                    invite = Self::build_originate_invite(
-                        &target_uri,
-                        &local_ip,
-                        local_port,
-                        &call_id,
-                        cseq,
-                        &from_tag,
-                        &invite_branch,
-                        username,
-                        domain,
-                        display_name,
-                        sdp_offer,
-                        Some((auth_header_name, &auth.to_header())),
-                    );
-                    socket.send_to(invite.as_bytes(), server_addr).await?;
-                    tracing::debug!("Re-sent INVITE with auth credentials");
-                }
-            }
-        }
+        let invite = super::outgoing::OutgoingInvite {
+            socket,
+            server_addr,
+            local_addr,
+            account: account.clone(),
+            target_uri,
+            call_id: message::generate_call_id(),
+            from_tag: message::generate_tag(),
+            sdp_offer: sdp_offer.to_string(),
+            owner_user_id: owner_user_id.to_string(),
+            handoff,
+            ring_timeout: self.ring_timeout,
+        };
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _keep_cancel = keep_cancel;
+            invite.run(slot, cancel_rx, result_tx).await;
+        });
+        result_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("outgoing call task ended without a result"))?
     }
 
-    /// End a call whose 200 OK crossed our CANCEL: send `bye` and retransmit
-    /// it (re-ACKing any retransmitted 200 OK) until the PBX answers it or
-    /// about 4 seconds pass.
-    async fn bye_cancelled_answer(
-        socket: &UdpSocket,
+    /// Store an answered outgoing call as active and start its receive loop
+    /// (which re-sends `ack` for retransmitted 2xx responses).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_outgoing_call(
+        handoff: &Arc<HandoffManager>,
+        socket: &Arc<UdpSocket>,
         server_addr: SocketAddr,
-        bye: &str,
-        ack: &str,
-    ) {
-        let mut buf = vec![0u8; 65535];
-        let give_up = tokio::time::Instant::now() + Duration::from_secs(4);
-        let mut interval = Duration::from_millis(500);
-        loop {
-            if socket.send_to(bye.as_bytes(), server_addr).await.is_err() {
-                return;
-            }
-            let retx_at = (tokio::time::Instant::now() + interval).min(give_up);
-            loop {
-                let wait = retx_at.saturating_duration_since(tokio::time::Instant::now());
-                let Ok(Ok((len, from))) =
-                    tokio::time::timeout(wait, socket.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                if from != server_addr {
-                    continue;
-                }
-                let Ok(text) = std::str::from_utf8(&buf[..len]) else {
-                    continue;
-                };
-                match message::extract_cseq_method(text).as_deref() {
-                    Some("BYE") if message::parse_status_code(text).is_some_and(|s| s >= 200) => {
-                        return;
-                    }
-                    Some("INVITE")
-                        if message::parse_status_code(text)
-                            .is_some_and(|s| (200..300).contains(&s)) =>
-                    {
-                        let _ = socket.send_to(ack.as_bytes(), server_addr).await;
-                    }
-                    _ => {}
-                }
-            }
-            if tokio::time::Instant::now() >= give_up {
-                tracing::warn!("No response to BYE for a cancelled call");
-                return;
-            }
-            interval = (interval * 2).min(Duration::from_secs(4));
-        }
+        local_addr: SocketAddr,
+        account: &SipAccountConfig,
+        call_id: &str,
+        from_tag: &str,
+        ok: &str,
+        ack: String,
+        owner_user_id: &str,
+        local_sdp: &str,
+    ) -> String {
+        let call_token = uuid::Uuid::new_v4().to_string();
+        let proxy_reg = Arc::new(RwLock::new(ProxyRegistration {
+            device_id: format!("outgoing-{}", &call_token[..8]),
+            config: account.clone(),
+            socket: socket.clone(),
+            server_addr,
+            peers: vec![server_addr],
+            local_addr,
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            cseq: 0,
+            state: ProxyState::Registered,
+            auth_attempts: 0,
+            push_manager: Arc::new(PushManager::new_noop()),
+            handoff: handoff.clone(),
+        }));
+        let ended = handoff
+            .register_active_call(
+                call_token.clone(),
+                call_id.to_string(),
+                CallOwner::User(owner_user_id.to_string()),
+                ok.to_string(),
+                server_addr,
+                proxy_reg,
+                None,
+                local_sdp.to_string(),
+                format!(
+                    "sip:{}@{}:{};transport=udp",
+                    account.username,
+                    local_addr.ip(),
+                    local_addr.port()
+                ),
+            )
+            .await;
+        tracing::info!(call_id = %call_id, "Outgoing call connected");
+        Self::spawn_outgoing_call_loop(
+            socket.clone(),
+            server_addr,
+            handoff.clone(),
+            call_id.to_string(),
+            ended,
+            Some(ack),
+        );
+        call_token
     }
 
     /// Receive loop for an outgoing call's dedicated socket: answers BYE and
@@ -1245,6 +984,7 @@ impl SipProxyManager {
         handoff: Arc<HandoffManager>,
         call_id: String,
         mut ended: tokio::sync::oneshot::Receiver<()>,
+        ack: Option<String>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -1302,76 +1042,27 @@ impl SipProxyManager {
                     {
                         tracing::warn!(call_id = %call_id, "Error handling SIP request: {}", e);
                     }
-                } else if matches!(
-                    message::extract_cseq_method(text).as_deref(),
-                    Some("REFER" | "BYE")
-                ) {
-                    handoff.handle_refer_response_on(text, &socket).await;
+                } else {
+                    match message::extract_cseq_method(text).as_deref() {
+                        Some("REFER" | "BYE") => {
+                            handoff.handle_refer_response_on(text, &socket).await;
+                        }
+                        // The PBX didn't get our ACK and repeats its 2xx.
+                        Some("INVITE")
+                            if message::parse_status_code(text)
+                                .is_some_and(|c| (200..300).contains(&c)) =>
+                        {
+                            if let Some(ack) = &ack {
+                                let _ = socket.send_to(ack.as_bytes(), from).await;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 // Other responses (200 OK to our BYE, etc.) are ignored.
             }
             tracing::debug!(call_id = %call_id, "Outgoing call receive loop ended");
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_originate_invite(
-        target_uri: &str,
-        local_ip: &str,
-        local_port: u16,
-        call_id: &str,
-        cseq: u32,
-        from_tag: &str,
-        branch: &str,
-        username: &str,
-        domain: &str,
-        display_name: &str,
-        sdp: &str,
-        auth: Option<(&str, &str)>,
-    ) -> String {
-        let mut msg = format!(
-            "INVITE {target_uri} SIP/2.0\r\n\
-             Via: SIP/2.0/UDP {local_ip}:{local_port};branch={branch};rport\r\n\
-             Max-Forwards: 70\r\n\
-             From: \"{display_name}\" <sip:{username}@{domain}>;tag={from_tag}\r\n\
-             To: <{target_uri}>\r\n\
-             Call-ID: {call_id}\r\n\
-             CSeq: {cseq} INVITE\r\n\
-             Contact: <sip:{username}@{local_ip}:{local_port};transport=udp>\r\n\
-             Content-Type: application/sdp\r\n\
-             Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n\
-             User-Agent: Aria-Gateway/0.1.0\r\n"
-        );
-
-        if let Some((name, value)) = auth {
-            msg.push_str(&format!("{}: {}\r\n", name, value));
-        }
-
-        msg.push_str(&format!("Content-Length: {}\r\n\r\n{}", sdp.len(), sdp));
-        msg
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_ack(
-        target_uri: &str,
-        local_ip: &str,
-        local_port: u16,
-        call_id: &str,
-        cseq: u32,
-        from_tag: &str,
-        to_tag: &str,
-        branch: &str,
-    ) -> String {
-        format!(
-            "ACK {target_uri} SIP/2.0\r\n\
-             Via: SIP/2.0/UDP {local_ip}:{local_port};branch={branch};rport\r\n\
-             Max-Forwards: 70\r\n\
-             From: <sip:user@host>;tag={from_tag}\r\n\
-             To: <{target_uri}>;tag={to_tag}\r\n\
-             Call-ID: {call_id}\r\n\
-             CSeq: {cseq} ACK\r\n\
-             Content-Length: 0\r\n\r\n"
-        )
     }
 }
 
@@ -1428,6 +1119,7 @@ Content-Length: 0\r\n\r\n";
             handoff.clone(),
             "out-call-1".into(),
             ended,
+            None,
         );
         OutgoingCall {
             handoff,
