@@ -447,7 +447,8 @@ impl SipProxyManager {
                         // Could send a push notification here to notify the app
                     }
                     Ok(None) => {
-                        tracing::debug!(call_id = %call_id, "BYE for unknown call — ignoring");
+                        tracing::debug!(call_id = %call_id, "BYE for unknown call — sending 481");
+                        Self::reply_481(reg, text, from).await?;
                     }
                     Err(e) => {
                         tracing::error!(call_id = %call_id, "Error handling BYE: {}", e);
@@ -952,19 +953,21 @@ impl SipProxyManager {
                     let cid = message::extract_header(text, "Call-ID").unwrap_or_default();
                     match method.as_str() {
                         "BYE" => {
-                            tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
-
-                            // Send 200 OK for BYE
-                            let response = format!(
-                                "SIP/2.0 200 OK\r\n\
-                                 {}\
-                                 Content-Length: 0\r\n\r\n",
-                                Self::echo_headers(text),
-                            );
-                            let _ = socket.send_to(response.as_bytes(), from).await;
-
-                            // Clean up via handoff
-                            let _ = handoff.handle_bye_from_pbx(&cid, text, from).await;
+                            // Ends the call and answers 200 OK if it is active.
+                            match handoff.handle_bye_from_pbx(&cid, text, from).await {
+                                Ok(Some(_)) => {
+                                    tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(call_id = %cid, "BYE for unknown call — sending 481");
+                                    if let Some(resp) = message::build_481(text) {
+                                        let _ = socket.send_to(resp.as_bytes(), from).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(call_id = %cid, "Error handling BYE: {}", e);
+                                }
+                            }
                         }
                         "NOTIFY" => {
                             let response = format!(
@@ -1047,6 +1050,19 @@ impl SipProxyManager {
              CSeq: {cseq} ACK\r\n\
              Content-Length: 0\r\n\r\n"
         )
+    }
+
+    /// Answer `request` with 481 Call/Transaction Does Not Exist.
+    async fn reply_481(
+        reg: &Arc<RwLock<ProxyRegistration>>,
+        request: &str,
+        to: SocketAddr,
+    ) -> anyhow::Result<()> {
+        if let Some(resp) = message::build_481(request) {
+            let socket = reg.read().await.socket.clone();
+            socket.send_to(resp.as_bytes(), to).await?;
+        }
+        Ok(())
     }
 
     /// Echo Via/From/To/Call-ID/CSeq headers for simple responses.
@@ -1174,5 +1190,67 @@ Content-Length: 0\r\n\r\n";
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!call.recv_loop.is_finished());
         call.recv_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn outgoing_loop_answers_481_to_bye_for_another_call() {
+        let call = outgoing_call().await;
+        call.pbx
+            .send_to(bye("some-other-call").as_bytes(), call.gw_addr)
+            .await
+            .unwrap();
+        let resp = recv_text(&call.pbx).await;
+        assert!(
+            resp.starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            "{resp}"
+        );
+        assert_eq!(
+            message::extract_header(&resp, "CSeq").as_deref(),
+            Some("5 BYE")
+        );
+        // Our own call is untouched and the loop keeps serving it.
+        assert!(call.handoff.is_call_active("out-call-1").await);
+        assert!(!call.recv_loop.is_finished());
+        call.recv_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_answers_481_to_bye_for_unknown_or_ended_call() {
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_addr = pbx.local_addr().unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+            gw,
+            "pbx.example.com",
+            handoff.clone(),
+        )));
+        let _ended = handoff
+            .register_active_call(
+                "tok".into(),
+                "out-call-1".into(),
+                CallOwner::User("alice".into()),
+                OUTBOUND_200.into(),
+                pbx_addr,
+                reg.clone(),
+                None,
+            )
+            .await;
+
+        // Unknown dialog.
+        SipProxyManager::handle_request(&reg, &bye("nope"), pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 481 "));
+
+        // First BYE ends the call with 200; a retransmission gets 481.
+        SipProxyManager::handle_request(&reg, &bye("out-call-1"), pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK\r\n"));
+        SipProxyManager::handle_request(&reg, &bye("out-call-1"), pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 481 "));
     }
 }

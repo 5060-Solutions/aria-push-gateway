@@ -90,6 +90,27 @@ pub fn build_480(request: &str) -> Option<String> {
     ))
 }
 
+/// Build a 481 Call/Transaction Does Not Exist response, e.g. for a BYE on a
+/// dialog the gateway doesn't know (RFC 3261 §15.1.2).
+pub fn build_481(request: &str) -> Option<String> {
+    let via = extract_header(request, "Via")?;
+    let from = extract_header(request, "From")?;
+    let to = extract_header(request, "To")?;
+    let call_id = extract_header(request, "Call-ID")?;
+    let cseq = extract_header(request, "CSeq")?;
+
+    Some(format!(
+        "SIP/2.0 481 Call/Transaction Does Not Exist\r\n\
+         Via: {via}\r\n\
+         From: {from}\r\n\
+         To: {to}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq}\r\n\
+         User-Agent: Aria-Gateway/0.1.0\r\n\
+         Content-Length: 0\r\n\r\n"
+    ))
+}
+
 /// Extract the media IP and port from an SDP body.
 ///
 /// Looks for the `c=IN IP4 <addr>` connection line and `m=audio <port>` media line.
