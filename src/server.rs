@@ -514,7 +514,7 @@ async fn make_call(
     auth: AuthUser,
     body: Result<Json<MakeCallRequest>, JsonRejection>,
 ) -> Result<Json<MakeCallResponse>, ApiError> {
-    let Json(req) = body.map_err(|rejection| ApiError::from(rejection.status()))?;
+    let Json(req) = body.map_err(|_| ApiError::from(StatusCode::BAD_REQUEST))?;
     if req
         .client_ref
         .as_deref()
@@ -626,9 +626,12 @@ async fn accept_call(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(token): Path<String>,
-    Json(req): Json<AcceptCallRequest>,
+    body: Result<Json<AcceptCallRequest>, JsonRejection>,
 ) -> Result<StatusCode, StatusCode> {
+    // Ownership first: a token that isn't the caller's is 404 whatever the
+    // body says.
     require_call_owner(&state, &auth, &token).await?;
+    let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
     state
         .handoff
         .accept_call(&token, req.sdp_answer)
@@ -2149,5 +2152,66 @@ Content-Length: 0\r\n\r\n";
             "{invite}"
         );
         http.abort();
+    }
+
+    // ── Body errors ─────────────────────────────────────────────────────────
+
+    fn raw_post(user: &str, path: &str, content_type: Option<&str>, body: &str) -> Request<Body> {
+        let jwt = auth::create_token(user, JWT_SECRET, 3600).unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"));
+        if let Some(ct) = content_type {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_bodies_are_400_on_every_route() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (_pbx, token) = pending_call_for(&app, "bob-dev").await;
+        for path in [
+            "/v1/auth/token".to_string(),
+            "/v1/devices".to_string(),
+            "/v1/calls".to_string(),
+            "/v1/calls/cancel".to_string(),
+            format!("/v1/calls/{token}/accept"),
+            format!("/v1/calls/{token}/transfer"),
+        ] {
+            for (ct, body) in [
+                (Some("application/json"), "{not json"),
+                (Some("application/json"), r#"{"unexpected": 1}"#),
+                (Some("text/plain"), "{}"),
+                (None, "{}"),
+            ] {
+                let (status, _) = app.send(raw_post("bob", &path, ct, body)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {ct:?} {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_is_checked_before_the_body() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (_pbx, token) = pending_call_for(&app, "bob-dev").await;
+        for path in [
+            format!("/v1/calls/{token}/accept"),
+            format!("/v1/calls/{token}/transfer"),
+            "/v1/calls/no-such-token/accept".to_string(),
+        ] {
+            let (status, _) = app
+                .send(raw_post(
+                    "alice",
+                    &path,
+                    Some("application/json"),
+                    "{not json",
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
     }
 }

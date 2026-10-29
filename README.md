@@ -143,6 +143,11 @@ Every endpoint except `/v1/auth/token` and `/health` requires
 `Authorization: Bearer <token>`; a missing, malformed, expired or wrongly
 signed token gets `401`.
 
+A request body that is not valid JSON, has the wrong content type, or is
+missing required fields gets `400` on every route. On call routes the
+ownership check runs first, so another user's token is `404` whatever the
+body says.
+
 ### Ownership
 
 A token's subject (`sub`, the `user_id` it was minted for) owns:
@@ -235,7 +240,7 @@ re-registration fails.
 | `POST` | `/v1/calls` | Initiate outgoing call (gateway sends INVITE) |
 | `POST` | `/v1/calls/cancel` | Cancel a still-ringing outgoing call by its `client_ref` |
 | `GET` | `/v1/calls/{token}` | Get incoming call offer (SDP + caller info) |
-| `POST` | `/v1/calls/{token}/accept` | Accept call with SDP answer |
+| `POST` | `/v1/calls/{token}/accept` | Accept call with SDP answer (`502` if the 200 OK can't be sent, `409` if a call with the same Call-ID is already active) |
 | `POST` | `/v1/calls/{token}/reject` | Reject call (sends 603 to PBX) |
 | `POST` | `/v1/calls/{token}/hangup` | Hang up active call (sends BYE to PBX) |
 | `POST` | `/v1/calls/{token}/transfer` | Blind-transfer active call (sends REFER to PBX) |
