@@ -711,13 +711,7 @@ impl SipProxyManager {
 
         match method.as_str() {
             "REGISTER" => Self::handle_register_response(reg, text, status).await,
-            "BYE" => {
-                // 200 OK to our BYE — call ended cleanly
-                let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-                tracing::debug!(call_id = %call_id, status, "BYE response received");
-                Ok(())
-            }
-            "REFER" => {
+            "BYE" | "REFER" => {
                 let (handoff, socket) = {
                     let r = reg.read().await;
                     (r.handoff.clone(), r.socket.clone())
@@ -1241,9 +1235,10 @@ impl SipProxyManager {
     /// Receive loop for an outgoing call's dedicated socket: answers BYE and
     /// NOTIFY from the PBX and routes REFER responses.
     ///
-    /// The loop exits as soon as the call stops being active (`ended`
-    /// completes) — whether the app hung up, the PBX sent BYE or a transfer
-    /// completed — so the task and its socket don't outlive the call.
+    /// The loop exits once the call stops being active (`ended` completes)
+    /// — whether the app hung up, the PBX sent BYE or a transfer completed —
+    /// and any BYE we sent has been answered (or timed out), so the task and
+    /// its socket don't outlive the call.
     fn spawn_outgoing_call_loop(
         socket: Arc<UdpSocket>,
         peer: SocketAddr,
@@ -1253,11 +1248,38 @@ impl SipProxyManager {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            // Once the call has ended, keep reading only while our BYE (or
+            // REFER) transaction is open, so its response is delivered and
+            // its retransmissions stop; then close.
+            let mut linger_until: Option<tokio::time::Instant> = None;
             loop {
+                if let Some(until) = linger_until {
+                    if !handoff.has_client_transactions(&socket)
+                        || tokio::time::Instant::now() >= until
+                    {
+                        break;
+                    }
+                }
+                // Poll while lingering so the loop notices the transaction end.
+                let wait = if linger_until.is_some() {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(3600)
+                };
                 let received = tokio::select! {
                     biased;
-                    _ = &mut ended => break,
-                    r = socket.recv_from(&mut buf) => r,
+                    _ = &mut ended, if linger_until.is_none() => {
+                        linger_until = Some(
+                            tokio::time::Instant::now()
+                                + super::transaction::TIMEOUT
+                                + Duration::from_secs(1),
+                        );
+                        continue;
+                    }
+                    r = tokio::time::timeout(wait, socket.recv_from(&mut buf)) => match r {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    },
                 };
                 let (len, from) = match received {
                     Ok(r) => r,
@@ -1280,7 +1302,10 @@ impl SipProxyManager {
                     {
                         tracing::warn!(call_id = %call_id, "Error handling SIP request: {}", e);
                     }
-                } else if message::extract_cseq_method(text).as_deref() == Some("REFER") {
+                } else if matches!(
+                    message::extract_cseq_method(text).as_deref(),
+                    Some("REFER" | "BYE")
+                ) {
                     handoff.handle_refer_response_on(text, &socket).await;
                 }
                 // Other responses (200 OK to our BYE, etc.) are ignored.
@@ -1444,8 +1469,17 @@ Content-Length: 0\r\n\r\n";
     async fn outgoing_loop_exits_after_app_hangup() {
         let call = outgoing_call().await;
         call.handoff.hangup_call("tok").await.unwrap();
-        assert!(recv_text(&call.pbx).await.starts_with("BYE "));
+        let bye = recv_text(&call.pbx).await;
+        assert!(bye.starts_with("BYE "));
+
+        // Unanswered, the BYE is retransmitted and the socket stays open.
+        assert_eq!(recv_text(&call.pbx).await, bye);
+        assert!(!call.recv_loop.is_finished());
+
+        let ok = message::build_simple_response(&bye, 200, "OK").unwrap();
+        call.pbx.send_to(ok.as_bytes(), call.gw_addr).await.unwrap();
         loop_exits(call.recv_loop).await;
+        nothing_arrives(&call.pbx).await;
     }
 
     #[tokio::test]

@@ -559,9 +559,9 @@ pub fn refer_notify_status(notify: &str) -> Option<u16> {
     parse_refer_notify(notify)?.status
 }
 
-/// Outstanding REFER transactions: Via branch -> where the final response
-/// goes, and the socket the REFER was sent on (the only one whose responses
-/// may complete it).
+/// Outstanding client transactions (REFER, BYE): Via branch -> where the
+/// final response goes, and the socket the request was sent on (the only
+/// one whose responses may complete it).
 type PendingRefers = HashMap<String, (oneshot::Sender<String>, Arc<tokio::net::UdpSocket>)>;
 
 fn lock_refers(
@@ -585,6 +585,19 @@ impl Drop for TransferClaim {
         if !self.accepted {
             self.flag.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// Removes a client transaction's response slot when dropped (owned form,
+/// for spawned tasks).
+struct OwnedSlot {
+    refers: Arc<std::sync::Mutex<PendingRefers>>,
+    branch: String,
+}
+
+impl Drop for OwnedSlot {
+    fn drop(&mut self) {
+        lock_refers(&self.refers).remove(&self.branch);
     }
 }
 
@@ -1456,7 +1469,9 @@ impl HandoffManager {
             "",
         );
 
-        let sent = reg.socket.send_to(bye.as_bytes(), call.pbx_addr).await;
+        let socket = reg.socket.clone();
+        drop(reg);
+        let sent = self.send_bye(&socket, call.pbx_addr, bye, branch).await;
 
         // Stop RTP relay
         if let Some(ref relay) = call.rtp_relay {
@@ -1494,6 +1509,45 @@ impl HandoffManager {
 
         sent?;
         Ok(())
+    }
+
+    /// Send a BYE as a non-INVITE client transaction: retransmit it (Timers
+    /// E/F) until the PBX answers or 64·T1 passes. The task owns the socket,
+    /// so it stays open until the transaction completes; the caller only
+    /// waits for the first send.
+    async fn send_bye(
+        &self,
+        socket: &Arc<tokio::net::UdpSocket>,
+        dest: SocketAddr,
+        bye: String,
+        branch: String,
+    ) -> std::io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        lock_refers(&self.pending_refers).insert(branch.clone(), (tx, socket.clone()));
+        if let Err(e) = socket.send_to(bye.as_bytes(), dest).await {
+            lock_refers(&self.pending_refers).remove(&branch);
+            return Err(e);
+        }
+        let refers = Arc::clone(&self.pending_refers);
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let _slot = OwnedSlot { refers, branch };
+            tokio::time::sleep(transaction::T1).await;
+            let mut rx = rx;
+            if rx.try_recv() == Err(oneshot::error::TryRecvError::Empty)
+                && !transaction::retransmit_until(&socket, dest, &bye, transaction::T2, rx).await
+            {
+                tracing::warn!("No response to our BYE");
+            }
+        });
+        Ok(())
+    }
+
+    /// Whether a client transaction (BYE/REFER) is still open on `socket`.
+    pub fn has_client_transactions(&self, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+        lock_refers(&self.pending_refers)
+            .values()
+            .any(|(_, s)| Arc::ptr_eq(s, socket))
     }
 
     /// Blind-transfer an active call: send a REFER on the PBX dialog and wait
@@ -2999,5 +3053,23 @@ Content-Length: 0\r\n\r\n";
             }
         );
         assert!(parse_refer_notify(&notify("dialog", "SIP/2.0 200 OK\r\n")).is_none());
+    }
+
+    #[tokio::test]
+    async fn bye_is_retransmitted_until_answered() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        mgr.hangup_call("tok").await.unwrap();
+        let bye = recv_text(&pbx).await;
+        assert!(bye.starts_with("BYE "));
+        assert_eq!(recv_text(&pbx).await, bye, "Timer E retransmission");
+        mgr.handle_refer_response(&response_to(&bye, "200 OK"))
+            .await;
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), pbx.recv(&mut buf))
+                .await
+                .is_err(),
+            "no retransmission after the 200"
+        );
     }
 }
