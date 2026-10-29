@@ -663,24 +663,25 @@ impl SipProxyManager {
     /// Originate an outgoing call on behalf of a mobile client.
     ///
     /// Opens a temporary UDP socket, sends a SIP INVITE with the mobile
-    /// client's SDP offer, handles auth challenges, and waits for a 200 OK.
+    /// client's SDP offer from `account` (the caller's registered device),
+    /// handles auth challenges, and waits for a 200 OK.
     /// Returns (call_token, sdp_answer).
-    #[allow(clippy::too_many_arguments)]
     pub async fn originate_call(
         &self,
         destination_uri: &str,
         sdp_offer: &str,
-        username: &str,
-        password: &str,
-        domain: &str,
-        registrar: Option<&str>,
-        transport: &str,
-        port: u16,
-        auth_username: Option<&str>,
-        display_name: &str,
+        account: &SipAccountConfig,
         owner_user_id: &str,
         handoff: Arc<HandoffManager>,
     ) -> anyhow::Result<(String, String)> {
+        let username = account.username.as_str();
+        let password = account.password.as_str();
+        let domain = account.domain.as_str();
+        let registrar = account.registrar.as_deref().filter(|r| !r.is_empty());
+        let transport = account.transport.as_str();
+        let port = account.port;
+        let auth_username = account.auth_username.as_deref().filter(|a| !a.is_empty());
+        let display_name = account.display_name.as_str();
         let effective_registrar = registrar.unwrap_or(domain);
         let effective_auth_user = auth_username.unwrap_or(username);
 

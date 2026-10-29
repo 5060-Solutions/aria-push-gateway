@@ -165,6 +165,27 @@ impl Database {
         )
     }
 
+    /// The caller's most recently updated active device registered for this
+    /// SIP account (`sip_username` exact, `sip_domain` case-insensitive).
+    pub async fn find_active_device_for_account(
+        &self,
+        user_id: &str,
+        sip_username: &str,
+        sip_domain: &str,
+    ) -> anyhow::Result<Option<DeviceRecord>> {
+        Ok(sqlx::query_as::<_, DeviceRecord>(
+            "SELECT * FROM devices \
+             WHERE user_id = ? AND sip_username = ? AND sip_domain = ? COLLATE NOCASE \
+               AND active = TRUE \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(sip_username)
+        .bind(sip_domain)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn list_active_devices(&self) -> anyhow::Result<Vec<DeviceRecord>> {
         Ok(
             sqlx::query_as::<_, DeviceRecord>("SELECT * FROM devices WHERE active = TRUE")

@@ -231,11 +231,17 @@ unknown, has expired, or belongs to another user's call. `/status` answers
   "destination_uri": "sip:bob@example.com",
   "sdp_offer": "<SDP>",
   "sip_username": "alice",
-  "sip_password": "secret",
-  "sip_domain": "sip.example.com",
-  "sip_display_name": "Alice"
+  "sip_domain": "sip.example.com"
 }
 ```
+
+`sip_username` + `sip_domain` (domain case-insensitive) select the SIP
+account. It must belong to an **active device the caller registered**,
+otherwise `404`. The call is placed with that device's stored credentials,
+registrar, port and display name. Older clients also send `sip_password`,
+`sip_registrar`, `sip_transport`, `sip_port`, `sip_auth_username` and
+`sip_display_name`. Those fields are still accepted but ignored. `502` means
+the INVITE failed or was rejected.
 
 **Response:** `{"call_token": "<token>", "sdp_answer": "<SDP>"}`
 

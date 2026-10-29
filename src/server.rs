@@ -414,21 +414,19 @@ async fn device_heartbeat(
 
 // ── Call Signaling ───────────────────────────────────────────────────────────
 
+/// Body of `POST /v1/calls`.
+///
+/// Only `sip_username` and `sip_domain` select the SIP account; the call is
+/// placed with the stored credentials of the caller's active device for that
+/// account. Older clients also send `sip_password`, `sip_registrar`,
+/// `sip_transport`, `sip_port`, `sip_auth_username` and `sip_display_name`;
+/// those are accepted and ignored.
 #[derive(Deserialize)]
 struct MakeCallRequest {
     destination_uri: String,
     sdp_offer: String,
     sip_username: String,
-    sip_password: String,
     sip_domain: String,
-    sip_registrar: Option<String>,
-    #[serde(default = "default_transport")]
-    sip_transport: String,
-    #[serde(default = "default_port")]
-    sip_port: u16,
-    sip_auth_username: Option<String>,
-    #[serde(default)]
-    sip_display_name: String,
 }
 
 #[derive(Serialize)]
@@ -443,24 +441,34 @@ struct MakeCallResponse {
 /// mobile client, waits for a 200 OK with SDP answer, and returns both
 /// the call_token (for subsequent hangup) and the SDP answer (so the
 /// mobile app can set up RTP directly with the remote party).
+///
+/// The SIP account must belong to an active device the caller owns;
+/// otherwise 404.
 async fn make_call(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<MakeCallRequest>,
 ) -> Result<Json<MakeCallResponse>, StatusCode> {
+    let device = state
+        .db
+        .find_active_device_for_account(&auth.user_id, &req.sip_username, &req.sip_domain)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or_else(|| {
+            tracing::warn!(
+                user = %auth.user_id,
+                sip_user = %req.sip_username,
+                "outgoing call for a SIP account with no active device of the caller"
+            );
+            StatusCode::NOT_FOUND
+        })?;
+
     let (call_token, sdp_answer) = state
         .sip_proxy
         .originate_call(
             &req.destination_uri,
             &req.sdp_offer,
-            &req.sip_username,
-            &req.sip_password,
-            &req.sip_domain,
-            req.sip_registrar.as_deref(),
-            &req.sip_transport,
-            req.sip_port,
-            req.sip_auth_username.as_deref(),
-            &req.sip_display_name,
+            &device.sip_config(),
             &auth.user_id,
             state.handoff.clone(),
         )
@@ -1172,5 +1180,201 @@ Content-Length: 0\r\n\r\n";
         assert!(!app.device_active("bob-same-phone").await);
         assert!(app.device_active("bob-other").await);
         assert!(app.device_active(&new_dev).await);
+    }
+
+    // ── Outgoing calls ──────────────────────────────────────────────────────
+
+    /// A device for SIP account `1001@pbx.example.com` whose registrar is
+    /// the fake PBX on `pbx_port`, with stored password `stored-pw`.
+    async fn add_sip_device(app: &TestApp, id: &str, user_id: &str, pbx_port: u16, active: bool) {
+        let now = chrono::Utc::now();
+        app.db
+            .upsert_device(&DeviceRecord {
+                id: id.into(),
+                user_id: user_id.into(),
+                platform: "android".into(),
+                push_token: format!("push-{id}"),
+                bundle_id: None,
+                sip_username: "1001".into(),
+                sip_password: "stored-pw".into(),
+                sip_domain: "pbx.example.com".into(),
+                sip_registrar: Some("127.0.0.1".into()),
+                sip_transport: "udp".into(),
+                sip_port: pbx_port as i64,
+                sip_auth_username: None,
+                sip_display_name: "Bob".into(),
+                active,
+                created_at: now,
+                updated_at: now,
+                last_register_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The body today's mobile clients send, credentials included.
+    fn make_call_body(extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "destination_uri": "sip:2000@pbx.example.com",
+            "sdp_offer": "v=0\r\n",
+            "sip_username": "1001",
+            "sip_password": "whatever-the-client-sent",
+            "sip_domain": "PBX.example.com",
+            "sip_registrar": "203.0.113.9",
+            "sip_transport": "udp",
+            "sip_port": 5999,
+            "sip_auth_username": "someone-else",
+            "sip_display_name": "Bob",
+        });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            b.extend(e.clone());
+        }
+        body
+    }
+
+    fn post_as(user: &str, path: &str, body: &serde_json::Value) -> Request<Body> {
+        let jwt = auth::create_token(user, JWT_SECRET, 3600).unwrap();
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A response to `req` from the fake PBX.
+    fn pbx_reply(req: &str, status: &str, extra: &str, body: &str) -> String {
+        let h = |n: &str| crate::sip::message::extract_header(req, n).unwrap_or_default();
+        format!(
+            "SIP/2.0 {status}\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=pbxtag\r\n\
+             Call-ID: {}\r\nCSeq: {}\r\nContact: <sip:2000@127.0.0.1>\r\n{extra}\
+             Content-Length: {}\r\n\r\n{body}",
+            h("Via"),
+            h("From"),
+            h("To"),
+            h("Call-ID"),
+            h("CSeq"),
+            body.len()
+        )
+    }
+
+    async fn recv_from(sock: &tokio::net::UdpSocket) -> (String, std::net::SocketAddr) {
+        let mut buf = vec![0u8; 65535];
+        let (len, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for SIP message")
+                .unwrap();
+        (String::from_utf8(buf[..len].to_vec()).unwrap(), from)
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_uses_the_callers_stored_device_credentials() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            &app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+
+        let req = post_as("bob", "/v1/calls", &make_call_body(serde_json::json!({})));
+        let http = {
+            let router = app.router.clone();
+            tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+        };
+
+        // The INVITE reaches the device's registrar, not the body's.
+        let (invite, gw) = recv_from(&pbx).await;
+        assert!(invite.starts_with("INVITE sip:2000@pbx.example.com SIP/2.0"));
+        assert!(invite.contains("<sip:1001@pbx.example.com>"));
+        let challenge = "WWW-Authenticate: Digest realm=\"pbx.example.com\", nonce=\"n1\"\r\n";
+        pbx.send_to(
+            pbx_reply(&invite, "401 Unauthorized", challenge, "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "));
+
+        // The retry authenticates with the stored password and auth user.
+        let (invite2, _) = recv_from(&pbx).await;
+        let authz = crate::sip::message::extract_header(&invite2, "Authorization").unwrap();
+        let expected = crate::sip::digest::DigestAuth::from_challenge(
+            "Digest realm=\"pbx.example.com\", nonce=\"n1\"",
+            "1001",
+            "stored-pw",
+            "sip:2000@pbx.example.com",
+            "INVITE",
+        )
+        .unwrap();
+        assert_eq!(authz, expected.to_header());
+
+        pbx.send_to(
+            pbx_reply(
+                &invite2,
+                "200 OK",
+                "Content-Type: application/sdp\r\n",
+                "v=0\r\n",
+            )
+            .as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let resp = http.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sdp_answer"], "v=0\r\n");
+        let token = json["call_token"].as_str().unwrap();
+        assert_eq!(
+            app.handoff.call_owner(token).await,
+            Some(CallOwner::User("bob".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_call_needs_an_active_device_of_the_caller() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = pbx.local_addr().unwrap().port();
+        add_sip_device(&app, "alice-dev", "alice", port, true).await;
+        add_sip_device(&app, "carol-old", "carol", port, false).await;
+
+        for user in ["bob", "carol"] {
+            let (status, _) = app
+                .send(post_as(
+                    user,
+                    "/v1/calls",
+                    &make_call_body(serde_json::json!({})),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{user}");
+        }
+        // Alice's own account works only with its own username.
+        let (status, _) = app
+            .send(post_as(
+                "alice",
+                "/v1/calls",
+                &make_call_body(serde_json::json!({"sip_username": "1002"})),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), pbx.recv(&mut buf))
+                .await
+                .is_err(),
+            "no INVITE may be sent"
+        );
     }
 }
