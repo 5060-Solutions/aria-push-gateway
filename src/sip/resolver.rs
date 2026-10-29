@@ -56,6 +56,15 @@ impl SrvResolver {
         port: u16,
         transport: &str,
     ) -> anyhow::Result<Vec<ResolvedServer>> {
+        // An IP literal names the server directly; there is nothing to look up.
+        if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+            return Ok(vec![ResolvedServer {
+                addr: SocketAddr::new(ip, port),
+                priority: 0,
+                weight: 0,
+            }]);
+        }
+
         let srv_name = srv_service_name(domain, transport);
 
         // Check cache first
@@ -213,4 +222,25 @@ fn srv_service_name(domain: &str, transport: &str) -> String {
         _ => "udp",
     };
     format!("_sip._{}.{}", proto, domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ip_literals_resolve_without_dns() {
+        let resolver = SrvResolver::new().unwrap();
+        for (host, expected) in [("127.0.0.1", "127.0.0.1:5070"), ("::1", "[::1]:5070")] {
+            let servers = tokio::time::timeout(
+                Duration::from_millis(100),
+                resolver.resolve(host, 5070, "udp"),
+            )
+            .await
+            .expect("an IP literal must not wait on DNS")
+            .unwrap();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].addr.to_string(), expected);
+        }
+    }
 }
