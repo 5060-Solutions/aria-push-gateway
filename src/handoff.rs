@@ -572,20 +572,84 @@ fn lock_refers(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Releases a call's transfer claim when dropped, unless the transfer was
-/// accepted. Covers every way `transfer_call` can stop, including its
-/// future being dropped when the HTTP client disconnects mid-transfer.
+/// What happens to a call's transfer claim when `transfer_call` stops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimMode {
+    /// Nothing reached the PBX, or it definitively refused: release it.
+    Release,
+    /// A REFER went out and its fate is unknown (no final response yet, the
+    /// transaction timed out, or the HTTP request was dropped): the PBX may
+    /// have accepted it, so keep the claim and let a NOTIFY, a BYE or the
+    /// outcome timeout resolve it.
+    Watch,
+    /// Already handled by the caller.
+    Keep,
+}
+
+/// A call's transfer claim. Its `Drop` covers every way `transfer_call` can
+/// stop, including its future being dropped when the HTTP client
+/// disconnects mid-transfer.
 struct TransferClaim {
     flag: Arc<AtomicBool>,
-    accepted: bool,
+    mode: ClaimMode,
+    active: Arc<RwLock<HashMap<String, ActiveCall>>>,
+    call_id: String,
+    timeout: Duration,
 }
 
 impl Drop for TransferClaim {
     fn drop(&mut self) {
-        if !self.accepted {
-            self.flag.store(false, Ordering::SeqCst);
+        match self.mode {
+            ClaimMode::Release => self.flag.store(false, Ordering::SeqCst),
+            ClaimMode::Watch => {
+                tokio::spawn(watch_transfer_outcome(
+                    Arc::clone(&self.active),
+                    self.call_id.clone(),
+                    self.timeout,
+                ));
+            }
+            ClaimMode::Keep => {}
         }
     }
+}
+
+/// Mark the call's transfer pending and wait for the outcome: if no refer
+/// NOTIFY arrives within `timeout`, report it failed with 408 and release
+/// the call for another attempt.
+async fn watch_transfer_outcome(
+    active: Arc<RwLock<HashMap<String, ActiveCall>>>,
+    call_id: String,
+    timeout: Duration,
+) {
+    let generation = {
+        let calls = active.read().await;
+        let Some(call) = calls.get(&call_id) else {
+            return;
+        };
+        let mut track = call.transfer_track();
+        track.generation += 1;
+        track.progress = TransferProgress::Pending;
+        track.notified = false;
+        track.generation
+    };
+
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let calls = active.read().await;
+        let Some(call) = calls.get(&call_id) else {
+            return;
+        };
+        let silent = {
+            let track = call.transfer_track();
+            track.generation == generation
+                && track.progress == TransferProgress::Pending
+                && !track.notified
+        };
+        if silent {
+            tracing::warn!(call_id = %call_id, "No NOTIFY after REFER — transfer failed (408)");
+            call.fail_transfer(408);
+        }
+    });
 }
 
 /// Removes a client transaction's response slot when dropped (owned form,
@@ -1579,7 +1643,10 @@ impl HandoffManager {
             }
             let claim = TransferClaim {
                 flag: call.transfer_pending.clone(),
-                accepted: false,
+                mode: ClaimMode::Release,
+                active: Arc::clone(&self.active),
+                call_id: call_id.clone(),
+                timeout: self.refer_notify_timeout,
             };
             (
                 claim,
@@ -1610,6 +1677,8 @@ impl HandoffManager {
         // Send the REFER; if the PBX challenges it, resend once with digest
         // credentials from the registration that carried the call.
         let mut credentials: Option<(&'static str, String)> = None;
+        // From the first send on, the PBX may act on the REFER.
+        claim.mode = ClaimMode::Watch;
         let result = loop {
             let Some(cseq) = self.next_cseq(&call_id).await else {
                 break Err(TransferError::NotFound);
@@ -1664,11 +1733,19 @@ impl HandoffManager {
         match &result {
             Ok(()) => {
                 // Stay claimed until the NOTIFY/BYE resolves the transfer.
-                claim.accepted = true;
+                claim.mode = ClaimMode::Keep;
                 tracing::info!(call_id = %call_id, "PBX accepted REFER");
                 self.watch_transfer(&call_id).await;
             }
+            Err(TransferError::Timeout) => {
+                // The PBX may still have acted on it: resolve via NOTIFY,
+                // BYE or the outcome timeout.
+                claim.mode = ClaimMode::Keep;
+                tracing::warn!(call_id = %call_id, "No final response to REFER — outcome pending");
+                self.watch_transfer(&call_id).await;
+            }
             Err(e) => {
+                claim.mode = ClaimMode::Release;
                 tracing::warn!(call_id = %call_id, "Transfer failed: {}", e);
             }
         }
@@ -1768,38 +1845,12 @@ impl HandoffManager {
     /// NOTIFY arrives within the timeout, the transfer is reported failed
     /// with 408 and the call is released for another attempt.
     async fn watch_transfer(&self, call_id: &str) {
-        let generation = {
-            let active = self.active.read().await;
-            let Some(call) = active.get(call_id) else {
-                return;
-            };
-            let mut track = call.transfer_track();
-            track.generation += 1;
-            track.progress = TransferProgress::Pending;
-            track.notified = false;
-            track.generation
-        };
-
-        let active = Arc::clone(&self.active);
-        let call_id = call_id.to_string();
-        let timeout = self.refer_notify_timeout;
-        tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            let active = active.read().await;
-            let Some(call) = active.get(&call_id) else {
-                return;
-            };
-            let silent = {
-                let track = call.transfer_track();
-                track.generation == generation
-                    && track.progress == TransferProgress::Pending
-                    && !track.notified
-            };
-            if silent {
-                tracing::warn!(call_id = %call_id, "No NOTIFY after accepted REFER — transfer failed (408)");
-                call.fail_transfer(408);
-            }
-        });
+        watch_transfer_outcome(
+            Arc::clone(&self.active),
+            call_id.to_string(),
+            self.refer_notify_timeout,
+        )
+        .await;
     }
 
     /// Handle a NOTIFY from the PBX (already answered with 200 OK by the
@@ -2724,18 +2775,37 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn abandoned_transfer_releases_the_call() {
-        let Harness { mgr, pbx } = outgoing_call_harness().await;
+    async fn abandoned_transfer_stays_pending_until_its_outcome_is_known() {
+        let Harness { mgr, pbx } = outgoing_call_harness_with(
+            HandoffManager::new().with_refer_notify_timeout(Duration::from_millis(200)),
+        )
+        .await;
         let task = {
             let mgr = mgr.clone();
             tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
         };
         recv_text(&pbx).await;
-        // The HTTP request is dropped mid-transaction (client went away).
+        // The HTTP request is dropped after the REFER went out: the PBX may
+        // have accepted it, so the call stays claimed and reports pending.
         task.abort();
         let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(lock_refers(&mgr.pending_refers).is_empty());
+        assert_eq!(
+            mgr.transfer_call("tok", "1003").await,
+            Err(TransferError::InProgress)
+        );
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"pending"}"#
+        );
 
+        // No NOTIFY: the outcome timeout fails it with 408 and frees the call.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            status_json(&mgr.get_call_status("tok").await),
+            r#"{"status":"active","transfer":"failed","transfer_code":408}"#
+        );
         let retry = {
             let mgr = mgr.clone();
             tokio::spawn(async move { mgr.transfer_call("tok", "1003").await })
@@ -2745,6 +2815,24 @@ Content-Length: 0\r\n\r\n";
         mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
             .await;
         assert_eq!(retry.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn abandoned_transfer_completes_on_a_later_notify() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.transfer_call("tok", "1002").await })
+        };
+        recv_text(&pbx).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The PBX did accept it and reports success: our leg is ended.
+        mgr.handle_notify("outbound-call-1", &notify("refer", "SIP/2.0 200 OK\r\n"))
+            .await;
+        assert!(recv_text(&pbx).await.starts_with("BYE "));
+        assert!(!mgr.is_call_active("outbound-call-1").await);
     }
 
     #[tokio::test]

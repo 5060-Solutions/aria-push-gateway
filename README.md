@@ -298,15 +298,16 @@ as-is. Targets containing whitespace, control characters, `<`, `>`, `"`, `,`,
 | `404` | Unknown token, another user's call, or the call is not active (e.g. still ringing) |
 | `409` | A transfer of this call is already in progress (REFER outstanding, or accepted and not yet resolved) |
 | `502` | PBX rejected the REFER (non-2xx final response, including a second auth challenge) or it could not be sent |
-| `504` | No final response from the PBX within 8 seconds |
+| `504` | No final response from the PBX within 8 seconds. The PBX may still have acted on the REFER, so the call stays claimed (`409` for another transfer) and `/status` reports `"transfer":"pending"` until a NOTIFY or BYE settles it, or `failed`/`408` after 30 s. |
 
-After a `202`, `GET /v1/calls/{token}/status` on the still-active call reports
+After a `202` (or a `504`, or a request dropped after the REFER went out),
+`GET /v1/calls/{token}/status` on the still-active call reports
 the outcome:
 
 | Body | Meaning |
 |------|---------|
 | `{"status":"active","transfer":"pending"}` | REFER accepted, outcome not known yet |
-| `{"status":"active","transfer":"failed","transfer_code":486}` | Transfer failed. The code is the NOTIFY's sipfrag status, or `408` if the refer subscription ended without a final status or no NOTIFY arrived within 30 s of the `202`. The call stays up and can be transferred again. |
+| `{"status":"active","transfer":"failed","transfer_code":486}` | Transfer failed. The code is the NOTIFY's sipfrag status, or `408` if the refer subscription ended without a final status or no NOTIFY arrived within 30 s. The call stays up and can be transferred again. |
 | `{"status":"ended","reason":"transferred"}` | Transfer succeeded |
 
 `transfer` and `transfer_code` are omitted when no transfer has been accepted
@@ -314,8 +315,8 @@ on the call. A new accepted transfer resets the state to `pending`.
 
 If the PBX challenges the REFER (`401`/`407`), the gateway resends it once
 with digest credentials from the SIP account that carried the call. After a
-failed transfer (`502`/`504`, or a NOTIFY reporting the target failed) the
-call stays up and can be transferred again.
+failed transfer (`502`, or `"transfer":"failed"` in `/status`) the call stays
+up and can be transferred again.
 
 Only blind (unattended) transfer is supported.
 
