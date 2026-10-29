@@ -77,6 +77,9 @@ pub struct ActiveCall {
     transfer_pending: AtomicBool,
     /// RTP relay for this call — stopped and dropped when the call ends.
     pub rtp_relay: Option<Arc<RtpRelay>>,
+    /// Dropped together with the call, which wakes the receiver returned by
+    /// [`HandoffManager::register_active_call`] however the call ended.
+    _ended: Option<oneshot::Sender<()>>,
 }
 
 impl ActiveCall {
@@ -96,6 +99,7 @@ impl ActiveCall {
             local_cseq: AtomicU32::new(initial_cseq),
             transfer_pending: AtomicBool::new(false),
             rtp_relay,
+            _ended: None,
         }
     }
 
@@ -877,6 +881,7 @@ impl HandoffManager {
     }
 
     /// Whether a call with this SIP Call-ID is still active.
+    #[cfg(test)]
     pub async fn is_call_active(&self, call_id: &str) -> bool {
         self.active.read().await.contains_key(call_id)
     }
@@ -1170,6 +1175,10 @@ impl HandoffManager {
     /// pending phase since we already have the SDP answer).
     ///
     /// `invite_raw` is the PBX's 200 OK to the gateway's INVITE.
+    ///
+    /// The returned receiver completes (with an error) once the call is no
+    /// longer active — hung up by the app, ended by the PBX or transferred —
+    /// so the caller can stop the call's receive loop.
     #[allow(clippy::too_many_arguments)]
     pub async fn register_active_call(
         &self,
@@ -1180,14 +1189,16 @@ impl HandoffManager {
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
         rtp_relay: Option<Arc<RtpRelay>>,
-    ) {
+    ) -> oneshot::Receiver<()> {
         let dialog = Dialog::from_uac(&invite_raw, pbx_addr);
         // Continue the CSeq space our INVITE started.
         let initial_cseq = message::extract_header(&invite_raw, "CSeq")
             .and_then(|v| v.split_whitespace().next()?.parse().ok())
             .unwrap_or(1);
-        let active_call =
+        let (ended_tx, ended_rx) = oneshot::channel();
+        let mut active_call =
             ActiveCall::new(owner, pbx_addr, proxy_reg, dialog, initial_cseq, rtp_relay);
+        active_call._ended = Some(ended_tx);
 
         {
             let mut active = self.active.write().await;
@@ -1197,6 +1208,7 @@ impl HandoffManager {
             let mut map = self.token_to_call_id.write().await;
             map.insert(call_token, call_id);
         }
+        ended_rx
     }
 }
 

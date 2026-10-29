@@ -824,7 +824,7 @@ impl SipProxyManager {
                     }));
 
                     // Register the active call with the RTP relay handle
-                    handoff
+                    let ended = handoff
                         .register_active_call(
                             call_token.clone(),
                             call_id.clone(),
@@ -838,87 +838,12 @@ impl SipProxyManager {
 
                     tracing::info!(call_id = %call_id, "Outgoing call connected");
 
-                    // Spawn a persistent receive loop on this socket to handle
-                    // BYE from PBX (when the remote party hangs up).
-                    let recv_socket = socket.clone();
-                    let recv_handoff = handoff.clone();
-                    let recv_call_id = call_id.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 65535];
-                        loop {
-                            match recv_socket.recv_from(&mut buf).await {
-                                Ok((len, from)) => {
-                                    let text = match std::str::from_utf8(&buf[..len]) {
-                                        Ok(s) => s.to_string(),
-                                        Err(_) => continue,
-                                    };
-
-                                    if message::is_request(&text) {
-                                        let method =
-                                            message::extract_method(&text).unwrap_or_default();
-                                        match method.as_str() {
-                                            "BYE" => {
-                                                let cid = message::extract_header(&text, "Call-ID")
-                                                    .unwrap_or_default();
-                                                tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
-
-                                                // Send 200 OK for BYE
-                                                let response = format!(
-                                                    "SIP/2.0 200 OK\r\n\
-                                                     {}\
-                                                     Content-Length: 0\r\n\r\n",
-                                                    Self::echo_headers(&text),
-                                                );
-                                                let _ = recv_socket
-                                                    .send_to(response.as_bytes(), from)
-                                                    .await;
-
-                                                // Clean up via handoff
-                                                let _ = recv_handoff
-                                                    .handle_bye_from_pbx(&cid, &text, from)
-                                                    .await;
-                                                break;
-                                            }
-                                            "NOTIFY" => {
-                                                let cid = message::extract_header(&text, "Call-ID")
-                                                    .unwrap_or_default();
-                                                let response = format!(
-                                                    "SIP/2.0 200 OK\r\n\
-                                                     {}\
-                                                     Content-Length: 0\r\n\r\n",
-                                                    Self::echo_headers(&text),
-                                                );
-                                                let _ = recv_socket
-                                                    .send_to(response.as_bytes(), from)
-                                                    .await;
-                                                recv_handoff.handle_notify(&cid, &text).await;
-                                                if !recv_handoff.is_call_active(&cid).await {
-                                                    // Transfer completed and our leg was ended.
-                                                    break;
-                                                }
-                                            }
-                                            _ => {
-                                                tracing::debug!(
-                                                    "Outgoing call recv loop: ignoring {} request",
-                                                    method
-                                                );
-                                            }
-                                        }
-                                    } else if message::extract_cseq_method(&text).as_deref()
-                                        == Some("REFER")
-                                    {
-                                        recv_handoff.handle_refer_response(&text).await;
-                                    }
-                                    // Other responses (200 OK to our BYE, etc.) are ignored.
-                                }
-                                Err(e) => {
-                                    tracing::debug!(call_id = %recv_call_id, "Outgoing call socket error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        tracing::debug!(call_id = %recv_call_id, "Outgoing call receive loop ended");
-                    });
+                    Self::spawn_outgoing_call_loop(
+                        socket.clone(),
+                        handoff.clone(),
+                        call_id.clone(),
+                        ended,
+                    );
 
                     return Ok((call_token, sdp_answer));
                 }
@@ -991,6 +916,79 @@ impl SipProxyManager {
         }
     }
 
+    /// Receive loop for an outgoing call's dedicated socket: answers BYE and
+    /// NOTIFY from the PBX and routes REFER responses.
+    ///
+    /// The loop exits as soon as the call stops being active (`ended`
+    /// completes) — whether the app hung up, the PBX sent BYE or a transfer
+    /// completed — so the task and its socket don't outlive the call.
+    fn spawn_outgoing_call_loop(
+        socket: Arc<UdpSocket>,
+        handoff: Arc<HandoffManager>,
+        call_id: String,
+        mut ended: tokio::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let received = tokio::select! {
+                    biased;
+                    _ = &mut ended => break,
+                    r = socket.recv_from(&mut buf) => r,
+                };
+                let (len, from) = match received {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(call_id = %call_id, "Outgoing call socket error: {}", e);
+                        break;
+                    }
+                };
+                let Ok(text) = std::str::from_utf8(&buf[..len]) else {
+                    continue;
+                };
+
+                if message::is_request(text) {
+                    let method = message::extract_method(text).unwrap_or_default();
+                    let cid = message::extract_header(text, "Call-ID").unwrap_or_default();
+                    match method.as_str() {
+                        "BYE" => {
+                            tracing::info!(call_id = %cid, "BYE from PBX for outgoing call");
+
+                            // Send 200 OK for BYE
+                            let response = format!(
+                                "SIP/2.0 200 OK\r\n\
+                                 {}\
+                                 Content-Length: 0\r\n\r\n",
+                                Self::echo_headers(text),
+                            );
+                            let _ = socket.send_to(response.as_bytes(), from).await;
+
+                            // Clean up via handoff
+                            let _ = handoff.handle_bye_from_pbx(&cid, text, from).await;
+                        }
+                        "NOTIFY" => {
+                            let response = format!(
+                                "SIP/2.0 200 OK\r\n\
+                                 {}\
+                                 Content-Length: 0\r\n\r\n",
+                                Self::echo_headers(text),
+                            );
+                            let _ = socket.send_to(response.as_bytes(), from).await;
+                            handoff.handle_notify(&cid, text).await;
+                        }
+                        _ => {
+                            tracing::debug!("Outgoing call recv loop: ignoring {} request", method);
+                        }
+                    }
+                } else if message::extract_cseq_method(text).as_deref() == Some("REFER") {
+                    handoff.handle_refer_response(text).await;
+                }
+                // Other responses (200 OK to our BYE, etc.) are ignored.
+            }
+            tracing::debug!(call_id = %call_id, "Outgoing call receive loop ended");
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_originate_invite(
         target_uri: &str,
@@ -1060,5 +1058,121 @@ impl SipProxyManager {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handoff::CallOwner;
+
+    const OUTBOUND_200: &str = "\
+SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:40000;branch=z9hG4bK-out;rport\r\n\
+From: <sip:1001@pbx.example.com>;tag=gwtag\r\n\
+To: <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+Call-ID: out-call-1\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:2000@127.0.0.1:5060>\r\n\
+Content-Length: 0\r\n\r\n";
+
+    struct OutgoingCall {
+        handoff: Arc<HandoffManager>,
+        pbx: UdpSocket,
+        gw_addr: SocketAddr,
+        recv_loop: tokio::task::JoinHandle<()>,
+    }
+
+    /// An active outgoing call whose receive loop is running, with a UDP
+    /// socket standing in for the PBX.
+    async fn outgoing_call() -> OutgoingCall {
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw_addr = gw.local_addr().unwrap();
+        let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
+            gw.clone(),
+            "pbx.example.com",
+            handoff.clone(),
+        )));
+        let ended = handoff
+            .register_active_call(
+                "tok".into(),
+                "out-call-1".into(),
+                CallOwner::User("alice".into()),
+                OUTBOUND_200.into(),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+            )
+            .await;
+        let recv_loop = SipProxyManager::spawn_outgoing_call_loop(
+            gw,
+            handoff.clone(),
+            "out-call-1".into(),
+            ended,
+        );
+        OutgoingCall {
+            handoff,
+            pbx,
+            gw_addr,
+            recv_loop,
+        }
+    }
+
+    async fn recv_text(sock: &UdpSocket) -> String {
+        let mut buf = vec![0u8; 65535];
+        let len = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
+            .await
+            .expect("timed out waiting for SIP message")
+            .unwrap();
+        String::from_utf8(buf[..len].to_vec()).unwrap()
+    }
+
+    async fn loop_exits(recv_loop: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(2), recv_loop)
+            .await
+            .expect("receive loop should exit once the call has ended")
+            .unwrap();
+    }
+
+    fn bye(call_id: &str) -> String {
+        format!(
+            "BYE sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-bye\r\n\
+             From: <sip:2000@pbx.example.com>;tag=pbxtag\r\n\
+             To: <sip:1001@pbx.example.com>;tag=gwtag\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 5 BYE\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn outgoing_loop_exits_after_app_hangup() {
+        let call = outgoing_call().await;
+        call.handoff.hangup_call("tok").await.unwrap();
+        assert!(recv_text(&call.pbx).await.starts_with("BYE "));
+        loop_exits(call.recv_loop).await;
+    }
+
+    #[tokio::test]
+    async fn outgoing_loop_exits_after_bye_from_pbx() {
+        let call = outgoing_call().await;
+        call.pbx
+            .send_to(bye("out-call-1").as_bytes(), call.gw_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&call.pbx).await.starts_with("SIP/2.0 200 OK\r\n"));
+        loop_exits(call.recv_loop).await;
+        assert!(!call.handoff.is_call_active("out-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn outgoing_loop_keeps_running_while_the_call_is_up() {
+        let call = outgoing_call().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!call.recv_loop.is_finished());
+        call.recv_loop.abort();
     }
 }
