@@ -85,6 +85,12 @@ cp gateway.example.toml gateway.toml
 # Edit gateway.toml — set auth.secret, push provider credentials, etc.
 ```
 
+`auth.secret` (the JWT signing secret) must be at least 32 characters and not
+a `CHANGE-ME...` placeholder. Otherwise the gateway refuses to start. A missing
+`gateway.toml` falls back to a placeholder secret, so it refuses too. For
+local development only, `--insecure-dev-secret` or
+`ARIA_GATEWAY_INSECURE_DEV_SECRET=1` lets it start anyway with a loud warning.
+
 Set the token-issuer key, either as `auth.token_issuer_key` in `gateway.toml`
 or in the environment (the environment wins):
 

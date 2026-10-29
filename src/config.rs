@@ -77,6 +77,33 @@ impl AuthConfig {
     }
 }
 
+/// The placeholder secret the built-in default config uses.
+pub const PLACEHOLDER_JWT_SECRET: &str = "CHANGE-ME-IN-PRODUCTION";
+/// Shortest JWT signing secret the gateway will start with.
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+
+impl AuthConfig {
+    /// Refuse a JWT signing secret that is empty, a known placeholder or
+    /// shorter than [`MIN_JWT_SECRET_LEN`]. Anyone who knows the secret can
+    /// mint tokens for any user, so the gateway must not run with a weak one.
+    pub fn check_jwt_secret(&self) -> anyhow::Result<()> {
+        let secret = self.secret.trim();
+        if secret.is_empty() {
+            anyhow::bail!("auth.secret is empty");
+        }
+        if secret.starts_with("CHANGE-ME") {
+            anyhow::bail!("auth.secret is still the placeholder {:?}", self.secret);
+        }
+        if secret.len() < MIN_JWT_SECRET_LEN {
+            anyhow::bail!(
+                "auth.secret is {} characters; it must be at least {MIN_JWT_SECRET_LEN}",
+                secret.len()
+            );
+        }
+        Ok(())
+    }
+}
+
 fn normalize_issuer_key(key: Option<String>) -> Option<String> {
     key.filter(|k| {
         let k = k.trim();
@@ -115,7 +142,7 @@ impl GatewayConfig {
                 fcm: None,
             },
             auth: AuthConfig {
-                secret: "CHANGE-ME-IN-PRODUCTION".to_string(),
+                secret: PLACEHOLDER_JWT_SECRET.to_string(),
                 token_expiry_secs: default_token_expiry(),
                 token_issuer_key: None,
             },
@@ -126,6 +153,37 @@ impl GatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn auth(secret: &str) -> AuthConfig {
+        AuthConfig {
+            secret: secret.into(),
+            token_expiry_secs: 60,
+            token_issuer_key: None,
+        }
+    }
+
+    #[test]
+    fn weak_jwt_secrets_are_refused() {
+        for secret in [
+            "",
+            "   ",
+            PLACEHOLDER_JWT_SECRET,
+            "CHANGE-ME-TO-A-STRONG-RANDOM-SECRET",
+            "CHANGE-ME-TO-A-STRONG-RANDOM-SECRET-AND-THEN-SOME",
+            "short-secret",
+            &"x".repeat(MIN_JWT_SECRET_LEN - 1),
+        ] {
+            assert!(auth(secret).check_jwt_secret().is_err(), "{secret:?}");
+        }
+        assert!(auth(&"x".repeat(MIN_JWT_SECRET_LEN))
+            .check_jwt_secret()
+            .is_ok());
+    }
+
+    #[test]
+    fn default_config_secret_is_refused() {
+        assert!(GatewayConfig::default().auth.check_jwt_secret().is_err());
+    }
 
     #[test]
     fn blank_and_placeholder_issuer_keys_count_as_unset() {

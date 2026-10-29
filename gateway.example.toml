@@ -10,7 +10,9 @@ public_url = "https://gateway.example.com"
 url = "sqlite:gateway.db?mode=rwc"
 
 [auth]
-# JWT signing secret — CHANGE THIS in production
+# JWT signing secret: at least 32 characters, e.g. `openssl rand -hex 32`.
+# The gateway refuses to start with an empty, placeholder (CHANGE-ME...) or
+# shorter secret unless run with --insecure-dev-secret (local dev only).
 secret = "CHANGE-ME-TO-A-STRONG-RANDOM-SECRET"
 # Token expiry in seconds (default: 30 days)
 token_expiry_secs = 2592000

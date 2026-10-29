@@ -20,7 +20,16 @@ struct Cli {
     /// Override listen address
     #[arg(long)]
     listen: Option<String>,
+
+    /// Start even with a missing, placeholder or short JWT secret. For local
+    /// development and tests only; never in production. Also enabled by
+    /// ARIA_GATEWAY_INSECURE_DEV_SECRET=1.
+    #[arg(long)]
+    insecure_dev_secret: bool,
 }
+
+/// Env var equivalent of `--insecure-dev-secret`.
+const INSECURE_DEV_SECRET_ENV: &str = "ARIA_GATEWAY_INSECURE_DEV_SECRET";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +41,24 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = config::GatewayConfig::load(&cli.config)?;
+
+    if let Err(e) = config.auth.check_jwt_secret() {
+        let override_env = std::env::var(INSECURE_DEV_SECRET_ENV)
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        if cli.insecure_dev_secret || override_env {
+            tracing::warn!(
+                "INSECURE: {e} — starting anyway because the dev override is set. \
+                 Anyone who knows this secret can mint tokens for any user."
+            );
+        } else {
+            anyhow::bail!(
+                "refusing to start: {e}. Set auth.secret to a random value of at least \
+                 {} characters (e.g. `openssl rand -hex 32`). For local development only, \
+                 pass --insecure-dev-secret or set {INSECURE_DEV_SECRET_ENV}=1.",
+                config::MIN_JWT_SECRET_LEN
+            );
+        }
+    }
 
     let listen_addr = cli.listen.unwrap_or_else(|| config.server.listen.clone());
 
