@@ -211,3 +211,78 @@ pub fn build_200_ok_invite(request: &str, sdp_answer: &str, contact_uri: &str) -
         len = sdp_answer.len(),
     ))
 }
+
+/// Build a CANCEL for a pending INVITE (RFC 3261 §9.1): same Request-URI,
+/// top Via (so the same branch), Route set, From, To, Call-ID and CSeq
+/// number as the INVITE, with method CANCEL.
+pub fn build_cancel(invite: &str) -> Option<String> {
+    let request_uri = invite
+        .lines()
+        .next()?
+        .strip_prefix("INVITE ")?
+        .strip_suffix(" SIP/2.0")?;
+    let via = extract_header(invite, "Via")?;
+    let from = extract_header(invite, "From")?;
+    let to = extract_header(invite, "To")?;
+    let call_id = extract_header(invite, "Call-ID")?;
+    let cseq = extract_header(invite, "CSeq")?;
+    let cseq_num = cseq.split_whitespace().next()?;
+
+    let mut msg = format!(
+        "CANCEL {request_uri} SIP/2.0\r\n\
+         Via: {via}\r\n\
+         Max-Forwards: 70\r\n"
+    );
+    for route in extract_all_headers(invite, "Route") {
+        msg.push_str(&format!("Route: {route}\r\n"));
+    }
+    msg.push_str(&format!(
+        "From: {from}\r\n\
+         To: {to}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq_num} CANCEL\r\n\
+         User-Agent: Aria-Gateway/0.1.0\r\n\
+         Content-Length: 0\r\n\r\n"
+    ));
+    Some(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_matches_the_invite_transaction() {
+        let invite = "INVITE sip:2000@pbx.example.com SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 10.0.0.2:40000;branch=z9hG4bK-inv2;rport\r\n\
+            Max-Forwards: 70\r\n\
+            Route: <sip:edge.example.com;lr>\r\n\
+            From: \"Bob\" <sip:1001@pbx.example.com>;tag=abc\r\n\
+            To: <sip:2000@pbx.example.com>\r\n\
+            Call-ID: cid-1\r\n\
+            CSeq: 2 INVITE\r\n\
+            Authorization: Digest x\r\n\
+            Content-Type: application/sdp\r\n\
+            Content-Length: 5\r\n\r\nv=0\r\n";
+        let cancel = build_cancel(invite).unwrap();
+        let lines: Vec<&str> = cancel.split("\r\n").collect();
+        assert_eq!(lines[0], "CANCEL sip:2000@pbx.example.com SIP/2.0");
+        for expected in [
+            "Via: SIP/2.0/UDP 10.0.0.2:40000;branch=z9hG4bK-inv2;rport",
+            "Route: <sip:edge.example.com;lr>",
+            "From: \"Bob\" <sip:1001@pbx.example.com>;tag=abc",
+            "To: <sip:2000@pbx.example.com>",
+            "Call-ID: cid-1",
+            "CSeq: 2 CANCEL",
+            "Content-Length: 0",
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "missing {expected:?} in\n{cancel}"
+            );
+        }
+        assert!(!cancel.contains("Authorization"));
+        assert!(!cancel.contains("v=0"));
+        assert!(build_cancel("BYE sip:x SIP/2.0\r\n\r\n").is_none());
+    }
+}

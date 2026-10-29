@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -14,6 +15,7 @@ use crate::auth::{self, AuthUser, JwtSecret};
 use crate::db::{Database, DeviceRecord};
 use crate::handoff::{self, CallOwner, HandoffManager, TransferError};
 use crate::push::PushManager;
+use crate::sip::proxy::{is_valid_client_ref, OriginateRefusal};
 use crate::sip::SipProxyManager;
 
 #[derive(Clone)]
@@ -58,6 +60,7 @@ pub fn build_router(
         .route("/v1/devices/{id}/heartbeat", post(device_heartbeat))
         // Call signaling
         .route("/v1/calls", post(make_call))
+        .route("/v1/calls/cancel", post(cancel_call))
         .route("/v1/calls/{token}", get(get_call_offer))
         .route("/v1/calls/{token}/accept", post(accept_call))
         .route("/v1/calls/{token}/reject", post(reject_call))
@@ -427,6 +430,40 @@ struct MakeCallRequest {
     sdp_offer: String,
     sip_username: String,
     sip_domain: String,
+    /// Optional client-chosen handle (1-64 of `[A-Za-z0-9_-]`) for
+    /// cancelling the call while it rings via `POST /v1/calls/cancel`.
+    #[serde(default)]
+    client_ref: Option<String>,
+}
+
+/// An error status, optionally with a `{"error": "<code>"}` body.
+struct ApiError {
+    status: StatusCode,
+    code: Option<&'static str>,
+}
+
+impl ApiError {
+    fn coded(status: StatusCode, code: &'static str) -> Self {
+        Self {
+            status,
+            code: Some(code),
+        }
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self { status, code: None }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self.code {
+            Some(code) => (self.status, Json(serde_json::json!({ "error": code }))).into_response(),
+            None => self.status.into_response(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -443,24 +480,37 @@ struct MakeCallResponse {
 /// mobile app can set up RTP directly with the remote party).
 ///
 /// The SIP account must belong to an active device the caller owns;
-/// otherwise 404.
+/// otherwise 404. With a `client_ref` the ringing call can be cancelled,
+/// in which case this answers 409 `{"error":"cancelled"}`.
 async fn make_call(
     State(state): State<AppState>,
     auth: AuthUser,
-    Json(req): Json<MakeCallRequest>,
-) -> Result<Json<MakeCallResponse>, StatusCode> {
+    body: Result<Json<MakeCallRequest>, JsonRejection>,
+) -> Result<Json<MakeCallResponse>, ApiError> {
+    let Json(req) = body.map_err(|rejection| ApiError::from(rejection.status()))?;
+    if req
+        .client_ref
+        .as_deref()
+        .is_some_and(|r| !is_valid_client_ref(r))
+    {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_ref",
+        ));
+    }
+
     let device = state
         .db
         .find_active_device_for_account(&auth.user_id, &req.sip_username, &req.sip_domain)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| ApiError::from(StatusCode::INTERNAL_SERVER_ERROR))?
         .ok_or_else(|| {
             tracing::warn!(
                 user = %auth.user_id,
                 sip_user = %req.sip_username,
                 "outgoing call for a SIP account with no active device of the caller"
             );
-            StatusCode::NOT_FOUND
+            ApiError::from(StatusCode::NOT_FOUND)
         })?;
 
     let (call_token, sdp_answer) = state
@@ -470,18 +520,56 @@ async fn make_call(
             &req.sdp_offer,
             &device.sip_config(),
             &auth.user_id,
+            req.client_ref.as_deref(),
             state.handoff.clone(),
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Outgoing call failed: {}", e);
-            StatusCode::BAD_GATEWAY
+        .map_err(|e| match e.downcast_ref::<OriginateRefusal>() {
+            Some(OriginateRefusal::Cancelled) => ApiError::coded(StatusCode::CONFLICT, "cancelled"),
+            Some(OriginateRefusal::ClientRefInUse) => {
+                ApiError::coded(StatusCode::CONFLICT, "client_ref_in_use")
+            }
+            None => {
+                tracing::error!("Outgoing call failed: {}", e);
+                ApiError::from(StatusCode::BAD_GATEWAY)
+            }
         })?;
 
     Ok(Json(MakeCallResponse {
         call_token,
         sdp_answer,
     }))
+}
+
+#[derive(Deserialize)]
+struct CancelCallRequest {
+    client_ref: String,
+}
+
+/// Cancel the caller's own outgoing call that is still ringing, by the
+/// `client_ref` given to `POST /v1/calls`. 202 once the CANCEL is under way;
+/// 404 if no such call is pending (unknown ref, another user's, or already
+/// answered or ended).
+async fn cancel_call(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    body: Result<Json<CancelCallRequest>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(req) = body.map_err(|_| ApiError::from(StatusCode::BAD_REQUEST))?;
+    if !is_valid_client_ref(&req.client_ref) {
+        return Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_ref",
+        ));
+    }
+    if state
+        .sip_proxy
+        .cancel_outgoing_call(&auth.user_id, &req.client_ref)
+    {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err(ApiError::from(StatusCode::NOT_FOUND))
+    }
 }
 
 async fn get_call_offer(
@@ -1376,5 +1464,311 @@ Content-Length: 0\r\n\r\n";
                 .is_err(),
             "no INVITE may be sent"
         );
+    }
+
+    // ── Cancelling a ringing outgoing call ──────────────────────────────────
+
+    struct RingingCall {
+        pbx: tokio::net::UdpSocket,
+        gw: std::net::SocketAddr,
+        invite: String,
+        http: tokio::task::JoinHandle<axum::response::Response>,
+    }
+
+    /// Bob places a call with `client_ref`; the fake PBX answers 180.
+    async fn ringing_call(app: &TestApp, client_ref: &str) -> RingingCall {
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+        let req = post_as(
+            "bob",
+            "/v1/calls",
+            &make_call_body(serde_json::json!({ "client_ref": client_ref })),
+        );
+        let http = {
+            let router = app.router.clone();
+            tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+        };
+        let (invite, gw) = recv_from(&pbx).await;
+        assert!(invite.starts_with("INVITE "));
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        RingingCall {
+            pbx,
+            gw,
+            invite,
+            http,
+        }
+    }
+
+    async fn cancel_as(app: &TestApp, user: &str, client_ref: &str) -> StatusCode {
+        app.send(post_as(
+            user,
+            "/v1/calls/cancel",
+            &serde_json::json!({ "client_ref": client_ref }),
+        ))
+        .await
+        .0
+    }
+
+    async fn http_result(
+        http: tokio::task::JoinHandle<axum::response::Response>,
+    ) -> (StatusCode, String) {
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), http)
+            .await
+            .expect("POST /v1/calls should have returned")
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    fn h(msg: &str, name: &str) -> String {
+        crate::sip::message::extract_header(msg, name).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn ringing_call_can_be_cancelled() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        add_sip_device(
+            &app,
+            "bob-dev",
+            "bob",
+            pbx.local_addr().unwrap().port(),
+            true,
+        )
+        .await;
+        let req = post_as(
+            "bob",
+            "/v1/calls",
+            &make_call_body(serde_json::json!({ "client_ref": "ref-1" })),
+        );
+        let http = {
+            let router = app.router.clone();
+            tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+        };
+
+        // Challenge the first INVITE so the CANCEL must match the second.
+        let (invite1, gw) = recv_from(&pbx).await;
+        let challenge = "WWW-Authenticate: Digest realm=\"pbx.example.com\", nonce=\"n1\"\r\n";
+        pbx.send_to(
+            pbx_reply(&invite1, "401 Unauthorized", challenge, "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack1, _) = recv_from(&pbx).await;
+        assert!(ack1.starts_with("ACK "));
+        assert_eq!(
+            h(&ack1, "Via"),
+            h(&invite1, "Via"),
+            "non-2xx ACK reuses the branch"
+        );
+        let (invite, _) = recv_from(&pbx).await;
+        assert_eq!(h(&invite, "CSeq"), "2 INVITE");
+        pbx.send_to(pbx_reply(&invite, "180 Ringing", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_as(&app, "bob", "ref-1").await, StatusCode::ACCEPTED);
+
+        let (cancel, _) = recv_from(&pbx).await;
+        assert_eq!(
+            cancel.lines().next().unwrap(),
+            "CANCEL sip:2000@pbx.example.com SIP/2.0"
+        );
+        assert_eq!(h(&cancel, "Via"), h(&invite, "Via"));
+        assert_eq!(h(&cancel, "Call-ID"), h(&invite, "Call-ID"));
+        assert_eq!(h(&cancel, "From"), h(&invite, "From"));
+        assert_eq!(h(&cancel, "To"), h(&invite, "To"));
+        assert_eq!(h(&cancel, "CSeq"), "2 CANCEL");
+
+        pbx.send_to(pbx_reply(&cancel, "200 OK", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+        pbx.send_to(
+            pbx_reply(&invite, "487 Request Terminated", "", "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "));
+        assert_eq!(h(&ack, "CSeq"), "2 ACK");
+        assert_eq!(h(&ack, "Via"), h(&invite, "Via"));
+
+        let (status, body) = http_result(http).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"cancelled"}"#);
+
+        // The pending entry is gone.
+        assert_eq!(cancel_as(&app, "bob", "ref-1").await, StatusCode::NOT_FOUND);
+        assert!(!app.handoff.is_call_active(&h(&invite, "Call-ID")).await);
+    }
+
+    #[tokio::test]
+    async fn answer_crossing_the_cancel_is_hung_up() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let RingingCall {
+            pbx,
+            gw,
+            invite,
+            http,
+        } = ringing_call(&app, "ref-x").await;
+
+        assert_eq!(cancel_as(&app, "bob", "ref-x").await, StatusCode::ACCEPTED);
+        let (cancel, _) = recv_from(&pbx).await;
+        assert!(cancel.starts_with("CANCEL "));
+
+        // The PBX had already answered: 200 OK to the INVITE, and the
+        // CANCEL finds no pending transaction.
+        pbx.send_to(
+            pbx_reply(
+                &invite,
+                "200 OK",
+                "Content-Type: application/sdp\r\n",
+                "v=0\r\n",
+            )
+            .as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        pbx.send_to(
+            pbx_reply(&cancel, "481 Call/Transaction Does Not Exist", "", "").as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+
+        // ACK then BYE in the dialog the 200 OK created.
+        let mut ack = None;
+        let bye = loop {
+            let (msg, _) = recv_from(&pbx).await;
+            if msg.starts_with("ACK ") {
+                ack = Some(msg);
+            } else if msg.starts_with("BYE ") {
+                break msg;
+            }
+        };
+        assert!(ack.is_some(), "the 200 OK must be ACKed before the BYE");
+        assert_eq!(h(&bye, "Call-ID"), h(&invite, "Call-ID"));
+        assert_eq!(h(&bye, "CSeq"), "2 BYE");
+        assert!(h(&bye, "To").contains("tag=pbxtag"));
+        pbx.send_to(pbx_reply(&bye, "200 OK", "", "").as_bytes(), gw)
+            .await
+            .unwrap();
+
+        let (status, body) = http_result(http).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"cancelled"}"#);
+        assert!(!app.handoff.is_call_active(&h(&invite, "Call-ID")).await);
+        assert_eq!(cancel_as(&app, "bob", "ref-x").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn another_users_ref_cannot_cancel_the_call() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let RingingCall {
+            pbx,
+            gw,
+            invite,
+            http,
+        } = ringing_call(&app, "shared-ref").await;
+
+        assert_eq!(
+            cancel_as(&app, "alice", "shared-ref").await,
+            StatusCode::NOT_FOUND
+        );
+        // The same ref can't be reused for a second pending call.
+        let (status, body) = app
+            .send(post_as(
+                "bob",
+                "/v1/calls",
+                &make_call_body(serde_json::json!({ "client_ref": "shared-ref" })),
+            ))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"client_ref_in_use"}"#);
+
+        // No CANCEL went out; the call connects normally.
+        pbx.send_to(
+            pbx_reply(
+                &invite,
+                "200 OK",
+                "Content-Type: application/sdp\r\n",
+                "v=0\r\n",
+            )
+            .as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "), "{ack}");
+        let (status, body) = http_result(http).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(app.handoff.is_call_active(&h(&invite, "Call-ID")).await);
+
+        // Once answered, the ref can no longer cancel anything.
+        assert_eq!(
+            cancel_as(&app, "bob", "shared-ref").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_invalid_refs() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        assert_eq!(
+            cancel_as(&app, "bob", "never-used").await,
+            StatusCode::NOT_FOUND
+        );
+
+        let too_long = "a".repeat(65);
+        for bad in ["", "has space", "semi;colon", "ünï", too_long.as_str()] {
+            assert_eq!(
+                cancel_as(&app, "bob", bad).await,
+                StatusCode::BAD_REQUEST,
+                "{bad:?}"
+            );
+            let (status, _) = app
+                .send(post_as(
+                    "bob",
+                    "/v1/calls",
+                    &make_call_body(serde_json::json!({ "client_ref": bad })),
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        let (status, _) = app
+            .send(post_as("bob", "/v1/calls/cancel", &serde_json::json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(is_valid_client_ref(&"a".repeat(64)));
+        assert!(is_valid_client_ref("Abc_09-x"));
+
+        // Unauthenticated cancel is refused outright.
+        let (status, _) = app
+            .send(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/calls/cancel")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"client_ref":"x"}"#))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

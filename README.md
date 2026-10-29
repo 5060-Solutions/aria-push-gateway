@@ -220,6 +220,7 @@ re-registration fails.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/calls` | Initiate outgoing call (gateway sends INVITE) |
+| `POST` | `/v1/calls/cancel` | Cancel a still-ringing outgoing call by its `client_ref` |
 | `GET` | `/v1/calls/{token}` | Get incoming call offer (SDP + caller info) |
 | `POST` | `/v1/calls/{token}/accept` | Accept call with SDP answer |
 | `POST` | `/v1/calls/{token}/reject` | Reject call (sends 603 to PBX) |
@@ -246,8 +247,37 @@ account. It must belong to an **active device the caller registered**,
 otherwise `404`. The call is placed with that device's stored credentials,
 registrar, port and display name. Older clients also send `sip_password`,
 `sip_registrar`, `sip_transport`, `sip_port`, `sip_auth_username` and
-`sip_display_name`. Those fields are still accepted but ignored. `502` means
-the INVITE failed or was rejected.
+`sip_display_name`. Those fields are still accepted but ignored.
+
+`POST /v1/calls` blocks until the call is answered or fails. To be able to
+cancel it while it rings, include an optional `"client_ref"` (1–64 characters
+of `A-Z a-z 0-9 _ -`). The gateway tracks the pending INVITE under the caller
+and that ref until a final response arrives.
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Answered: `{"call_token", "sdp_answer"}` |
+| `400` | Malformed body, or `{"error":"invalid_client_ref"}` |
+| `404` | The caller has no active device for `sip_username` + `sip_domain` |
+| `409` | `{"error":"cancelled"}`: cancelled via `/v1/calls/cancel` |
+| `409` | `{"error":"client_ref_in_use"}`: the caller already has a pending call with this `client_ref` |
+| `502` | The INVITE failed, timed out (30 s) or was rejected |
+
+**Cancel body:** `{"client_ref": "<ref>"}`
+
+| Status | Meaning |
+|--------|---------|
+| `202` | The caller's pending INVITE with this ref is being cancelled. Repeating the request while that call is still pending also returns `202`. |
+| `400` | Malformed body or invalid `client_ref` |
+| `404` | No such pending call: unknown ref, another user's ref, or the call was already answered or ended |
+
+On cancel the gateway sends a CANCEL matching the pending INVITE (same
+Request-URI, Via branch, Route, From, To, Call-ID and CSeq number) and
+retransmits it until the PBX answers. It ACKs the INVITE's final response
+(normally `487`). If a `200 OK` crosses the CANCEL, the gateway ACKs it and
+immediately sends BYE, so a cancelled call never stays up. Either way the
+blocked `POST /v1/calls` returns `409 {"error":"cancelled"}`. The ref is
+released on every outcome and can be reused.
 
 **Response:** `{"call_token": "<token>", "sdp_answer": "<SDP>"}`
 

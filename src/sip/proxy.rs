@@ -115,10 +115,92 @@ enum ProxyState {
     Error(String),
 }
 
+/// Why an outgoing call ended without being connected, for outcomes the
+/// API reports specifically (everything else is a plain failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginateRefusal {
+    /// The app cancelled the call while it was ringing.
+    Cancelled,
+    /// Another outgoing call of this user is pending under the same
+    /// `client_ref`.
+    ClientRefInUse,
+}
+
+impl std::fmt::Display for OriginateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "outgoing call cancelled"),
+            Self::ClientRefInUse => write!(f, "client_ref already in use by a pending call"),
+        }
+    }
+}
+
+impl std::error::Error for OriginateRefusal {}
+
+/// Pending outgoing INVITEs keyed by (owner user id, client_ref).
+type PendingInvites = HashMap<(String, String), PendingInvite>;
+
+struct PendingInvite {
+    /// Distinguishes this INVITE from a later one reusing the same key.
+    id: u64,
+    /// Taken (and fired) by a cancel request; `None` once cancel was asked.
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// An outgoing INVITE's entry in [`SipProxyManager::pending_invites`];
+/// removes the entry when dropped, whatever the outcome.
+struct InviteSlot<'a> {
+    invites: &'a std::sync::Mutex<PendingInvites>,
+    key: (String, String),
+    id: u64,
+}
+
+fn lock_invites(m: &std::sync::Mutex<PendingInvites>) -> std::sync::MutexGuard<'_, PendingInvites> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl InviteSlot<'_> {
+    /// The INVITE was answered: drop the entry so it can no longer be
+    /// cancelled, and report whether a cancel had already been requested
+    /// (a 200 OK crossing our CANCEL).
+    fn claim_answer(&self) -> bool {
+        let mut invites = lock_invites(self.invites);
+        match invites.get(&self.key) {
+            Some(entry) if entry.id == self.id => {
+                let cancel_requested = entry.cancel.is_none();
+                invites.remove(&self.key);
+                cancel_requested
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Drop for InviteSlot<'_> {
+    fn drop(&mut self) {
+        let mut invites = lock_invites(self.invites);
+        if invites.get(&self.key).is_some_and(|e| e.id == self.id) {
+            invites.remove(&self.key);
+        }
+    }
+}
+
+/// Whether `client_ref` is 1-64 characters of `[A-Za-z0-9_-]`.
+pub fn is_valid_client_ref(client_ref: &str) -> bool {
+    (1..=64).contains(&client_ref.len())
+        && client_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Manages all proxy registrations.
 pub struct SipProxyManager {
     registrations: RwLock<HashMap<String, Arc<RwLock<ProxyRegistration>>>>,
     resolver: Arc<SrvResolver>,
+    /// Outgoing INVITEs still waiting for a final response that the app
+    /// can cancel by `client_ref`.
+    pending_invites: std::sync::Mutex<PendingInvites>,
+    next_invite_id: std::sync::atomic::AtomicU64,
 }
 
 impl SipProxyManager {
@@ -127,7 +209,51 @@ impl SipProxyManager {
         Self {
             registrations: RwLock::new(HashMap::new()),
             resolver: Arc::new(resolver),
+            pending_invites: std::sync::Mutex::new(HashMap::new()),
+            next_invite_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Ask the pending outgoing INVITE that `user_id` placed under
+    /// `client_ref` to be cancelled. Returns `false` if there is no such
+    /// INVITE (unknown ref, another user's ref, or already answered/ended).
+    pub fn cancel_outgoing_call(&self, user_id: &str, client_ref: &str) -> bool {
+        let mut invites = lock_invites(&self.pending_invites);
+        let Some(entry) = invites.get_mut(&(user_id.to_string(), client_ref.to_string())) else {
+            return false;
+        };
+        if let Some(tx) = entry.cancel.take() {
+            let _ = tx.send(());
+        }
+        true
+    }
+
+    fn track_invite(
+        &self,
+        user_id: &str,
+        client_ref: &str,
+        cancel: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<InviteSlot<'_>, OriginateRefusal> {
+        let key = (user_id.to_string(), client_ref.to_string());
+        let id = self
+            .next_invite_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut invites = lock_invites(&self.pending_invites);
+        if invites.contains_key(&key) {
+            return Err(OriginateRefusal::ClientRefInUse);
+        }
+        invites.insert(
+            key.clone(),
+            PendingInvite {
+                id,
+                cancel: Some(cancel),
+            },
+        );
+        Ok(InviteSlot {
+            invites: &self.pending_invites,
+            key,
+            id,
+        })
     }
 
     /// Start maintaining a SIP registration for a device.
@@ -666,14 +792,29 @@ impl SipProxyManager {
     /// client's SDP offer from `account` (the caller's registered device),
     /// handles auth challenges, and waits for a 200 OK.
     /// Returns (call_token, sdp_answer).
+    ///
+    /// With a `client_ref`, the pending INVITE can be cancelled through
+    /// [`Self::cancel_outgoing_call`]: the gateway sends CANCEL, ACKs the
+    /// final response, and BYEs a 200 OK that crosses the CANCEL. The call
+    /// then fails with [`OriginateRefusal::Cancelled`].
     pub async fn originate_call(
         &self,
         destination_uri: &str,
         sdp_offer: &str,
         account: &SipAccountConfig,
         owner_user_id: &str,
+        client_ref: Option<&str>,
         handoff: Arc<HandoffManager>,
     ) -> anyhow::Result<(String, String)> {
+        // Track the INVITE under its client_ref first, so a cancel works from
+        // the moment the request is accepted. The slot is removed on every
+        // outcome when it drops.
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (slot, _no_cancel) = match client_ref {
+            Some(r) => (Some(self.track_invite(owner_user_id, r, cancel_tx)?), None),
+            None => (None, Some(cancel_tx)),
+        };
+
         let username = account.username.as_str();
         let password = account.password.as_str();
         let domain = account.domain.as_str();
@@ -728,7 +869,7 @@ impl SipProxyManager {
             tracing::info!(ip, port, "Phone SDP offer media address (pass-through)");
         }
 
-        let invite = Self::build_originate_invite(
+        let mut invite = Self::build_originate_invite(
             &target_uri,
             &local_ip,
             local_port,
@@ -742,6 +883,7 @@ impl SipProxyManager {
             sdp_offer,
             None,
         );
+        let mut invite_branch = branch;
 
         socket.send_to(invite.as_bytes(), server_addr).await?;
         tracing::info!(uri = %target_uri, "Sent outgoing INVITE (SDP pass-through)");
@@ -751,15 +893,65 @@ impl SipProxyManager {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut cseq: u32 = 1;
 
+        // Cancellation state: the CANCEL we sent (retransmitted until the
+        // PBX answers it) and when to retransmit next.
+        let mut cancel_armed = slot.is_some();
+        let mut cancel: Option<String> = None;
+        let mut cancel_answered = false;
+        let mut cancel_interval = Duration::from_millis(500);
+        let mut cancel_retx_at = deadline;
+
+        enum Event {
+            Cancel(bool),
+            Recv(Result<std::io::Result<usize>, tokio::time::error::Elapsed>),
+        }
+
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                if cancel.is_some() {
+                    return Err(OriginateRefusal::Cancelled.into());
+                }
                 anyhow::bail!("Outgoing call timed out");
             }
+            let wake = if cancel.is_some() && !cancel_answered {
+                cancel_retx_at.min(deadline)
+            } else {
+                deadline
+            };
 
-            let len = tokio::time::timeout(remaining, socket.recv(&mut buf))
-                .await
-                .map_err(|_| anyhow::anyhow!("Outgoing call timed out"))??;
+            let event = tokio::select! {
+                biased;
+                r = &mut cancel_rx, if cancel_armed => Event::Cancel(r.is_ok()),
+                r = tokio::time::timeout(wake.saturating_duration_since(now), socket.recv(&mut buf)) => Event::Recv(r),
+            };
+
+            let len = match event {
+                Event::Cancel(requested) => {
+                    cancel_armed = false;
+                    if requested {
+                        let msg = message::build_cancel(&invite)
+                            .ok_or_else(|| anyhow::anyhow!("cannot build CANCEL"))?;
+                        socket.send_to(msg.as_bytes(), server_addr).await?;
+                        tracing::info!(call_id = %call_id, "Outgoing call cancelled by app — sent CANCEL");
+                        cancel_retx_at = tokio::time::Instant::now() + cancel_interval;
+                        cancel = Some(msg);
+                    }
+                    continue;
+                }
+                Event::Recv(Err(_)) => {
+                    // Timer: retransmit the CANCEL, or loop round to the deadline.
+                    if let (Some(msg), false) = (&cancel, cancel_answered) {
+                        if tokio::time::Instant::now() >= cancel_retx_at {
+                            socket.send_to(msg.as_bytes(), server_addr).await?;
+                            cancel_interval = (cancel_interval * 2).min(Duration::from_secs(4));
+                            cancel_retx_at = tokio::time::Instant::now() + cancel_interval;
+                        }
+                    }
+                    continue;
+                }
+                Event::Recv(Ok(r)) => r?,
+            };
 
             let text = std::str::from_utf8(&buf[..len])?;
             let status = match message::parse_status_code(text) {
@@ -767,23 +959,23 @@ impl SipProxyManager {
                 None => continue,
             };
 
+            match message::extract_cseq_method(text).as_deref() {
+                Some("INVITE") => {}
+                Some("CANCEL") => {
+                    tracing::debug!(status, "Response to our CANCEL");
+                    cancel_answered = true;
+                    continue;
+                }
+                _ => continue,
+            }
+
+            let cancelled = cancel.is_some();
             match status {
-                100 | 180 | 183 => {
+                100..=199 => {
                     tracing::debug!(status, "Provisional response for outgoing call");
                     continue;
                 }
-                200 => {
-                    // Extract SDP from 200 OK
-                    let raw_sdp_answer = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-
-                    // Pass PBX's SDP answer through to phone unchanged.
-                    // Phone will send RTP directly to PBX media relay.
-                    let sdp_answer = raw_sdp_answer;
-                    if let Some((ip, port)) = message::extract_sdp_media_address(&sdp_answer) {
-                        tracing::info!(ip, port, "PBX SDP answer media address (pass-through)");
-                    }
-
-                    // Send ACK
+                200..=299 => {
                     let to_tag = message::extract_to_tag(text).unwrap_or_default();
                     let ack = Self::build_ack(
                         &target_uri,
@@ -793,9 +985,39 @@ impl SipProxyManager {
                         cseq,
                         &from_tag,
                         &to_tag,
-                        &branch,
+                        &message::generate_branch(),
                     );
                     socket.send_to(ack.as_bytes(), server_addr).await?;
+
+                    // Answered: from here on the call can't be cancelled. If
+                    // a cancel was asked for (even one still in flight), the
+                    // answer crossed it — end the call right away.
+                    let cancel_requested = slot.as_ref().is_some_and(|s| s.claim_answer());
+                    if cancelled || cancel_requested {
+                        tracing::info!(call_id = %call_id, "200 OK crossed our CANCEL — sending BYE");
+                        let local_addr = SocketAddr::new(local_ip.parse()?, local_port);
+                        let dialog = crate::handoff::Dialog::from_uac(text, server_addr);
+                        let bye = crate::handoff::build_in_dialog_request(
+                            "BYE",
+                            &dialog,
+                            cseq + 1,
+                            local_addr,
+                            &message::generate_branch(),
+                            "",
+                        );
+                        Self::bye_cancelled_answer(&socket, server_addr, &bye, &ack).await;
+                        return Err(OriginateRefusal::Cancelled.into());
+                    }
+
+                    // Extract SDP from 200 OK
+                    let raw_sdp_answer = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+
+                    // Pass PBX's SDP answer through to phone unchanged.
+                    // Phone will send RTP directly to PBX media relay.
+                    let sdp_answer = raw_sdp_answer;
+                    if let Some((ip, port)) = message::extract_sdp_media_address(&sdp_answer) {
+                        tracing::info!(ip, port, "PBX SDP answer media address (pass-through)");
+                    }
 
                     // Create a call token for hangup tracking
                     let call_token = uuid::Uuid::new_v4().to_string();
@@ -849,28 +1071,9 @@ impl SipProxyManager {
 
                     return Ok((call_token, sdp_answer));
                 }
-                401 | 407 => {
-                    tracing::debug!(status, "Auth challenge for outgoing INVITE");
-
-                    let header_name = if status == 401 {
-                        "WWW-Authenticate"
-                    } else {
-                        "Proxy-Authenticate"
-                    };
-
-                    let www_auth = message::extract_header(text, header_name)
-                        .ok_or_else(|| anyhow::anyhow!("No auth challenge header"))?;
-
-                    let auth = DigestAuth::from_challenge(
-                        &www_auth,
-                        effective_auth_user,
-                        password,
-                        &target_uri,
-                        "INVITE",
-                    )
-                    .ok_or_else(|| anyhow::anyhow!("Failed to parse auth challenge"))?;
-
-                    // Send ACK for the 401/407
+                _ => {
+                    // Every non-2xx final response is ACKed on the INVITE's
+                    // own transaction (same branch).
                     let to_tag = message::extract_to_tag(text).unwrap_or_default();
                     let ack = Self::build_ack(
                         &target_uri,
@@ -880,27 +1083,47 @@ impl SipProxyManager {
                         cseq,
                         &from_tag,
                         &to_tag,
-                        &branch,
+                        &invite_branch,
                     );
                     socket.send_to(ack.as_bytes(), server_addr).await?;
 
-                    // Re-send INVITE with auth
-                    cseq += 1;
-                    let new_branch = message::generate_branch();
-                    let auth_header_name = if status == 401 {
-                        "Authorization"
-                    } else {
-                        "Proxy-Authorization"
-                    };
+                    if cancelled {
+                        tracing::info!(call_id = %call_id, status, "Outgoing call ended after CANCEL");
+                        return Err(OriginateRefusal::Cancelled.into());
+                    }
+                    if status != 401 && status != 407 {
+                        anyhow::bail!("Outgoing call rejected with status {}", status);
+                    }
 
-                    let invite = Self::build_originate_invite(
+                    tracing::debug!(status, "Auth challenge for outgoing INVITE");
+                    let (header_name, auth_header_name) = if status == 401 {
+                        ("WWW-Authenticate", "Authorization")
+                    } else {
+                        ("Proxy-Authenticate", "Proxy-Authorization")
+                    };
+                    let www_auth = message::extract_header(text, header_name)
+                        .ok_or_else(|| anyhow::anyhow!("No auth challenge header"))?;
+                    let auth = DigestAuth::from_challenge(
+                        &www_auth,
+                        effective_auth_user,
+                        password,
+                        &target_uri,
+                        "INVITE",
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse auth challenge"))?;
+
+                    // Re-send INVITE with auth on a new transaction; a later
+                    // CANCEL must match this one.
+                    cseq += 1;
+                    invite_branch = message::generate_branch();
+                    invite = Self::build_originate_invite(
                         &target_uri,
                         &local_ip,
                         local_port,
                         &call_id,
                         cseq,
                         &from_tag,
-                        &new_branch,
+                        &invite_branch,
                         username,
                         domain,
                         display_name,
@@ -910,11 +1133,53 @@ impl SipProxyManager {
                     socket.send_to(invite.as_bytes(), server_addr).await?;
                     tracing::debug!("Re-sent INVITE with auth credentials");
                 }
-                _ if status >= 400 => {
-                    anyhow::bail!("Outgoing call rejected with status {}", status);
-                }
-                _ => continue,
             }
+        }
+    }
+
+    /// End a call whose 200 OK crossed our CANCEL: send `bye` and retransmit
+    /// it (re-ACKing any retransmitted 200 OK) until the PBX answers it or
+    /// about 4 seconds pass.
+    async fn bye_cancelled_answer(
+        socket: &UdpSocket,
+        server_addr: SocketAddr,
+        bye: &str,
+        ack: &str,
+    ) {
+        let mut buf = vec![0u8; 65535];
+        let give_up = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut interval = Duration::from_millis(500);
+        loop {
+            if socket.send_to(bye.as_bytes(), server_addr).await.is_err() {
+                return;
+            }
+            let retx_at = (tokio::time::Instant::now() + interval).min(give_up);
+            loop {
+                let wait = retx_at.saturating_duration_since(tokio::time::Instant::now());
+                let Ok(Ok(len)) = tokio::time::timeout(wait, socket.recv(&mut buf)).await else {
+                    break;
+                };
+                let Ok(text) = std::str::from_utf8(&buf[..len]) else {
+                    continue;
+                };
+                match message::extract_cseq_method(text).as_deref() {
+                    Some("BYE") if message::parse_status_code(text).is_some_and(|s| s >= 200) => {
+                        return;
+                    }
+                    Some("INVITE")
+                        if message::parse_status_code(text)
+                            .is_some_and(|s| (200..300).contains(&s)) =>
+                    {
+                        let _ = socket.send_to(ack.as_bytes(), server_addr).await;
+                    }
+                    _ => {}
+                }
+            }
+            if tokio::time::Instant::now() >= give_up {
+                tracing::warn!("No response to BYE for a cancelled call");
+                return;
+            }
+            interval = (interval * 2).min(Duration::from_secs(4));
         }
     }
 
