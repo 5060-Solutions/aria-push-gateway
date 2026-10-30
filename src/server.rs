@@ -1236,6 +1236,40 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn blind_transfer_of_an_outgoing_call_refers_its_uac_dialog() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "bob").await;
+        let request = {
+            let router = app.router.clone();
+            let req = post_as(
+                "bob",
+                &format!("/v1/calls/{token}/transfer"),
+                &serde_json::json!({ "target": "1002" }),
+            );
+            tokio::spawn(async move { router.oneshot(req).await.unwrap().status() })
+        };
+        let refer = recv_text(&pbx).await;
+        // In-dialog on the call the gateway placed: our From/To, the PBX's
+        // Contact as Request-URI.
+        assert!(
+            refer.starts_with("REFER sip:2000@127.0.0.1:5060 SIP/2.0\r\n"),
+            "{refer}"
+        );
+        assert_eq!(h(&refer, "Call-ID"), "out-call-1");
+        assert_eq!(h(&refer, "From"), "<sip:1001@pbx.example.com>;tag=gwtag");
+        assert_eq!(h(&refer, "To"), "<sip:2000@pbx.example.com>;tag=pbxtag");
+        assert_eq!(h(&refer, "Refer-To"), "<sip:1002@pbx.example.com>");
+        app.handoff
+            .handle_refer_response(&pbx_reply(&refer, "202 Accepted", "", ""))
+            .await;
+        assert_eq!(request.await.unwrap(), StatusCode::ACCEPTED);
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}/status"), "bob")
+            .await;
+        assert_eq!(body, r#"{"status":"active","transfer":"pending"}"#);
+    }
+
+    #[tokio::test]
     async fn concurrent_transfer_answers_409() {
         let app = test_app(Some(ISSUER_KEY)).await;
         let (pbx, token) = outgoing_call_for(&app, "bob").await;
