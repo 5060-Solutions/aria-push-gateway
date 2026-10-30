@@ -699,35 +699,52 @@ struct TransferCallRequest {
     /// Dial string / extension (`1002`) or full `sip:` URI.
     #[serde(default)]
     target: String,
+    /// Token of another of the caller's calls: makes this an attended
+    /// transfer joining the two calls' far ends (`target` is then ignored).
+    #[serde(default)]
+    replaces: Option<String>,
 }
 
-/// Blind-transfer an active call by sending a REFER to the PBX.
+/// Transfer an active call by sending a REFER to the PBX: blind to `target`,
+/// or attended (joined to the call named by `replaces`).
 ///
-/// Returns 202 once the PBX accepts the REFER; the call then ends through the
-/// normal BYE/NOTIFY flow and `/status` reports it as ended.
+/// Returns 202 once the PBX accepts the REFER; the call(s) then end through
+/// the normal BYE/NOTIFY flow and `/status` reports them as ended.
 async fn transfer_call(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(token): Path<String>,
     body: Result<Json<TransferCallRequest>, JsonRejection>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     require_call_owner(&state, &auth, &token).await?;
     let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    state
-        .handoff
-        .transfer_call(&token, &req.target)
-        .await
-        .map_err(|e| {
-            tracing::warn!(token = %token, "Transfer failed: {}", e);
-            match e {
-                TransferError::InvalidTarget(_) => StatusCode::BAD_REQUEST,
-                TransferError::NotFound => StatusCode::NOT_FOUND,
-                TransferError::InProgress => StatusCode::CONFLICT,
-                TransferError::Rejected(_) | TransferError::Send(_) => StatusCode::BAD_GATEWAY,
-                TransferError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+    let result = match &req.replaces {
+        Some(replaces) => {
+            // Both calls must be the caller's; another user's (or an
+            // unknown) token is 404 like on every call route.
+            require_call_owner(&state, &auth, replaces).await?;
+            state.handoff.attended_transfer(&token, replaces).await
+        }
+        None => state.handoff.transfer_call(&token, &req.target).await,
+    };
+    result.map_err(|e| {
+        tracing::warn!(token = %token, "Transfer failed: {}", e);
+        match e {
+            TransferError::InvalidTarget(_) => StatusCode::BAD_REQUEST.into(),
+            TransferError::SameCall => ApiError::coded(StatusCode::BAD_REQUEST, "same_call"),
+            TransferError::NotFound => StatusCode::NOT_FOUND.into(),
+            TransferError::InProgress => StatusCode::CONFLICT.into(),
+            TransferError::NotEstablished => {
+                ApiError::coded(StatusCode::CONFLICT, "call_not_established")
             }
-        })?;
+            TransferError::Unsupported => {
+                ApiError::coded(StatusCode::CONFLICT, "unsupported_by_pbx")
+            }
+            TransferError::Rejected(_) | TransferError::Send(_) => StatusCode::BAD_GATEWAY.into(),
+            TransferError::Timeout => StatusCode::GATEWAY_TIMEOUT.into(),
+        }
+    })?;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -2213,5 +2230,132 @@ Content-Length: 0\r\n\r\n";
                 .await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
         }
+    }
+
+    // ── Attended transfer ───────────────────────────────────────────────────
+
+    /// Register an answered outgoing call of `user` under `token`.
+    async fn another_outgoing_call(
+        app: &TestApp,
+        user: &str,
+        token: &str,
+        call_id: &str,
+    ) -> tokio::net::UdpSocket {
+        let (pbx, reg) = fake_pbx(&app.handoff).await;
+        app.handoff
+            .register_active_call(
+                token.into(),
+                call_id.into(),
+                CallOwner::User(user.into()),
+                OK_200.replace("out-call-1", call_id),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+                "v=0\r\n".into(),
+                "sip:gw@127.0.0.1".into(),
+            )
+            .await;
+        pbx
+    }
+
+    async fn attended(
+        app: &TestApp,
+        user: &str,
+        token: &str,
+        replaces: &str,
+    ) -> (StatusCode, String) {
+        app.send(post_as(
+            user,
+            &format!("/v1/calls/{token}/transfer"),
+            &serde_json::json!({ "replaces": replaces }),
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_refers_the_incoming_call_with_replaces() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("dev-1", "bob", true).await;
+        let (pbx_in, in_token) = pending_call_for(&app, "dev-1").await;
+        app.handoff
+            .accept_call(&in_token, "v=0\r\n".into())
+            .await
+            .unwrap();
+        let (_pbx_out, out_token) = outgoing_call_for(&app, "bob").await;
+
+        // The outgoing call's token in the path: the REFER still goes on the
+        // incoming call, replacing the outgoing one.
+        let request = {
+            let router = app.router.clone();
+            let req = post_as(
+                "bob",
+                &format!("/v1/calls/{out_token}/transfer"),
+                &serde_json::json!({ "replaces": in_token }),
+            );
+            tokio::spawn(async move { router.oneshot(req).await.unwrap().status() })
+        };
+        let refer = loop {
+            let msg = recv_text(&pbx_in).await;
+            if msg.starts_with("REFER ") {
+                break msg;
+            }
+            assert!(msg.starts_with("SIP/2.0 200 OK"), "{msg}");
+        };
+        assert_eq!(h(&refer, "Call-ID"), "in-call-1");
+        assert_eq!(
+            h(&refer, "Refer-To"),
+            "<sip:2000@pbx.example.com?Replaces=out-call-1%3Bto-tag%3Dpbxtag%3Bfrom-tag%3Dgwtag>"
+        );
+        app.handoff
+            .handle_refer_response(&pbx_reply(&refer, "202 Accepted", "", ""))
+            .await;
+        assert_eq!(request.await.unwrap(), StatusCode::ACCEPTED);
+
+        for token in [&in_token, &out_token] {
+            let (_, body) = app
+                .call(Method::GET, &format!("/v1/calls/{token}/status"), "bob")
+                .await;
+            assert_eq!(body, r#"{"status":"active","transfer":"pending"}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_of_another_users_call_is_404() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("dev-1", "bob", true).await;
+        let (_pbx_in, in_token) = pending_call_for(&app, "dev-1").await;
+        app.handoff
+            .accept_call(&in_token, "v=0\r\n".into())
+            .await
+            .unwrap();
+        let (_pbx_out, out_token) = outgoing_call_for(&app, "alice").await;
+
+        let (status, _) = attended(&app, "bob", &in_token, &out_token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = attended(&app, "alice", &out_token, &in_token).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = attended(&app, "bob", &in_token, "no-such-token").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_between_two_outgoing_calls_is_unsupported() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (_pbx1, first) = outgoing_call_for(&app, "bob").await;
+        let _pbx2 = another_outgoing_call(&app, "bob", "out-tok-2", "out-call-2").await;
+        let (status, body) = attended(&app, "bob", &first, "out-tok-2").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"unsupported_by_pbx"}"#);
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_of_a_ringing_call_is_409() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("dev-1", "bob", true).await;
+        let (_pbx_in, ringing) = pending_call_for(&app, "dev-1").await;
+        let (_pbx_out, out_token) = outgoing_call_for(&app, "bob").await;
+        let (status, body) = attended(&app, "bob", &out_token, &ringing).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, r#"{"error":"call_not_established"}"#);
     }
 }
