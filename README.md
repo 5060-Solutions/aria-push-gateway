@@ -308,6 +308,11 @@ released on every outcome and can be reused.
 
 **Transfer body:** `{"target": "1002"}` or `{"target": "sip:1002@pbx.example.com"}`
 
+Any active call can be transferred, whether the PBX sent it to the phone or
+the phone placed it: the REFER goes in-dialog on the call's PBX dialog, as the
+UAS or the UAC of that dialog. (The PBX must support REFER from either side of
+a call; older Aria PBX releases act only on REFER from the answering side.)
+
 A bare number/extension (letters, digits and `+ * # . - _`) is sent as
 `Refer-To: <sip:<target>@<account SIP domain>>`; a `sip:`/`sips:` URI is sent
 as-is. Targets containing whitespace, control characters, `<`, `>`, `"`, `,`,
@@ -347,16 +352,20 @@ Joins the far ends of two of the caller's active calls and drops the phone
 from both: typically the call being transferred and a consultation call the
 user placed to the target. `target` is ignored when `replaces` is present.
 
-The PBX only accepts this as a REFER on a call the phone **received**, with a
-`Replaces` naming a call the phone **placed**. So one call must be incoming
-and the other outgoing; either token may go in the path. The gateway always
-sends the REFER on the incoming call's dialog:
+Each call may be one the phone received or one it placed, in any
+combination. The gateway sends the REFER on the dialog of the call in the
+path (the transferred call), with a `Replaces` naming the dialog of the call
+in `replaces` (the consultation call):
 
 ```
-Refer-To: <sip:<consultation remote URI>?Replaces=<consultation Call-ID>%3Bto-tag%3D<remote tag>%3Bfrom-tag%3D<our tag>>
+Refer-To: <sip:<consultation remote URI>?Replaces=<consultation Call-ID>%3Bto-tag%3D<PBX tag>%3Bfrom-tag%3D<gateway tag>>
 ```
 
-The Call-ID and tags are percent-encoded (everything except
+Per RFC 3891 the tags are given as the recipient of the `INVITE` with
+`Replaces` (the PBX) sees the consultation dialog: `to-tag` is the PBX's own
+tag on it and `from-tag` the gateway's, whichever side sent that dialog's
+INVITE. Both calls must be on the same PBX node and reach it from the same
+gateway source address. The Call-ID and tags are percent-encoded (everything except
 `A-Z a-z 0-9 - . _ ~`). `Referred-By`, digest retry and the 30 s NOTIFY
 watchdog work as for blind transfer.
 
@@ -366,7 +375,6 @@ watchdog work as for blind transfer.
 | `400` | Malformed body, or `{"error":"same_call"}`: both tokens name the same call |
 | `404` | Either token is unknown or belongs to another user's call |
 | `409` | `{"error":"call_not_established"}`: either call is still ringing or already ended |
-| `409` | `{"error":"unsupported_by_pbx"}`: both calls are incoming or both are outgoing |
 | `409` | (no body) A transfer of either call is already in progress. Both calls are claimed until the transfer resolves |
 | `502` / `504` | As for blind transfer. On `502` both calls stay up and are released; `/status` is unchanged |
 
@@ -379,7 +387,7 @@ Outcome, reported on **both** calls' `/status`:
   success, or no NOTIFY within 30 s (`408`) leaves both calls up. Both report
   `{"status":"active","transfer":"failed","transfer_code":N}`, and both can be
   transferred again.
-- **Abandoned.** If the app hangs up the incoming call while the transfer is
+- **Abandoned.** If the app hangs up the transferred call while the transfer is
   pending, the consultation call is released with `"transfer":"failed"`,
   `"transfer_code":487`.
 

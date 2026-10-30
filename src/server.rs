@@ -738,9 +738,6 @@ async fn transfer_call(
             TransferError::NotEstablished => {
                 ApiError::coded(StatusCode::CONFLICT, "call_not_established")
             }
-            TransferError::Unsupported => {
-                ApiError::coded(StatusCode::CONFLICT, "unsupported_by_pbx")
-            }
             TransferError::Rejected(_) | TransferError::Send(_) => StatusCode::BAD_GATEWAY.into(),
             TransferError::Timeout => StatusCode::GATEWAY_TIMEOUT.into(),
         }
@@ -1236,6 +1233,40 @@ Content-Length: 0\r\n\r\n";
 
         let (_, body) = app.call(Method::GET, &status_path, "alice").await;
         assert_eq!(body, r#"{"status":"unknown"}"#);
+    }
+
+    #[tokio::test]
+    async fn blind_transfer_of_an_outgoing_call_refers_its_uac_dialog() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "bob").await;
+        let request = {
+            let router = app.router.clone();
+            let req = post_as(
+                "bob",
+                &format!("/v1/calls/{token}/transfer"),
+                &serde_json::json!({ "target": "1002" }),
+            );
+            tokio::spawn(async move { router.oneshot(req).await.unwrap().status() })
+        };
+        let refer = recv_text(&pbx).await;
+        // In-dialog on the call the gateway placed: our From/To, the PBX's
+        // Contact as Request-URI.
+        assert!(
+            refer.starts_with("REFER sip:2000@127.0.0.1:5060 SIP/2.0\r\n"),
+            "{refer}"
+        );
+        assert_eq!(h(&refer, "Call-ID"), "out-call-1");
+        assert_eq!(h(&refer, "From"), "<sip:1001@pbx.example.com>;tag=gwtag");
+        assert_eq!(h(&refer, "To"), "<sip:2000@pbx.example.com>;tag=pbxtag");
+        assert_eq!(h(&refer, "Refer-To"), "<sip:1002@pbx.example.com>");
+        app.handoff
+            .handle_refer_response(&pbx_reply(&refer, "202 Accepted", "", ""))
+            .await;
+        assert_eq!(request.await.unwrap(), StatusCode::ACCEPTED);
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}/status"), "bob")
+            .await;
+        assert_eq!(body, r#"{"status":"active","transfer":"pending"}"#);
     }
 
     #[tokio::test]
@@ -2273,7 +2304,7 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn attended_transfer_refers_the_incoming_call_with_replaces() {
+    async fn attended_transfer_refers_the_call_in_the_path_with_replaces() {
         let app = test_app(Some(ISSUER_KEY)).await;
         app.add_device("dev-1", "bob", true).await;
         let (pbx_in, in_token) = pending_call_for(&app, "dev-1").await;
@@ -2283,14 +2314,14 @@ Content-Length: 0\r\n\r\n";
             .unwrap();
         let (_pbx_out, out_token) = outgoing_call_for(&app, "bob").await;
 
-        // The outgoing call's token in the path: the REFER still goes on the
-        // incoming call, replacing the outgoing one.
+        // The incoming call's token in the path: the REFER goes on it,
+        // replacing the outgoing one.
         let request = {
             let router = app.router.clone();
             let req = post_as(
                 "bob",
-                &format!("/v1/calls/{out_token}/transfer"),
-                &serde_json::json!({ "replaces": in_token }),
+                &format!("/v1/calls/{in_token}/transfer"),
+                &serde_json::json!({ "replaces": out_token }),
             );
             tokio::spawn(async move { router.oneshot(req).await.unwrap().status() })
         };
@@ -2339,13 +2370,38 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn attended_transfer_between_two_outgoing_calls_is_unsupported() {
+    async fn attended_transfer_between_two_outgoing_calls_refers_the_first() {
         let app = test_app(Some(ISSUER_KEY)).await;
-        let (_pbx1, first) = outgoing_call_for(&app, "bob").await;
+        let (pbx1, first) = outgoing_call_for(&app, "bob").await;
         let _pbx2 = another_outgoing_call(&app, "bob", "out-tok-2", "out-call-2").await;
-        let (status, body) = attended(&app, "bob", &first, "out-tok-2").await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body, r#"{"error":"unsupported_by_pbx"}"#);
+
+        let request = {
+            let router = app.router.clone();
+            let req = post_as(
+                "bob",
+                &format!("/v1/calls/{first}/transfer"),
+                &serde_json::json!({ "replaces": "out-tok-2" }),
+            );
+            tokio::spawn(async move { router.oneshot(req).await.unwrap().status() })
+        };
+        let refer = recv_text(&pbx1).await;
+        assert!(refer.starts_with("REFER "), "{refer}");
+        assert_eq!(h(&refer, "Call-ID"), "out-call-1");
+        // Tags as the PBX sees the replaced dialog: to-tag is its own.
+        assert_eq!(
+            h(&refer, "Refer-To"),
+            "<sip:2000@pbx.example.com?Replaces=out-call-2%3Bto-tag%3Dpbxtag%3Bfrom-tag%3Dgwtag>"
+        );
+        app.handoff
+            .handle_refer_response(&pbx_reply(&refer, "202 Accepted", "", ""))
+            .await;
+        assert_eq!(request.await.unwrap(), StatusCode::ACCEPTED);
+        for token in [first.as_str(), "out-tok-2"] {
+            let (_, body) = app
+                .call(Method::GET, &format!("/v1/calls/{token}/status"), "bob")
+                .await;
+            assert_eq!(body, r#"{"status":"active","transfer":"pending"}"#);
+        }
     }
 
     #[tokio::test]
