@@ -20,7 +20,16 @@ struct Cli {
     /// Override listen address
     #[arg(long)]
     listen: Option<String>,
+
+    /// Start even with a missing, placeholder or short JWT secret. For local
+    /// development and tests only; never in production. Also enabled by
+    /// ARIA_GATEWAY_INSECURE_DEV_SECRET=1.
+    #[arg(long)]
+    insecure_dev_secret: bool,
 }
+
+/// Env var equivalent of `--insecure-dev-secret`.
+const INSECURE_DEV_SECRET_ENV: &str = "ARIA_GATEWAY_INSECURE_DEV_SECRET";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,9 +42,25 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = config::GatewayConfig::load(&cli.config)?;
 
-    let listen_addr = cli
-        .listen
-        .unwrap_or_else(|| config.server.listen.clone());
+    if let Err(e) = config.auth.check_jwt_secret() {
+        let override_env = std::env::var(INSECURE_DEV_SECRET_ENV)
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        if cli.insecure_dev_secret || override_env {
+            tracing::warn!(
+                "INSECURE: {e} — starting anyway because the dev override is set. \
+                 Anyone who knows this secret can mint tokens for any user."
+            );
+        } else {
+            anyhow::bail!(
+                "refusing to start: {e}. Set auth.secret to a random value of at least \
+                 {} characters (e.g. `openssl rand -hex 32`). For local development only, \
+                 pass --insecure-dev-secret or set {INSECURE_DEV_SECRET_ENV}=1.",
+                config::MIN_JWT_SECRET_LEN
+            );
+        }
+    }
+
+    let listen_addr = cli.listen.unwrap_or_else(|| config.server.listen.clone());
 
     tracing::info!("Aria Push Gateway v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Public URL: {}", config.server.public_url);
@@ -46,7 +71,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Database ready");
 
     // Initialize SIP proxy manager
-    let sip_proxy = Arc::new(sip::SipProxyManager::new());
+    let trusted_sources = config
+        .sip
+        .resolve_trusted_sources()
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+    if !trusted_sources.is_empty() {
+        tracing::info!(?trusted_sources, "Extra trusted SIP sources");
+    }
+    let sip_proxy = Arc::new(sip::SipProxyManager::new().with_trusted_sources(trusted_sources));
 
     // Initialize push notification clients
     let push_manager = Arc::new(push::PushManager::new(&config.push)?);
@@ -74,6 +106,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let token_issuer_key = config.auth.resolve_token_issuer_key();
+    config
+        .auth
+        .check_issuer_key(token_issuer_key.as_deref())
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+    match &token_issuer_key {
+        None => tracing::warn!(
+            "TOKEN_ISSUER_KEY is not set — POST /v1/auth/token will refuse every request"
+        ),
+        Some(key) if key.len() < 32 => tracing::warn!(
+            "TOKEN_ISSUER_KEY is shorter than 32 characters — use a long random value"
+        ),
+        Some(_) => {}
+    }
+
     // Build and start HTTP server
     let app = server::build_router(
         db.clone(),
@@ -82,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         handoff.clone(),
         config.auth.secret.clone(),
         config.auth.token_expiry_secs,
+        token_issuer_key,
     );
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;

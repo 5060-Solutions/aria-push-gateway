@@ -16,7 +16,9 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct ResolvedServer {
     pub addr: SocketAddr,
+    #[allow(dead_code)] // kept for diagnostics; ordering happens at resolve time
     pub priority: u16,
+    #[allow(dead_code)]
     pub weight: u16,
 }
 
@@ -36,7 +38,8 @@ pub struct SrvResolver {
 impl SrvResolver {
     /// Create a new SRV resolver using system DNS configuration.
     pub fn new() -> anyhow::Result<Self> {
-        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Ok(Self {
             resolver,
             cache: RwLock::new(std::collections::HashMap::new()),
@@ -53,6 +56,15 @@ impl SrvResolver {
         port: u16,
         transport: &str,
     ) -> anyhow::Result<Vec<ResolvedServer>> {
+        // An IP literal names the server directly; there is nothing to look up.
+        if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+            return Ok(vec![ResolvedServer {
+                addr: SocketAddr::new(ip, port),
+                priority: 0,
+                weight: 0,
+            }]);
+        }
+
         let srv_name = srv_service_name(domain, transport);
 
         // Check cache first
@@ -132,9 +144,7 @@ impl SrvResolver {
                     }
                     // Track minimum TTL from the A/AAAA records
                     let valid_until = ips.valid_until();
-                    let ttl_secs = valid_until
-                        .duration_since(Instant::now())
-                        .as_secs() as u32;
+                    let ttl_secs = valid_until.duration_since(Instant::now()).as_secs() as u32;
                     min_ttl = min_ttl.min(ttl_secs.max(30));
                 }
                 Err(e) => {
@@ -184,10 +194,7 @@ impl SrvResolver {
         // Cache the A record result too
         let ttl = {
             let valid_until = ips.valid_until();
-            let ttl_secs = valid_until
-                .duration_since(Instant::now())
-                .as_secs()
-                .max(30);
+            let ttl_secs = valid_until.duration_since(Instant::now()).as_secs().max(30);
             Duration::from_secs(ttl_secs)
         };
 
@@ -215,4 +222,25 @@ fn srv_service_name(domain: &str, transport: &str) -> String {
         _ => "udp",
     };
     format!("_sip._{}.{}", proto, domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ip_literals_resolve_without_dns() {
+        let resolver = SrvResolver::new().unwrap();
+        for (host, expected) in [("127.0.0.1", "127.0.0.1:5070"), ("::1", "[::1]:5070")] {
+            let servers = tokio::time::timeout(
+                Duration::from_millis(100),
+                resolver.resolve(host, 5070, "udp"),
+            )
+            .await
+            .expect("an IP literal must not wait on DNS")
+            .unwrap();
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].addr.to_string(), expected);
+        }
+    }
 }

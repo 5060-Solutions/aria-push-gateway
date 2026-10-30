@@ -102,6 +102,7 @@ dependencies = [
  "serde_json",
  "sip-5060",
  "sqlx",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "toml",

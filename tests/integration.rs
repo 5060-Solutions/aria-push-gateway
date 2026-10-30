@@ -3,8 +3,8 @@
 /// Test SIP message building and parsing through the gateway's message module.
 mod sip_message {
     // We test through aria-sip-core's public API since the gateway re-exports it.
-    use rsip::parser;
-    use rsip::{generate_branch, generate_call_id, generate_tag};
+    use rsip::generators::{generate_branch, generate_call_id, generate_tag};
+    use rsip::sip_parser as parser;
 
     const SAMPLE_INVITE: &str = "\
 INVITE sip:alice@example.com SIP/2.0\r\n\
@@ -53,10 +53,7 @@ Content-Length: 0\r\n\r\n";
             parser::extract_header(SAMPLE_INVITE, "Call-ID"),
             Some("test-call-id-001".into())
         );
-        assert_eq!(
-            parser::extract_method(SAMPLE_INVITE),
-            Some("INVITE".into())
-        );
+        assert_eq!(parser::extract_method(SAMPLE_INVITE), Some("INVITE".into()));
         assert!(parser::is_request(SAMPLE_INVITE));
     }
 
@@ -102,14 +99,9 @@ Content-Length: 0\r\n\r\n";
         use rsip::sip_auth::DigestAuth;
 
         let www_auth = parser::extract_header(SAMPLE_401, "WWW-Authenticate").unwrap();
-        let auth = DigestAuth::from_challenge(
-            &www_auth,
-            "alice",
-            "secret",
-            "sip:example.com",
-            "REGISTER",
-        )
-        .unwrap();
+        let auth =
+            DigestAuth::from_challenge(&www_auth, "alice", "secret", "sip:example.com", "REGISTER")
+                .unwrap();
 
         assert_eq!(auth.realm, "example.com");
         assert_eq!(auth.nonce, "abc123");
@@ -165,7 +157,11 @@ mod auth {
         use serde::Serialize;
 
         #[derive(Serialize)]
-        struct Claims { sub: String, exp: u64, iat: u64 }
+        struct Claims {
+            sub: String,
+            exp: u64,
+            iat: u64,
+        }
 
         let claims = Claims {
             sub: "alice@example.com".to_string(),
@@ -176,7 +172,8 @@ mod auth {
             &Header::default(),
             &claims,
             &EncodingKey::from_secret(b"secret"),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(verify_token(&token, "secret").is_err());
     }

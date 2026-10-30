@@ -31,6 +31,7 @@ pub struct RtpRelay {
 impl RtpRelay {
     /// Allocate a new RTP relay with two ephemeral UDP sockets.
     /// Returns the relay and (phone_port, pbx_port).
+    #[allow(dead_code)] // retained for the SDP-rewriting relay mode
     pub async fn allocate() -> anyhow::Result<(Self, u16, u16)> {
         let phone_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let pbx_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -38,11 +39,7 @@ impl RtpRelay {
         let phone_port = phone_socket.local_addr()?.port();
         let pbx_port = pbx_socket.local_addr()?.port();
 
-        tracing::info!(
-            phone_port,
-            pbx_port,
-            "Allocated RTP relay ports"
-        );
+        tracing::info!(phone_port, pbx_port, "Allocated RTP relay ports");
 
         let relay = Self {
             phone_socket,
