@@ -12,8 +12,8 @@
 //! the PBX dialog and, once the PBX reports (via NOTIFY) that the transfer
 //! target answered, ends its own leg with a BYE.
 //!
-//! An attended transfer joins an incoming call to a consultation call the
-//! phone placed: the REFER goes on the incoming call's dialog with a
+//! An attended transfer joins two of the phone's calls, each either placed
+//! or received: the REFER goes on the transferred call's dialog with a
 //! `Replaces` naming the consultation dialog, and on success both of the
 //! gateway's legs end as transferred.
 
@@ -221,11 +221,6 @@ impl ActiveCall {
     /// Allocate the CSeq number for the next request the gateway sends.
     fn next_cseq(&self) -> u32 {
         self.local_cseq.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Whether the PBX called us on this dialog (we are the UAS).
-    fn is_incoming(&self) -> bool {
-        self.invite_branch.is_some()
     }
 
     /// The consultation call this call is being attended-transferred with,
@@ -459,8 +454,14 @@ fn uri_header_escape(s: &str) -> String {
 
 /// The `Refer-To` URI of an attended transfer (RFC 5589 §7): the
 /// consultation call's remote party, with a `Replaces` header (RFC 3891)
-/// naming the consultation dialog — its Call-ID, the remote (to) tag and our
-/// own (from) tag, each percent-encoded.
+/// naming the consultation dialog, each part percent-encoded.
+///
+/// RFC 3891 §3 matches `to-tag` against the local tag and `from-tag` against
+/// the remote tag of the UA that receives the INVITE with `Replaces`: here
+/// the PBX, the gateway's peer on that dialog. So `to-tag` is the PBX's tag
+/// (our remote tag) and `from-tag` is ours (our local tag), whichever side
+/// sent the dialog's INVITE: [`Dialog`] already keeps `local`/`remote` from
+/// the gateway's point of view for both UAC and UAS dialogs.
 pub fn replaces_refer_to(consult: &Dialog) -> String {
     let remote = name_addr_uri(&consult.remote);
     let target = remote.split('?').next().unwrap_or_default();
@@ -621,9 +622,6 @@ pub enum TransferError {
     /// An attended transfer named a call that is not answered (still
     /// ringing) or already over.
     NotEstablished,
-    /// An attended transfer between two calls the PBX can't join: it only
-    /// accepts a REFER on a call the phone received, replacing one it placed.
-    Unsupported,
     /// An attended transfer named the same call twice.
     SameCall,
     /// The PBX answered the REFER with a non-2xx final response.
@@ -641,10 +639,6 @@ impl std::fmt::Display for TransferError {
             Self::NotFound => write!(f, "call token not found or not active"),
             Self::InProgress => write!(f, "a transfer of this call is already in progress"),
             Self::NotEstablished => write!(f, "both calls must be answered and active"),
-            Self::Unsupported => write!(
-                f,
-                "attended transfer needs one incoming and one outgoing call"
-            ),
             Self::SameCall => write!(f, "a call cannot replace itself"),
             Self::Rejected(status) => write!(f, "PBX rejected REFER with {status}"),
             Self::Timeout => write!(f, "no final response to REFER"),
@@ -1831,10 +1825,11 @@ impl HandoffManager {
     /// Attended-transfer: join the far end of one of the user's calls to the
     /// far end of another and drop the phone from both.
     ///
-    /// The PBX only accepts this as a REFER on a call the phone received,
-    /// with a `Replaces` naming a call the phone placed, so the incoming call
-    /// carries the REFER and the outgoing one is replaced, whichever order
-    /// the tokens come in. Ownership of both tokens is the caller's to check.
+    /// The REFER goes on `call_token`'s dialog with a `Replaces` naming
+    /// `replaces_token`'s dialog. Either call may be one the phone received
+    /// or one it placed: the dialog's tags are kept from the gateway's point
+    /// of view, so [`replaces_refer_to`] orients them for the PBX either way.
+    /// Ownership of both tokens is the caller's to check.
     ///
     /// On success both calls stay active with their transfer pending; they
     /// end as `transferred` on the PBX's NOTIFY 200 or BYEs. A failure
@@ -1863,11 +1858,9 @@ impl HandoffManager {
             let (Some(call_a), Some(call_b)) = (active.get(&a), active.get(&b)) else {
                 return Err(TransferError::NotEstablished);
             };
-            let (call, consult) = match (call_a.is_incoming(), call_b.is_incoming()) {
-                (true, false) => (call_a, call_b),
-                (false, true) => (call_b, call_a),
-                _ => return Err(TransferError::Unsupported),
-            };
+            // The REFER goes on the call named in the path; the other is
+            // the one replaced. Either may be incoming or outgoing.
+            let (call, consult) = (call_a, call_b);
             // Claim both calls: neither may carry another transfer meanwhile.
             let claim = |c: &ActiveCall| {
                 c.transfer_pending
@@ -3468,8 +3461,9 @@ Content-Length: 0\r\n\r\n";
     /// The Call-ID of the consultation (outgoing) call in [`attended_harness`].
     const CONSULT_CALL_ID: &str = "c0nsult@10.0.0.9";
 
-    /// An answered incoming call (`in`, from `pbx_in`) and an outgoing call
-    /// (`out`, to `pbx_out`, Call-ID [`CONSULT_CALL_ID`]) on one manager.
+    /// An answered incoming call (`in`, from `pbx_in`, PBX tag `pbxin`) and
+    /// an outgoing call (`out`, to `pbx_out`, Call-ID [`CONSULT_CALL_ID`])
+    /// on one manager.
     struct AttendedHarness {
         mgr: Arc<HandoffManager>,
         in_token: String,
@@ -3477,68 +3471,111 @@ Content-Length: 0\r\n\r\n";
         pbx_out: tokio::net::UdpSocket,
         /// The gateway socket of the incoming call.
         gw_in: SocketAddr,
+        /// The gateway socket of the outgoing call.
+        gw_out: SocketAddr,
+        /// The tag the gateway put in its 200 OK to the incoming call.
+        in_gw_tag: String,
     }
 
-    async fn attended_harness_with(mgr: HandoffManager) -> AttendedHarness {
-        use crate::sip::proxy::ProxyRegistration;
+    fn test_registration(
+        mgr: &Arc<HandoffManager>,
+        gw: Arc<tokio::net::UdpSocket>,
+    ) -> Arc<RwLock<crate::sip::proxy::ProxyRegistration>> {
+        Arc::new(RwLock::new(crate::sip::proxy::ProxyRegistration::for_test(
+            gw,
+            "pbx.example.com",
+            mgr.clone(),
+        )))
+    }
+
+    /// An incoming call `call_id` (PBX tag `pbx_tag`) answered and ACKed on
+    /// its own sockets: its token, the PBX socket, the gateway socket's
+    /// address and the tag of the gateway's 200 OK.
+    async fn answered_incoming(
+        mgr: &Arc<HandoffManager>,
+        call_id: &str,
+        pbx_tag: &str,
+    ) -> (String, tokio::net::UdpSocket, SocketAddr, String) {
         use tokio::net::UdpSocket;
-
-        let mgr = Arc::new(mgr);
-        let reg = |gw: Arc<UdpSocket>| {
-            Arc::new(RwLock::new(ProxyRegistration::for_test(
-                gw,
-                "pbx.example.com",
-                mgr.clone(),
-            )))
-        };
-
-        let pbx_in = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let gw_in = gw.local_addr().unwrap();
-        let in_token = mgr
+        let gw_addr = gw.local_addr().unwrap();
+        let token = mgr
             .create_pending_call(
                 "dev".into(),
-                "inbound-call-1".into(),
-                INBOUND_INVITE.into(),
-                pbx_in.local_addr().unwrap(),
-                reg(gw.clone()),
+                call_id.into(),
+                INBOUND_INVITE
+                    .replace("inbound-call-1", call_id)
+                    .replace("tag=pbxtag", &format!("tag={pbx_tag}")),
+                pbx.local_addr().unwrap(),
+                test_registration(mgr, gw.clone()),
                 None,
                 String::new(),
                 0,
                 0,
             )
             .await;
-        mgr.accept_call(&in_token, "v=0\r\n".into()).await.unwrap();
-        let ok = recv_text(&pbx_in).await;
+        mgr.accept_call(&token, "v=0\r\n".into()).await.unwrap();
+        let ok = recv_text(&pbx).await;
+        let to = message::extract_header(&ok, "To").unwrap();
         let ack = format!(
-            "ACK sip:aria-gateway@{gw_in} SIP/2.0\r\n\
+            "ACK sip:aria-gateway@{gw_addr} SIP/2.0\r\n\
              Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ack\r\n\
-             From: {}\r\nTo: {}\r\nCall-ID: inbound-call-1\r\n\
+             From: {}\r\nTo: {to}\r\nCall-ID: {call_id}\r\n\
              CSeq: 102 ACK\r\nContent-Length: 0\r\n\r\n",
             message::extract_header(&ok, "From").unwrap(),
-            message::extract_header(&ok, "To").unwrap(),
         );
         assert!(mgr.handle_ack(&ack, &gw).await);
+        let gw_tag = message::header_param(&to, "tag").unwrap();
+        (token, pbx, gw_addr, gw_tag)
+    }
 
-        let pbx_out = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    /// An outgoing call `call_id` registered as `token` with the given
+    /// gateway (From) and PBX (To) tags: the PBX socket and the gateway
+    /// socket's address.
+    async fn answered_outgoing(
+        mgr: &Arc<HandoffManager>,
+        token: &str,
+        call_id: &str,
+        gw_tag: &str,
+        pbx_tag: &str,
+    ) -> (tokio::net::UdpSocket, SocketAddr) {
+        use tokio::net::UdpSocket;
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw_addr = gw.local_addr().unwrap();
         mgr.register_active_call(
-            "out".into(),
-            CONSULT_CALL_ID.into(),
+            token.into(),
+            call_id.into(),
             CallOwner::User("alice".into()),
-            OUTBOUND_200.replace("outbound-call-1", CONSULT_CALL_ID),
-            pbx_out.local_addr().unwrap(),
-            reg(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())),
+            OUTBOUND_200
+                .replace("outbound-call-1", call_id)
+                .replace("tag=gwtag", &format!("tag={gw_tag}"))
+                .replace("tag=pbxtag", &format!("tag={pbx_tag}")),
+            pbx.local_addr().unwrap(),
+            test_registration(mgr, gw),
             None,
             "v=0\r\n".into(),
             "sip:gw@127.0.0.1".into(),
         )
         .await;
+        (pbx, gw_addr)
+    }
+
+    async fn attended_harness_with(mgr: HandoffManager) -> AttendedHarness {
+        let mgr = Arc::new(mgr);
+        let (in_token, pbx_in, gw_in, in_gw_tag) =
+            answered_incoming(&mgr, "inbound-call-1", "pbxin").await;
+        let (pbx_out, gw_out) =
+            answered_outgoing(&mgr, "out", CONSULT_CALL_ID, "gwtag", "pbxtag").await;
         AttendedHarness {
             mgr,
             in_token,
             pbx_in,
             pbx_out,
             gw_in,
+            gw_out,
+            in_gw_tag,
         }
     }
 
@@ -3574,34 +3611,52 @@ Content-Length: 0\r\n\r\n";
         )
     }
 
-    /// Run an attended transfer of the harness calls, check the REFER and
-    /// have the PBX accept it; returns the REFER.
+    /// Run an attended transfer of the harness calls with `token` in the
+    /// path, check the REFER goes on that call with a `Replaces` naming the
+    /// other, and have the PBX accept it; returns the REFER.
     async fn accepted_attended(h: &AttendedHarness, token: &str, replaces: &str) -> String {
         let task = {
             let mgr = h.mgr.clone();
             let (token, replaces) = (token.to_string(), replaces.to_string());
             tokio::spawn(async move { mgr.attended_transfer(&token, &replaces).await })
         };
+        // The Replaces tags are the dialog as the PBX sees it: to-tag is the
+        // PBX's own tag, from-tag the gateway's.
+        let (pbx, gw, call_id, request_uri, refer_to) = if token == h.in_token {
+            (
+                &h.pbx_in,
+                h.gw_in,
+                "inbound-call-1",
+                "sip:2000@10.0.0.1:5060;transport=udp",
+                "<sip:2000@pbx.example.com?Replaces=c0nsult%4010.0.0.9\
+                 %3Bto-tag%3Dpbxtag%3Bfrom-tag%3Dgwtag>"
+                    .to_string(),
+            )
+        } else {
+            (
+                &h.pbx_out,
+                h.gw_out,
+                CONSULT_CALL_ID,
+                "sip:2000@10.0.0.1:5060",
+                format!(
+                    "<sip:2000@pbx.example.com?Replaces=inbound-call-1\
+                     %3Bto-tag%3Dpbxin%3Bfrom-tag%3D{}>",
+                    h.in_gw_tag
+                ),
+            )
+        };
         let mut buf = vec![0u8; 65535];
-        let (len, from) =
-            tokio::time::timeout(Duration::from_secs(2), h.pbx_in.recv_from(&mut buf))
-                .await
-                .expect("no REFER on the incoming call")
-                .unwrap();
+        let (len, from) = tokio::time::timeout(Duration::from_secs(2), pbx.recv_from(&mut buf))
+            .await
+            .expect("no REFER on the transferred call")
+            .unwrap();
         let refer = String::from_utf8(buf[..len].to_vec()).unwrap();
-        assert_eq!(
-            from, h.gw_in,
-            "REFER leaves from the incoming call's socket"
-        );
-        assert!(refer.starts_with("REFER sip:2000@10.0.0.1:5060;transport=udp SIP/2.0\r\n"));
-        assert_eq!(
-            message::extract_header(&refer, "Call-ID").unwrap(),
-            "inbound-call-1"
-        );
+        assert_eq!(from, gw, "REFER leaves from the transferred call's socket");
+        assert!(refer.starts_with(&format!("REFER {request_uri} SIP/2.0\r\n")));
+        assert_eq!(message::extract_header(&refer, "Call-ID").unwrap(), call_id);
         assert_eq!(
             message::extract_header(&refer, "Refer-To").unwrap(),
-            "<sip:2000@pbx.example.com?Replaces=c0nsult%4010.0.0.9\
-             %3Bto-tag%3Dpbxtag%3Bfrom-tag%3Dgwtag>"
+            refer_to
         );
         assert_eq!(
             message::extract_header(&refer, "Referred-By").unwrap(),
@@ -3657,13 +3712,28 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn attended_transfer_with_swapped_tokens_refers_the_incoming_call() {
+    async fn attended_transfer_of_an_outgoing_call_replaces_the_incoming_one() {
         let h = attended_harness().await;
-        // The outgoing call's token in the path: the REFER still goes on the
-        // incoming call (checked by `accepted_attended`).
-        accepted_attended(&h, "out", &h.in_token.clone()).await;
+        // The outgoing call's token in the path: the REFER goes on it, with
+        // a Replaces naming the incoming call (checked by `accepted_attended`).
+        let refer = accepted_attended(&h, "out", &h.in_token.clone()).await;
         assert_eq!(status_of(&h.mgr, &h.in_token).await, PENDING);
         assert_eq!(status_of(&h.mgr, "out").await, PENDING);
+
+        h.mgr
+            .handle_notify(
+                CONSULT_CALL_ID,
+                &refer_notify_on(&refer, "SIP/2.0 200 OK\r\n", "terminated"),
+            )
+            .await;
+        assert!(recv_text(&h.pbx_out).await.starts_with("BYE "));
+        assert!(recv_text(&h.pbx_in).await.starts_with("BYE "));
+        for token in [h.in_token.as_str(), "out"] {
+            match h.mgr.get_call_status(token).await {
+                CallStatus::Ended(info) => assert_eq!(info.reason, "transferred"),
+                _ => panic!("{token} should have ended"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -3787,59 +3857,80 @@ Content-Length: 0\r\n\r\n";
         );
     }
 
-    #[tokio::test]
-    async fn attended_transfer_needs_one_incoming_and_one_outgoing_call() {
-        let Harness { mgr, pbx: _pbx } = outgoing_call_harness().await;
-        let (pbx2, reg) = {
-            use crate::sip::proxy::ProxyRegistration;
-            let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
-                gw,
-                "pbx.example.com",
-                mgr.clone(),
-            )));
-            (pbx, reg)
+    /// Start an attended transfer of `token` replacing `replaces`, take the
+    /// REFER from `pbx` and accept it; returns the REFER.
+    async fn accept_refer_on(
+        mgr: &Arc<HandoffManager>,
+        pbx: &tokio::net::UdpSocket,
+        token: &str,
+        replaces: &str,
+    ) -> String {
+        let task = {
+            let mgr = mgr.clone();
+            let (token, replaces) = (token.to_string(), replaces.to_string());
+            tokio::spawn(async move { mgr.attended_transfer(&token, &replaces).await })
         };
-        mgr.register_active_call(
-            "tok2".into(),
-            "outbound-call-2".into(),
-            CallOwner::User("alice".into()),
-            OUTBOUND_200.replace("outbound-call-1", "outbound-call-2"),
-            pbx2.local_addr().unwrap(),
-            reg,
-            None,
-            "v=0\r\n".into(),
-            "sip:gw@127.0.0.1".into(),
-        )
-        .await;
-        assert_eq!(
-            mgr.attended_transfer("tok", "tok2").await,
-            Err(TransferError::Unsupported)
-        );
+        let refer = recv_text(pbx).await;
+        mgr.handle_refer_response(&response_to(&refer, "202 Accepted"))
+            .await;
+        assert_eq!(task.await.unwrap(), Ok(()));
+        refer
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_joins_two_outgoing_calls() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let (_pbx2, _) = answered_outgoing(&mgr, "tok2", "outbound-call-2", "gw2", "pbx2").await;
         assert_eq!(
             mgr.attended_transfer("tok", "tok").await,
             Err(TransferError::SameCall)
         );
-        // Neither call was claimed.
+
+        let refer = accept_refer_on(&mgr, &pbx, "tok", "tok2").await;
+        assert!(refer.starts_with("REFER sip:2000@10.0.0.1:5060 SIP/2.0\r\n"));
         assert_eq!(
-            status_json(&mgr.get_call_status("tok").await),
-            r#"{"status":"active"}"#
+            message::extract_header(&refer, "Call-ID").unwrap(),
+            "outbound-call-1"
         );
+        assert_eq!(
+            message::extract_header(&refer, "Refer-To").unwrap(),
+            "<sip:2000@pbx.example.com?Replaces=outbound-call-2\
+             %3Bto-tag%3Dpbx2%3Bfrom-tag%3Dgw2>"
+        );
+        assert_eq!(status_of(&mgr, "tok").await, PENDING);
+        assert_eq!(status_of(&mgr, "tok2").await, PENDING);
+    }
+
+    #[tokio::test]
+    async fn attended_transfer_joins_two_incoming_calls() {
+        let mgr = Arc::new(HandoffManager::new());
+        let (a, pbx_a, _, _) = answered_incoming(&mgr, "inbound-a", "pbxa").await;
+        let (b, _pbx_b, _, b_gw_tag) = answered_incoming(&mgr, "inbound-b", "pbxb").await;
+
+        let refer = accept_refer_on(&mgr, &pbx_a, &a, &b).await;
+        assert!(refer.starts_with("REFER sip:2000@10.0.0.1:5060;transport=udp SIP/2.0\r\n"));
+        assert_eq!(
+            message::extract_header(&refer, "Call-ID").unwrap(),
+            "inbound-a"
+        );
+        assert_eq!(
+            message::extract_header(&refer, "Refer-To").unwrap(),
+            format!(
+                "<sip:2000@pbx.example.com?Replaces=inbound-b\
+                 %3Bto-tag%3Dpbxb%3Bfrom-tag%3D{b_gw_tag}>"
+            )
+        );
+        assert_eq!(status_of(&mgr, &a).await, PENDING);
+        assert_eq!(status_of(&mgr, &b).await, PENDING);
     }
 
     #[tokio::test]
     async fn attended_transfer_needs_both_calls_answered() {
         let h = attended_harness().await;
         let (_pbx, ringing) = {
-            use crate::sip::proxy::ProxyRegistration;
             let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
-                gw,
-                "pbx.example.com",
-                h.mgr.clone(),
-            )));
+            let reg = test_registration(&h.mgr, gw);
             let token = h
                 .mgr
                 .create_pending_call(
