@@ -663,7 +663,7 @@ impl SipProxyManager {
                     Self::reply(socket, message::build_481(text), from).await?;
                     return Ok(());
                 };
-                match handoff.classify_invite(text, socket).await {
+                match handoff.classify_invite(text, from, socket).await {
                     InviteDisposition::Retransmission(resp) => {
                         tracing::debug!(call_id = %call_id, "INVITE retransmission — repeating our response");
                         socket.send_to(resp.as_bytes(), from).await?;
@@ -745,8 +745,11 @@ impl SipProxyManager {
         Ok(())
     }
 
-    /// A new incoming call: answer 100 Trying, hold the INVITE pending and
-    /// push the device.
+    /// A new incoming call: answer 100 Trying at once, hold the INVITE
+    /// pending and push the device. The push runs in its own task so the
+    /// receive loop keeps serving this socket (retransmissions, CANCEL)
+    /// while APNs/FCM answer; once the provider accepts the push the PBX
+    /// gets 180 Ringing, and if it fails a 480 with the reason.
     async fn offer_incoming_call(
         reg: &Arc<RwLock<ProxyRegistration>>,
         handoff: &Arc<HandoffManager>,
@@ -754,7 +757,16 @@ impl SipProxyManager {
         text: &str,
         from: SocketAddr,
     ) -> anyhow::Result<()> {
-        if reg.read().await.unregistering {
+        // 100 Trying first, before any lock or lookup: it stops the PBX's
+        // INVITE retransmissions.
+        Self::reply(socket, message::build_100_trying(text), from).await?;
+        let received = std::time::Instant::now();
+
+        let (unregistering, device_id, push_mgr) = {
+            let r = reg.read().await;
+            (r.unregistering, r.device_id.clone(), r.push_manager.clone())
+        };
+        if unregistering {
             // The binding is being removed; this registration takes no
             // new calls.
             if let Some(resp) = message::build_simple_response(text, 480, "Temporarily Unavailable")
@@ -766,22 +778,18 @@ impl SipProxyManager {
             return Ok(());
         }
         tracing::info!("Incoming INVITE for proxy device");
-        Self::reply(socket, message::build_100_trying(text), from).await?;
 
         let (caller_user, caller_domain) =
             message::extract_from_uri(text).unwrap_or(("unknown".into(), "unknown".into()));
+        let caller_uri = format!("{caller_user}@{caller_domain}");
         let caller_name = message::extract_display_name(text);
         let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
-        let (device_id, push_mgr) = {
-            let r = reg.read().await;
-            (r.device_id.clone(), r.push_manager.clone())
-        };
 
         // SDP passes through unchanged — phone talks directly to PBX relay
         let call_token = handoff
             .create_pending_call(
                 device_id.clone(),
-                call_id,
+                call_id.clone(),
                 text.to_string(),
                 from,
                 reg.clone(),
@@ -794,18 +802,33 @@ impl SipProxyManager {
 
         tracing::info!(
             device = %device_id,
-            caller = %format!("{}@{}", caller_user, caller_domain),
+            caller = %caller_uri,
             token = %call_token,
             "Sending push notification for incoming call"
         );
-        push_mgr
-            .send_incoming_call(
-                &device_id,
-                &call_token,
-                &format!("{}@{}", caller_user, caller_domain),
-                caller_name.as_deref(),
-            )
-            .await?;
+        let handoff = Arc::clone(handoff);
+        tokio::spawn(async move {
+            let result = push_mgr
+                .send_incoming_call(&device_id, &call_token, &caller_uri, caller_name.as_deref())
+                .await;
+            let push_ms = received.elapsed().as_millis() as u64;
+            match result {
+                Ok(()) => {
+                    if handoff.ring(&call_token).await {
+                        tracing::info!(call_id = %call_id, push_ms, "Push accepted — sent 180 Ringing");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        call_id = %call_id,
+                        device = %device_id,
+                        push_ms,
+                        "Push failed — answering 480: {e}"
+                    );
+                    handoff.fail_pending(&call_token, e.sip_reason_text()).await;
+                }
+            }
+        });
         Ok(())
     }
 
@@ -1197,6 +1220,7 @@ impl SipProxyManager {
 mod tests {
     use super::*;
     use crate::handoff::CallOwner;
+    use crate::push::mock::MockFcm;
 
     const OUTBOUND_200: &str = "\
 SIP/2.0 200 OK\r\n\
@@ -1622,6 +1646,10 @@ Content-Length: 0\r\n\r\n";
         pbx_addr: SocketAddr,
         invite: String,
         token: String,
+        /// The 180 Ringing sent once the push was accepted.
+        ringing: String,
+        /// The provider the push went to.
+        fcm: MockFcm,
     }
 
     fn incoming_invite(branch: &str) -> String {
@@ -1640,21 +1668,39 @@ Content-Length: 0\r\n\r\n";
         )
     }
 
-    /// An incoming call ringing on a registration that trusts the fake PBX;
-    /// the 100 Trying has been consumed.
-    async fn ringing() -> Ringing {
+    /// A registration that trusts a fake PBX and pushes to `fcm`.
+    async fn registration_pushing_to(
+        fcm: &MockFcm,
+    ) -> (
+        Arc<HandoffManager>,
+        Arc<RwLock<ProxyRegistration>>,
+        UdpSocket,
+        SocketAddr,
+    ) {
         let handoff = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let pbx_addr = pbx.local_addr().unwrap();
         let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut r = ProxyRegistration::for_test(gw, "pbx.example.com", handoff.clone());
         r.trust_peer(pbx_addr);
-        let reg = Arc::new(RwLock::new(r));
+        r.push_manager = fcm.manager("test-device").await;
+        (handoff, Arc::new(RwLock::new(r)), pbx, pbx_addr)
+    }
+
+    /// An incoming call ringing on a registration that trusts the fake PBX;
+    /// the 100 Trying and the 180 Ringing have been consumed.
+    async fn ringing() -> Ringing {
+        let mut fcm = MockFcm::start().await;
+        let (handoff, reg, pbx, pbx_addr) = registration_pushing_to(&fcm).await;
         let invite = incoming_invite("z9hG4bK-in1");
-        // The no-op push manager fails to push; the call is still offered.
-        let _ = SipProxyManager::handle_message(&reg, &invite, pbx_addr).await;
+        SipProxyManager::handle_message(&reg, &invite, pbx_addr)
+            .await
+            .unwrap();
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 100 Trying"));
+        let ringing = recv_text(&pbx).await;
+        assert!(ringing.starts_with("SIP/2.0 180 Ringing\r\n"), "{ringing}");
         let token = handoff.pending_token("in-1").await.unwrap();
+        assert_eq!(fcm.delivered.recv().await.unwrap().0, token);
         Ringing {
             handoff,
             reg,
@@ -1662,6 +1708,8 @@ Content-Length: 0\r\n\r\n";
             pbx_addr,
             invite,
             token,
+            ringing,
+            fcm,
         }
     }
 
@@ -1681,10 +1729,14 @@ Content-Length: 0\r\n\r\n";
 
     #[tokio::test]
     async fn invite_retransmission_is_not_a_new_call() {
-        let r = ringing().await;
+        let mut r = ringing().await;
+        // Once ringing, a retransmission gets the same 180 again, and the
+        // device is not pushed again.
         let _ = SipProxyManager::handle_message(&r.reg, &r.invite, r.pbx_addr).await;
-        assert!(recv_text(&r.pbx).await.starts_with("SIP/2.0 100 Trying"));
+        assert_eq!(recv_text(&r.pbx).await, r.ringing);
         assert_eq!(r.handoff.pending_count().await, 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(r.fcm.delivered.try_recv().is_err(), "pushed twice");
 
         // Same Call-ID on a different transaction: merged request.
         let merged = incoming_invite("z9hG4bK-other");
@@ -1712,6 +1764,11 @@ Content-Length: 0\r\n\r\n";
         assert!(vias[0].contains("z9hG4bK-in1") && vias[1].contains("z9hG4bK-upstream"));
         assert!(ok.contains("Record-Route: <sip:edge.example.com;lr>\r\n"));
         assert!(message::extract_to_tag(&ok).is_some());
+        // One early dialog: the 200 confirms the 180's.
+        assert_eq!(
+            message::extract_to_tag(&ok),
+            message::extract_to_tag(&r.ringing)
+        );
 
         // Unacknowledged: retransmitted.
         assert_eq!(recv_text(&r.pbx).await, ok);
@@ -1790,6 +1847,11 @@ Content-Length: 0\r\n\r\n";
         let decline = recv_text(&r.pbx).await;
         assert!(decline.starts_with("SIP/2.0 603 Decline"));
         assert!(message::extract_to_tag(&decline).is_some());
+        assert_eq!(
+            message::extract_to_tag(&decline),
+            message::extract_to_tag(&r.ringing),
+            "the final reuses the 180's To tag"
+        );
         assert_eq!(decline.lines().filter(|l| l.starts_with("Via:")).count(), 2);
         assert_eq!(recv_text(&r.pbx).await, decline, "retransmitted until ACK");
 
@@ -1821,6 +1883,10 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(
             message::extract_to_tag(&ok),
             message::extract_to_tag(&terminated)
+        );
+        assert_eq!(
+            message::extract_to_tag(&terminated),
+            message::extract_to_tag(&r.ringing)
         );
         assert_eq!(r.handoff.pending_count().await, 0);
     }
@@ -2000,5 +2066,295 @@ Content-Length: 0\r\n\r\n";
             .filter(|(m, f)| *f != old_gw && expires(m) == "3600")
             .count();
         assert!(new_refreshes >= 2, "new registration keeps refreshing");
+    }
+
+    #[tokio::test]
+    async fn ringing_is_sent_once_the_push_is_accepted() {
+        let r = ringing().await;
+        let ringing = &r.ringing;
+        // A dialog-creating provisional: our tag, Contact, the INVITE's
+        // Vias and Record-Route, and no SDP (the app hasn't answered yet).
+        assert!(message::extract_to_tag(ringing).is_some());
+        assert!(ringing.contains("Contact: <sip:aria-gateway@127.0.0.1:"));
+        assert!(ringing.contains("Record-Route: <sip:edge.example.com;lr>\r\n"));
+        assert_eq!(ringing.lines().filter(|l| l.starts_with("Via:")).count(), 2);
+        assert!(ringing.contains("CSeq: 10 INVITE\r\n"));
+        assert!(ringing.ends_with("Content-Length: 0\r\n\r\n"));
+        assert!(!ringing.contains("Content-Type"));
+        assert_eq!(r.handoff.pending_count().await, 1);
+    }
+
+    /// The 480 the PBX gets for an INVITE whose push failed with `status`
+    /// (or, with `None`, a device that has no push registration).
+    async fn unavailable_after_push(status: Option<u16>) -> (String, Ringing) {
+        let mut fcm = MockFcm::start().await;
+        if let Some(status) = status {
+            fcm.set_status(status);
+        }
+        let (handoff, reg, pbx, pbx_addr) = registration_pushing_to(&fcm).await;
+        if status.is_none() {
+            reg.write().await.device_id = "device-without-push".into();
+        }
+        let invite = incoming_invite("z9hG4bK-in1");
+        SipProxyManager::handle_message(&reg, &invite, pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 100 Trying"));
+        let resp = recv_text(&pbx).await;
+        assert!(fcm.delivered.try_recv().is_err());
+        assert_eq!(handoff.pending_count().await, 0, "the call is over");
+        let r = Ringing {
+            handoff,
+            reg,
+            pbx,
+            pbx_addr,
+            invite,
+            token: String::new(),
+            ringing: String::new(),
+            fcm,
+        };
+        (resp, r)
+    }
+
+    #[tokio::test]
+    async fn failed_push_answers_480_with_the_reason() {
+        let (resp, r) = unavailable_after_push(Some(503)).await;
+        assert!(
+            resp.starts_with("SIP/2.0 480 Temporarily Unavailable\r\n"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("Reason: SIP;cause=480;text=\"Push rejected by provider\"\r\n"),
+            "{resp}"
+        );
+        assert!(message::extract_to_tag(&resp).is_some());
+
+        // Retransmitted until ACKed, and repeated for a retransmitted INVITE.
+        assert_eq!(recv_text(&r.pbx).await, resp);
+        SipProxyManager::handle_message(&r.reg, &r.invite, r.pbx_addr)
+            .await
+            .unwrap();
+        assert_eq!(recv_text(&r.pbx).await, resp);
+        SipProxyManager::handle_message(&r.reg, &ack_for(&resp, "z9hG4bK-in1"), r.pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut buf = [0u8; 4096];
+        while r.pbx.try_recv(&mut buf).is_ok() {}
+        nothing_arrives(&r.pbx).await;
+    }
+
+    #[tokio::test]
+    async fn device_without_push_answers_480() {
+        let (resp, _r) = unavailable_after_push(None).await;
+        assert!(
+            resp.starts_with("SIP/2.0 480 Temporarily Unavailable\r\n"),
+            "{resp}"
+        );
+        assert!(
+            resp.contains("Reason: SIP;cause=480;text=\"No push device registered\"\r\n"),
+            "{resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retransmission_before_ringing_gets_100_and_no_second_push() {
+        let mut fcm = MockFcm::start().await;
+        fcm.set_latency(Duration::from_millis(300));
+        let (handoff, reg, pbx, pbx_addr) = registration_pushing_to(&fcm).await;
+        let invite = incoming_invite("z9hG4bK-in1");
+        SipProxyManager::handle_message(&reg, &invite, pbx_addr)
+            .await
+            .unwrap();
+        let trying = recv_text(&pbx).await;
+        assert!(trying.starts_with("SIP/2.0 100 Trying"));
+
+        // While the push is in flight, a retransmission gets the 100 again.
+        SipProxyManager::handle_message(&reg, &invite, pbx_addr)
+            .await
+            .unwrap();
+        assert_eq!(recv_text(&pbx).await, trying);
+        assert_eq!(handoff.pending_count().await, 1);
+
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 180 Ringing"));
+        fcm.delivered.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fcm.delivered.try_recv().is_err(), "pushed twice");
+    }
+
+    #[tokio::test]
+    async fn same_branch_from_another_source_is_not_a_retransmission() {
+        let r = ringing().await;
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other.local_addr().unwrap();
+        r.reg.write().await.trust_peer(other_addr);
+        SipProxyManager::handle_message(&r.reg, &r.invite, other_addr)
+            .await
+            .unwrap();
+        let resp = recv_text(&other).await;
+        assert!(resp.starts_with("SIP/2.0 482 "), "{resp}");
+        assert_eq!(r.handoff.pending_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_while_the_push_is_in_flight() {
+        let mut fcm = MockFcm::start().await;
+        fcm.set_latency(Duration::from_millis(300));
+        let (handoff, reg, pbx, pbx_addr) = registration_pushing_to(&fcm).await;
+        let invite = incoming_invite("z9hG4bK-in1");
+        SipProxyManager::handle_message(&reg, &invite, pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 100 Trying"));
+
+        // Answered at once, not after the push.
+        let sent = std::time::Instant::now();
+        SipProxyManager::handle_message(&reg, &cancel_of(&invite), pbx_addr)
+            .await
+            .unwrap();
+        assert!(recv_text(&pbx).await.starts_with("SIP/2.0 200 OK"));
+        let terminated = recv_text(&pbx).await;
+        assert!(terminated.starts_with("SIP/2.0 487 "), "{terminated}");
+        assert!(sent.elapsed() < Duration::from_millis(200));
+        assert_eq!(handoff.pending_count().await, 0);
+
+        // The push lands afterwards: no 180 for the cancelled call.
+        fcm.delivered.recv().await.unwrap();
+        SipProxyManager::handle_message(&reg, &ack_for(&terminated, "z9hG4bK-in1"), pbx_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pbx.try_recv(&mut buf) {
+            let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(!msg.starts_with("SIP/2.0 180"), "{msg}");
+        }
+    }
+
+    // ── Call-setup timeline ─────────────────────────────────────────────────
+
+    /// How long the simulated provider takes to accept a push.
+    const PUSH_LATENCY: Duration = Duration::from_millis(300);
+    /// How long the simulated app takes from push delivery to fetching the
+    /// offer and answering.
+    const APP_WAKE: Duration = Duration::from_millis(1000);
+    /// When the fake PBX retransmits the INVITE (RFC 3261 T1 is 500 ms; an
+    /// earlier one keeps the test short and still lands mid-push).
+    const RETRANSMIT_AT: Duration = Duration::from_millis(50);
+
+    /// Milliseconds from INVITE to each response the PBX got.
+    #[derive(Debug, Default)]
+    struct Timeline {
+        trying: Option<u128>,
+        retransmission_answered: Option<u128>,
+        ringing: Option<u128>,
+        ok: Option<u128>,
+        responses: Vec<String>,
+    }
+
+    /// Ring a registered device through the real receive loop: the PBX
+    /// sends an INVITE (and a retransmission of it), the provider accepts
+    /// the push after [`PUSH_LATENCY`], and the app answers [`APP_WAKE`]
+    /// after delivery.
+    async fn call_setup_timeline_run() -> Timeline {
+        let mut fcm = MockFcm::start().await;
+        fcm.set_latency(PUSH_LATENCY);
+        let push = fcm.manager("dev1").await;
+        let mgr = SipProxyManager::new();
+        let handoff = Arc::new(HandoffManager::new());
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mgr.register_device("dev1".into(), account(&pbx), push, handoff.clone())
+            .await
+            .unwrap();
+        let (register, gw) = recv_from(&pbx).await;
+        let ok = message::build_simple_response(&register, 200, "OK").unwrap();
+        pbx.send_to(ok.as_bytes(), gw).await.unwrap();
+
+        let app_handoff = handoff.clone();
+        tokio::spawn(async move {
+            let (token, _) = fcm.delivered.recv().await.unwrap();
+            tokio::time::sleep(APP_WAKE).await;
+            app_handoff.get_call_offer(&token).await.unwrap();
+            app_handoff
+                .accept_call(
+                    &token,
+                    "v=0\r\nc=IN IP4 10.1.1.1\r\nm=audio 5000 RTP/AVP 0\r\n".into(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let invite = incoming_invite("z9hG4bK-tl");
+        let start = tokio::time::Instant::now();
+        pbx.send_to(invite.as_bytes(), gw).await.unwrap();
+        let mut retransmit = Box::pin(tokio::time::sleep(RETRANSMIT_AT));
+        let mut retransmitted = false;
+        let mut t = Timeline::default();
+        let mut buf = vec![0u8; 65535];
+        let deadline = start + Duration::from_secs(5);
+        while t.ok.is_none() {
+            tokio::select! {
+                _ = &mut retransmit, if !retransmitted => {
+                    retransmitted = true;
+                    pbx.send_to(invite.as_bytes(), gw).await.unwrap();
+                }
+                r = tokio::time::timeout_at(deadline, pbx.recv(&mut buf)) => {
+                    let len = r.expect("call never answered").unwrap();
+                    let msg = String::from_utf8(buf[..len].to_vec()).unwrap();
+                    let at = start.elapsed().as_millis();
+                    let first = msg.lines().next().unwrap_or_default().to_string();
+                    if first.starts_with("SIP/2.0 200") {
+                        t.ok = Some(at);
+                    } else if first.starts_with("SIP/2.0 180") {
+                        t.ringing = t.ringing.or(Some(at));
+                    } else if t.trying.is_none() {
+                        t.trying = Some(at);
+                    } else if retransmitted && t.retransmission_answered.is_none() {
+                        t.retransmission_answered = Some(at);
+                    }
+                    t.responses.push(msg);
+                }
+            }
+        }
+        t
+    }
+
+    /// The PBX hears 100 at once and 180 as soon as the provider accepts
+    /// the push, not when the app answers; the receive loop answers the
+    /// retransmission while the push is still in flight. Run with
+    /// `--nocapture` to see the timings.
+    #[tokio::test]
+    async fn call_setup_timeline() {
+        let t = call_setup_timeline_run().await;
+        println!(
+            "call setup (push {PUSH_LATENCY:?}, app wake {APP_WAKE:?}): 100 Trying at {:?} ms, \
+             retransmission answered at {:?} ms (sent at {RETRANSMIT_AT:?}), \
+             180 Ringing at {:?} ms, 200 OK at {:?} ms",
+            t.trying, t.retransmission_answered, t.ringing, t.ok
+        );
+        let push = PUSH_LATENCY.as_millis();
+        let wake = APP_WAKE.as_millis();
+        assert!(t.trying.unwrap() < 50, "{t:?}");
+        let retransmission = t.retransmission_answered.expect("retransmission answered");
+        assert!(
+            retransmission < RETRANSMIT_AT.as_millis() + 50,
+            "the receive loop waited for the push: {t:?}"
+        );
+        let ringing = t.ringing.expect("180 Ringing");
+        assert!(
+            ringing >= push && ringing < push + 150,
+            "180 should follow the push: {t:?}"
+        );
+        let ok = t.ok.unwrap();
+        assert!(ok >= push + wake && ok < push + wake + 300, "{t:?}");
+
+        // One To tag across the 180 and the 200.
+        let tags: Vec<_> = t
+            .responses
+            .iter()
+            .filter(|m| !m.starts_with("SIP/2.0 100"))
+            .map(|m| message::extract_to_tag(m))
+            .collect();
+        assert!(tags.len() >= 2 && tags.iter().all(|tag| tag.is_some() && *tag == tags[0]));
     }
 }

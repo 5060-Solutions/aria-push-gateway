@@ -114,13 +114,22 @@ impl ServerTransactions {
     /// The response previously sent for this exact request (same socket,
     /// branch and method), if it is a retransmission.
     pub fn replay(&self, socket: &Arc<UdpSocket>, request: &str) -> Option<String> {
+        self.replay_with_dest(socket, request).map(|(r, _)| r)
+    }
+
+    /// [`Self::replay`], with where the response was sent.
+    pub fn replay_with_dest(
+        &self,
+        socket: &Arc<UdpSocket>,
+        request: &str,
+    ) -> Option<(String, SocketAddr)> {
         let k = key(socket, request)?;
         let inner = self.lock();
         inner
             .responses
             .get(&k)
             .filter(|(_, _, at)| at.elapsed() < TIMEOUT)
-            .map(|(r, _, _)| r.clone())
+            .map(|(r, dest, _)| (r.clone(), *dest))
     }
 
     /// Whether a final response was sent for the INVITE with this branch.

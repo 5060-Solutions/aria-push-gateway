@@ -335,6 +335,23 @@ pub fn build_200_ok_invite(
     )
 }
 
+/// Build a 180 Ringing for an INVITE: our `to_tag` (the same one every
+/// later response carries, so the PBX sees one early dialog that the 200
+/// confirms), the INVITE's Record-Route and our Contact, and no body: the
+/// app's SDP only exists once it answers, so the PBX plays its own
+/// ringback.
+pub fn build_180_ringing(request: &str, contact_uri: &str, to_tag: &str) -> Option<String> {
+    build_response(
+        request,
+        180,
+        "Ringing",
+        Some(to_tag),
+        true,
+        &format!("Contact: <{contact_uri}>\r\n"),
+        None,
+    )
+}
+
 /// Build the ACK for a non-2xx final `response` to `invite` (RFC 3261
 /// §17.1.1.3): same Request-URI, top Via (branch), Route, From, Call-ID and
 /// CSeq number as the INVITE, and the response's To (with its tag).

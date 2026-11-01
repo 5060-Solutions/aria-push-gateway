@@ -66,12 +66,43 @@ struct PendingCall {
     local_tag: String,
     /// Top Via branch of the INVITE (identifies its transaction).
     invite_branch: String,
+    /// The latest provisional response sent (100 Trying, then 180 Ringing
+    /// once the push is out); a retransmitted INVITE gets it again.
+    last_provisional: String,
     /// The gateway's local IP for SDP rewriting.
     local_ip: String,
     /// The phone-side RTP relay port.
     phone_rtp_port: u16,
     /// The PBX-side RTP relay port.
     pbx_rtp_port: u16,
+}
+
+impl PendingCall {
+    /// Answer the INVITE with 480 Temporarily Unavailable, our To tag and
+    /// `Reason: SIP;cause=480;text="<reason>"` (RFC 3326).
+    fn send_unavailable(&self, uas: &Arc<ServerTransactions>, reason: &str) {
+        let header = format!(
+            "Reason: SIP;cause=480;text=\"{}\"\r\n",
+            reason.replace(['"', '\\', '\r', '\n'], "")
+        );
+        if let Some(resp) = message::build_response(
+            &self.invite_raw,
+            480,
+            "Temporarily Unavailable",
+            Some(&self.local_tag),
+            false,
+            &header,
+            None,
+        ) {
+            uas.send_final(&self.socket, self.pbx_addr, &self.invite_raw, resp);
+        }
+    }
+}
+
+/// The Contact the gateway puts in its responses on a registration bound
+/// to `local_addr`.
+fn gateway_contact(local_addr: SocketAddr) -> String {
+    format!("sip:aria-gateway@{}:{}", local_addr.ip(), local_addr.port())
 }
 
 /// What the app can learn about a transfer after the PBX accepted it.
@@ -970,6 +1001,7 @@ impl HandoffManager {
         let call_token = uuid::Uuid::new_v4().to_string();
         let socket = proxy_reg.read().await.socket.clone();
         let invite_branch = message::extract_via_branch(&invite_raw).unwrap_or_default();
+        let last_provisional = message::build_100_trying(&invite_raw).unwrap_or_default();
 
         let pending = PendingCall {
             device_id,
@@ -981,6 +1013,7 @@ impl HandoffManager {
             socket,
             local_tag: message::generate_tag(),
             invite_branch,
+            last_provisional,
             local_ip,
             phone_rtp_port,
             pbx_rtp_port,
@@ -1004,21 +1037,50 @@ impl HandoffManager {
                     token = %token_clone,
                     "Call handoff timed out — sending 480"
                 );
-                if let Some(resp) = message::build_response(
-                    &call.invite_raw,
-                    480,
-                    "Temporarily Unavailable",
-                    Some(&call.local_tag),
-                    false,
-                    "",
-                    None,
-                ) {
-                    uas.send_final(&call.socket, call.pbx_addr, &call.invite_raw, resp);
-                }
+                call.send_unavailable(&uas, "App did not answer the push");
             }
         });
 
         token
+    }
+
+    /// The push for a pending call was accepted by APNs/FCM: send 180
+    /// Ringing (our To tag, Contact, Record-Route, no SDP) so the caller
+    /// hears ringback while the app wakes. Retransmitted INVITEs get the
+    /// 180 from now on. Returns whether it was sent: not if the call was
+    /// answered, rejected or cancelled meanwhile.
+    pub async fn ring(&self, call_token: &str) -> bool {
+        let mut pending = self.pending.write().await;
+        let Some(call) = pending.get_mut(call_token) else {
+            return false;
+        };
+        let local_addr = call.proxy_reg.read().await.local_addr;
+        let Some(ringing) = message::build_180_ringing(
+            &call.invite_raw,
+            &gateway_contact(local_addr),
+            &call.local_tag,
+        ) else {
+            return false;
+        };
+        call.last_provisional = ringing.clone();
+        // Sent under the lock, so a 200 from a concurrent accept can't
+        // overtake it.
+        if let Err(e) = call.socket.send_to(ringing.as_bytes(), call.pbx_addr).await {
+            tracing::warn!(token = %call_token, "Failed to send 180 Ringing: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// The push for a pending call failed: end it with 480 and `reason` in
+    /// a `Reason` header, retransmitted until the PBX ACKs it. Returns
+    /// whether the call was still pending.
+    pub async fn fail_pending(&self, call_token: &str, reason: &str) -> bool {
+        let Some(call) = self.pending.write().await.remove(call_token) else {
+            return false;
+        };
+        call.send_unavailable(&self.uas, reason);
+        true
     }
 
     /// Mobile app accepts the call with an SDP answer.
@@ -1082,7 +1144,7 @@ impl HandoffManager {
 
         // Build 200 OK with the rewritten SDP and send to PBX
         let local_addr = call.proxy_reg.read().await.local_addr;
-        let contact_uri = format!("sip:aria-gateway@{}:{}", local_addr.ip(), local_addr.port());
+        let contact_uri = gateway_contact(local_addr);
         let ok = message::build_200_ok_invite(
             &call.invite_raw,
             &rewritten_sdp,
@@ -1248,10 +1310,15 @@ impl HandoffManager {
         true
     }
 
-    /// Classify an INVITE without a To tag that arrived on `socket`.
+    /// Classify an INVITE without a To tag that arrived on `socket` from
+    /// `from`. A retransmission has the same Call-ID, top Via branch, socket
+    /// and source as the INVITE we are handling; it gets our latest response
+    /// again (100 or 180 while ringing, the 200, or the final) and is not
+    /// processed again. Anything else with a known Call-ID is merged.
     pub async fn classify_invite(
         &self,
         invite: &str,
+        from: SocketAddr,
         socket: &Arc<tokio::net::UdpSocket>,
     ) -> InviteDisposition {
         let call_id = message::extract_header(invite, "Call-ID").unwrap_or_default();
@@ -1264,23 +1331,27 @@ impl HandoffManager {
             .values()
             .find(|c| c.call_id == call_id)
         {
-            return if c_matches(&call.socket, socket) && call.invite_branch == branch {
-                message::build_100_trying(invite)
-                    .map_or(InviteDisposition::Merged, InviteDisposition::Retransmission)
+            let same = c_matches(&call.socket, socket)
+                && call.invite_branch == branch
+                && call.pbx_addr == from;
+            return if same && !call.last_provisional.is_empty() {
+                InviteDisposition::Retransmission(call.last_provisional.clone())
             } else {
                 InviteDisposition::Merged
             };
         }
         if let Some(call) = self.active.read().await.get(&call_id) {
             let same = c_matches(&call.socket, socket)
-                && call.invite_branch.as_deref() == Some(branch.as_str());
+                && call.invite_branch.as_deref() == Some(branch.as_str())
+                && call.pbx_addr == from;
             return match call.last_2xx().clone() {
                 Some((_, ok)) if same => InviteDisposition::Retransmission(ok),
                 _ => InviteDisposition::Merged,
             };
         }
-        match self.uas.replay(socket, invite) {
-            Some(resp) => InviteDisposition::Retransmission(resp),
+        match self.uas.replay_with_dest(socket, invite) {
+            Some((resp, dest)) if dest == from => InviteDisposition::Retransmission(resp),
+            Some(_) => InviteDisposition::Merged,
             None => InviteDisposition::New,
         }
     }
