@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize push notification clients
     let push_manager = Arc::new(push::PushManager::new(&config.push)?);
+    push_manager.spawn_credential_refresh();
 
     // Initialize call handoff manager
     let handoff = Arc::new(handoff::HandoffManager::new());

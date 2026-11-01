@@ -57,6 +57,8 @@ sequenceDiagram
     GW->>PBX: 100 Trying
 
     GW->>Push: VoIP push notification
+    Push-->>GW: accepted
+    GW->>PBX: 180 Ringing (caller hears ringback)
     Push->>App: Wake up (call_token, caller info)
 
     App->>GW: GET /v1/calls/{token}
@@ -67,6 +69,40 @@ sequenceDiagram
 
     Note over PBX,App: RTP flows directly<br/>between PBX and App
 ```
+
+### Incoming call responses
+
+The PBX's INVITE is answered without waiting on anything slow:
+
+- **100 Trying** at once, before any lookup.
+- **180 Ringing** as soon as APNs/FCM accept the push, so the caller hears
+  ringback while the app wakes, not silence. It has no SDP (the app's answer
+  doesn't exist yet), so the PBX plays its own ringback.
+- **200 OK** with the app's SDP when the app accepts.
+
+The 180 and every final response (200, 480, 487, 603) carry the same To tag,
+so the PBX sees a single early dialog that the 200 confirms.
+
+If the push can't be delivered, the INVITE gets **480 Temporarily
+Unavailable** immediately, with a `Reason: SIP;cause=480;text="..."` header
+saying why: `No push device registered`, `Push provider not configured`,
+`Unsupported device platform`, `Push credentials unavailable`,
+`Push rejected by provider` or `Push provider unreachable`. A push request
+that takes longer than 5 s counts as unreachable. An app that doesn't
+answer within 30 s gets `App did not answer the push`. There is no
+fallback: the call fails.
+
+The push runs alongside the SIP receive loop, so INVITE retransmissions and
+CANCEL are answered while it is in flight. A retransmission (same Call-ID,
+top Via branch and source address as the INVITE being handled) gets the
+latest response again (100, 180, 200 or the final) and doesn't push the
+device a second time. The same branch from another address gets 482.
+
+Provider connections stay open between pushes (HTTP/2 keep-alive), and the
+APNs JWT and FCM access token are renewed in the background well before
+they expire. A push doesn't normally pay for a new connection or a round
+trip to Google's token endpoint; the first push after startup still opens
+the connection.
 
 ## Quick Start
 
