@@ -92,6 +92,12 @@ impl SourcePolicy {
         }
     }
 
+    /// Replace the resolved IPs: every target of the registrar, so a call
+    /// sent by whichever PBX node holds the user's binding is accepted.
+    pub fn set_ips(&mut self, ips: impl IntoIterator<Item = IpAddr>) {
+        self.ips = ips.into_iter().map(|ip| ip.to_canonical()).collect();
+    }
+
     /// Accept SIP from this IP too (tests only).
     #[cfg(test)]
     pub fn add_ip(&mut self, ip: IpAddr) {
@@ -122,6 +128,21 @@ mod tests {
         assert!(!p.admits(addr("127.0.0.1:5060")));
         // IPv4-mapped IPv6 sources are the same address.
         assert!(p.admits(addr("[::ffff:203.0.113.7]:5060")));
+    }
+
+    #[test]
+    fn set_ips_trusts_every_target_and_drops_removed_ones() {
+        let mut p = SourcePolicy::new(["203.0.113.7".parse().unwrap()], Arc::default());
+        assert!(!p.admits(addr("203.0.113.8:5060")));
+        p.set_ips([
+            "203.0.113.7".parse().unwrap(),
+            "203.0.113.8".parse().unwrap(),
+        ]);
+        assert!(p.admits(addr("203.0.113.7:5060")));
+        assert!(p.admits(addr("203.0.113.8:5060")));
+        p.set_ips(["203.0.113.8".parse().unwrap()]);
+        assert!(!p.admits(addr("203.0.113.7:5060")));
+        assert!(p.admits(addr("203.0.113.8:5060")));
     }
 
     #[test]

@@ -124,6 +124,71 @@ pub fn extract_display_name(msg: &str) -> Option<String> {
     rsip::sip_parser::extract_display_name_from_value(&extract_header(msg, "From")?)
 }
 
+/// The `reg-id` of the gateway's one flow per user (RFC 5626 section 4.2).
+pub const REG_ID: u32 = 1;
+
+/// A stable RFC 5626 `+sip.instance` URN for `user@domain`: the same user
+/// gets the same instance ID across restarts, re-registrations and
+/// failovers, so a registrar replaces the binding instead of adding one.
+/// (A name-based UUID: FNV-1a 128 over the address of record, with the
+/// version and variant bits set.)
+pub fn instance_urn(username: &str, domain: &str) -> String {
+    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for b in format!("aria-gateway:{username}@{domain}").bytes() {
+        h ^= u128::from(b);
+        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    h = (h & !(0xf << 76)) | (8 << 76); // version 8 (custom)
+    h = (h & !(0x3 << 62)) | (0x2 << 62); // RFC 4122 variant
+    format!("urn:uuid:{}", uuid::Uuid::from_u128(h))
+}
+
+/// The Contact header value of a REGISTER: the gateway's address with its
+/// RFC 5626 `+sip.instance` and `reg-id`.
+pub fn register_contact(
+    username: &str,
+    local_ip: &str,
+    local_port: u16,
+    transport: &str,
+    instance: &str,
+) -> String {
+    format!(
+        "<sip:{username}@{local_ip}:{local_port};transport={transport}>;+sip.instance=\"<{instance}>\";reg-id={REG_ID}"
+    )
+}
+
+/// Build an OPTIONS ping to `target` for the health check.
+pub fn build_options(
+    target: &str,
+    username: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    call_id: &str,
+    cseq: u32,
+) -> String {
+    let branch = generate_branch();
+    let tag = generate_tag();
+    format!(
+        "OPTIONS sip:{target} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {local_ip}:{local_port};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{username}@{domain}>;tag={tag}\r\n\
+         To: <sip:{target}>\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} OPTIONS\r\n\
+         User-Agent: Aria-Gateway/0.1.0\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+}
+
+/// Seconds from a `Retry-After` header (`30`, `30 (maintenance)`).
+pub fn retry_after_secs(msg: &str) -> Option<u64> {
+    let v = extract_header(msg, "Retry-After")?;
+    let digits: String = v.trim().chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Build a REGISTER request.
 #[allow(clippy::too_many_arguments)]
 pub fn build_register(
@@ -138,9 +203,11 @@ pub fn build_register(
     from_tag: &str,
     auth_header: Option<&str>,
     expires: u32,
+    instance: &str,
 ) -> String {
     let branch = generate_branch();
     let tp = transport.to_uppercase();
+    let contact = register_contact(username, local_ip, local_port, transport, instance);
 
     let mut msg = format!(
         "REGISTER sip:{registrar} SIP/2.0\r\n\
@@ -150,8 +217,9 @@ pub fn build_register(
          To: <sip:{username}@{domain}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{username}@{local_ip}:{local_port};transport={transport}>\r\n\
+         Contact: {contact}\r\n\
          Expires: {expires}\r\n\
+         Supported: outbound, path\r\n\
          Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, NOTIFY\r\n\
          User-Agent: Aria-Gateway/0.1.0\r\n",
     );
@@ -418,6 +486,52 @@ pub fn build_cancel(invite: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_contact_carries_instance_and_reg_id() {
+        let inst = instance_urn("1001", "pbx.example.com");
+        let c = register_contact("1001", "10.0.0.5", 5070, "udp", &inst);
+        assert_eq!(
+            c,
+            format!("<sip:1001@10.0.0.5:5070;transport=udp>;+sip.instance=\"<{inst}>\";reg-id=1")
+        );
+        let msg = build_register(
+            "1001",
+            "pbx.example.com",
+            "pbx.example.com",
+            "10.0.0.5",
+            5070,
+            "udp",
+            "cid",
+            1,
+            "tag",
+            None,
+            3600,
+            &inst,
+        );
+        assert!(msg.contains(&format!("Contact: {c}\r\n")));
+        assert!(msg.contains("Supported: outbound, path\r\n"));
+    }
+
+    #[test]
+    fn instance_urn_is_stable_per_user_and_a_valid_uuid() {
+        let a = instance_urn("1001", "pbx.example.com");
+        assert_eq!(a, instance_urn("1001", "pbx.example.com"));
+        assert_ne!(a, instance_urn("1002", "pbx.example.com"));
+        assert_ne!(a, instance_urn("1001", "other.example.com"));
+        let uuid = uuid::Uuid::parse_str(a.strip_prefix("urn:uuid:").unwrap()).unwrap();
+        assert_eq!(uuid.get_version_num(), 8);
+        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn retry_after_is_parsed() {
+        let r = |v: &str| retry_after_secs(&format!("SIP/2.0 503 X\r\nRetry-After: {v}\r\n\r\n"));
+        assert_eq!(r("30"), Some(30));
+        assert_eq!(r("120 (maintenance)"), Some(120));
+        assert_eq!(r("Fri, 01 Jan 2027 00:00:00 GMT"), None);
+        assert_eq!(retry_after_secs("SIP/2.0 503 X\r\n\r\n"), None);
+    }
 
     const INVITE_VIA_RR: &str = "INVITE sip:1001@10.0.0.2 SIP/2.0\r\n\
         Via: SIP/2.0/UDP edge.example.com;branch=z9hG4bK-a, SIP/2.0/UDP core;branch=z9hG4bK-b\r\n\

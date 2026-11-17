@@ -12,6 +12,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
 use super::digest::DigestAuth;
+use super::failover::{Action, Event, Machine};
 use super::message;
 use super::resolver::SrvResolver;
 use super::trust::{SourcePolicy, TrustedSources};
@@ -66,11 +67,19 @@ pub struct ProxyRegistration {
     stop: tokio::sync::watch::Sender<bool>,
     /// An Expires: 0 REGISTER is in progress; no new calls are offered.
     unregistering: bool,
-    /// Bumped on every successful REGISTER so only the latest refresh
-    /// timer fires.
-    refresh_generation: u64,
     /// When to refresh after a successful REGISTER.
     refresh_after: Duration,
+    /// Which SRV target the registration is on and when to move it; `None`
+    /// for an outgoing call's stand-in registration.
+    failover: Option<Machine>,
+    /// Looks the registrar up again when its SRV TTL runs out.
+    resolver: Option<Arc<SrvResolver>>,
+    /// Where lookups report back to the supervisor.
+    lookups: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// RFC 5626 `+sip.instance` URN, stable for this user.
+    instance: String,
+    /// CSeq for health-check OPTIONS pings.
+    options_cseq: u32,
 }
 
 /// Re-register at 80% of the 3600 s binding.
@@ -152,8 +161,12 @@ impl ProxyRegistration {
             handoff,
             stop: tokio::sync::watch::channel(false).0,
             unregistering: false,
-            refresh_generation: 0,
             refresh_after: REFRESH_AFTER,
+            failover: None,
+            resolver: None,
+            lookups: None,
+            instance: message::instance_urn("1001", domain),
+            options_cseq: 0,
         }
     }
 }
@@ -365,10 +378,18 @@ impl SipProxyManager {
             .resolver
             .resolve(&registrar, config.port, &config.transport)
             .await?;
-        let server_addr = resolved
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("Failed to resolve {}", registrar))?
-            .addr;
+        anyhow::ensure!(
+            !resolved.servers.is_empty(),
+            "Failed to resolve {registrar}"
+        );
+        let started = std::time::Instant::now();
+        let (machine, start_actions) = Machine::start(
+            resolved.servers.clone(),
+            resolved.ttl,
+            self.refresh_after,
+            started,
+        );
+        let server_addr = machine.current();
 
         // Bind UDP socket
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -383,12 +404,17 @@ impl SipProxyManager {
         let call_id = message::generate_call_id();
         let from_tag = format!("{:08x}", rand::random::<u32>());
 
+        let instance = message::instance_urn(&config.username, &config.domain);
+        let (lookups_tx, lookups_rx) = tokio::sync::mpsc::unbounded_channel();
         let reg = Arc::new(RwLock::new(ProxyRegistration {
             device_id: device_id.clone(),
             config,
             socket: socket.clone(),
             server_addr,
-            peers: SourcePolicy::new(resolved.iter().map(|r| r.addr.ip()), self.trusted.clone()),
+            peers: SourcePolicy::new(
+                resolved.servers.iter().map(|r| r.addr.ip()),
+                self.trusted.clone(),
+            ),
             local_addr,
             call_id,
             from_tag,
@@ -399,8 +425,12 @@ impl SipProxyManager {
             handoff,
             stop: tokio::sync::watch::channel(false).0,
             unregistering: false,
-            refresh_generation: 0,
             refresh_after: self.refresh_after,
+            failover: Some(machine),
+            resolver: Some(self.resolver.clone()),
+            lookups: Some(lookups_tx),
+            instance,
+            options_cseq: 0,
         }));
 
         // Store registration, retiring any previous one for this device
@@ -415,8 +445,11 @@ impl SipProxyManager {
             Self::retire(&previous).await;
         }
 
-        // Send initial REGISTER
-        Self::send_register(&reg).await?;
+        // Initial REGISTER (and the trust list) as the machine asks.
+        if Self::execute(&reg, start_actions).await {
+            Self::drive(&reg, Event::SocketError).await;
+        }
+        Self::spawn_supervisor(reg.clone(), lookups_rx);
 
         // Spawn receive loop for this device
         let reg_clone = reg.clone();
@@ -484,19 +517,11 @@ impl SipProxyManager {
                             }
                             tracing::error!(
                                 device = %device_id_clone,
-                                "Too many consecutive socket errors — attempting re-registration"
+                                "Too many consecutive socket errors — failing over"
                             );
-                            // Try to re-register after a delay
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            if let Err(e) = Self::send_register(&reg_clone).await {
-                                tracing::error!(
-                                    device = %device_id_clone,
-                                    "Re-registration after socket errors failed: {}",
-                                    e
-                                );
-                                break;
-                            }
                             consecutive_errors = 0;
+                            Self::drive(&reg_clone, Event::SocketError).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
@@ -571,6 +596,7 @@ impl SipProxyManager {
                 &r.from_tag,
                 None,
                 r.expires(),
+                &r.instance,
             );
             (msg, r.server_addr, r.socket.clone())
         };
@@ -578,6 +604,152 @@ impl SipProxyManager {
         socket.send_to(msg.as_bytes(), server_addr).await?;
         tracing::debug!("Sent REGISTER to {}", server_addr);
         Ok(())
+    }
+
+    /// Feed `event` to the registration's failover machine and carry out
+    /// what it asks (a send that fails is a socket error in turn).
+    async fn drive(reg: &Arc<RwLock<ProxyRegistration>>, event: Event) {
+        let mut events = vec![event];
+        let mut rounds = 0;
+        while let Some(event) = events.pop() {
+            rounds += 1;
+            if rounds > 8 {
+                break;
+            }
+            let actions = {
+                let mut r = reg.write().await;
+                if r.unregistering || *r.stop.borrow() {
+                    return;
+                }
+                match r.failover.as_mut() {
+                    Some(m) => m.handle(event, std::time::Instant::now()),
+                    None => return,
+                }
+            };
+            if Self::execute(reg, actions).await {
+                events.push(Event::SocketError);
+            }
+        }
+    }
+
+    /// Carry out failover actions; true if a send failed.
+    async fn execute(reg: &Arc<RwLock<ProxyRegistration>>, actions: Vec<Action>) -> bool {
+        let mut send_failed = false;
+        for action in actions {
+            match action {
+                Action::Register(to) => {
+                    let (device_id, moved) = {
+                        let mut r = reg.write().await;
+                        let moved = r.server_addr != to;
+                        r.server_addr = to;
+                        r.auth_attempts = 0;
+                        r.state = ProxyState::Registering;
+                        (r.device_id.clone(), moved)
+                    };
+                    if moved {
+                        // The route to the new target may leave from another
+                        // interface.
+                        if let Some(ip) = Self::local_ip_towards(to).await {
+                            let mut r = reg.write().await;
+                            r.local_addr.set_ip(ip);
+                        }
+                    }
+                    if let Err(e) = Self::send_register(reg).await {
+                        tracing::error!(device = %device_id, target = %to, "REGISTER send failed: {e}");
+                        send_failed = true;
+                    }
+                }
+                Action::Options(to) => {
+                    let (msg, socket) = {
+                        let mut r = reg.write().await;
+                        r.options_cseq += 1;
+                        let msg = message::build_options(
+                            &to.to_string(),
+                            &r.config.username,
+                            &r.config.domain,
+                            &r.local_addr.ip().to_string(),
+                            r.local_addr.port(),
+                            &format!("gwping-{}", r.call_id),
+                            r.options_cseq,
+                        );
+                        (msg, r.socket.clone())
+                    };
+                    if let Err(e) = socket.send_to(msg.as_bytes(), to).await {
+                        tracing::debug!(target = %to, "OPTIONS send failed: {e}");
+                        // Only the current target's health depends on it; a
+                        // failed probe of another just times out.
+                        let current = reg.read().await.server_addr;
+                        send_failed |= current == to;
+                    }
+                }
+                Action::Resolve => {
+                    let (resolver, lookups, registrar, port, transport) = {
+                        let r = reg.read().await;
+                        (
+                            r.resolver.clone(),
+                            r.lookups.clone(),
+                            r.config.effective_registrar().to_string(),
+                            r.config.port,
+                            r.config.transport.clone(),
+                        )
+                    };
+                    if let (Some(resolver), Some(lookups)) = (resolver, lookups) {
+                        tokio::spawn(async move {
+                            let event = match resolver.resolve(&registrar, port, &transport).await {
+                                Ok(found) => Event::Resolved(found.servers, found.ttl),
+                                Err(e) => {
+                                    tracing::warn!(%registrar, "SRV re-resolution failed: {e}");
+                                    Event::ResolveFailed
+                                }
+                            };
+                            let _ = lookups.send(event);
+                        });
+                    }
+                }
+                Action::Trust(ips) => {
+                    let mut r = reg.write().await;
+                    r.peers.set_ips(ips);
+                }
+                Action::Moved { from, to } => {
+                    let r = reg.read().await;
+                    tracing::warn!(device = %r.device_id, %from, %to, "Registrar changed — re-registering");
+                }
+            }
+        }
+        send_failed
+    }
+
+    /// The local address the OS would use to reach `target`.
+    async fn local_ip_towards(target: SocketAddr) -> Option<std::net::IpAddr> {
+        let probe = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        probe.connect(target).await.ok()?;
+        Some(probe.local_addr().ok()?.ip())
+    }
+
+    /// Ticks the registration's failover machine: refreshes, the
+    /// no-response timeout, health checks, failback probes and SRV
+    /// re-resolution. Ends with the registration.
+    fn spawn_supervisor(
+        reg: Arc<RwLock<ProxyRegistration>>,
+        mut lookups: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) {
+        tokio::spawn(async move {
+            let (mut stop, period) = {
+                let r = reg.read().await;
+                (
+                    r.stop.subscribe(),
+                    (r.refresh_after / 4).clamp(Duration::from_millis(20), Duration::from_secs(1)),
+                )
+            };
+            loop {
+                let event = tokio::select! {
+                    _ = tokio::time::sleep(period) => Event::Tick,
+                    Some(found) = lookups.recv() => found,
+                    _ = stop.wait_for(|stopped| *stopped) => return,
+                };
+                Self::drive(&reg, event).await;
+            }
+        });
     }
 
     async fn send_unregister(reg: &Arc<RwLock<ProxyRegistration>>) -> anyhow::Result<()> {
@@ -609,7 +781,7 @@ impl SipProxyManager {
         if message::is_request(text) {
             Self::handle_request(reg, text, from).await
         } else {
-            Self::handle_response(reg, text).await
+            Self::handle_response(reg, text, from).await
         }
     }
 
@@ -835,6 +1007,7 @@ impl SipProxyManager {
     async fn handle_response(
         reg: &Arc<RwLock<ProxyRegistration>>,
         text: &str,
+        from: SocketAddr,
     ) -> anyhow::Result<()> {
         let status = match message::parse_status_code(text) {
             Some(s) => s,
@@ -845,6 +1018,13 @@ impl SipProxyManager {
 
         match method.as_str() {
             "REGISTER" => Self::handle_register_response(reg, text, status).await,
+            // Any final answer to a health-check ping proves the PBX is up.
+            "OPTIONS" => {
+                if status >= 200 {
+                    Self::drive(reg, Event::OptionsResponse { from }).await;
+                }
+                Ok(())
+            }
             "BYE" | "REFER" => {
                 let (handoff, socket) = {
                     let r = reg.read().await;
@@ -874,30 +1054,10 @@ impl SipProxyManager {
                     return Ok(());
                 }
                 r.state = ProxyState::Registered;
-                tracing::info!(device = %r.device_id, "Proxy registration successful");
-
-                // Schedule re-registration before expiry. Only the latest
-                // timer fires, and none once the registration is retired.
-                r.refresh_generation += 1;
-                let generation = r.refresh_generation;
-                let after = r.refresh_after;
-                let mut stop = r.stop.subscribe();
-                let reg_clone = reg.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(after) => {}
-                        _ = stop.wait_for(|stopped| *stopped) => return,
-                    }
-                    let current = {
-                        let r = reg_clone.read().await;
-                        r.refresh_generation == generation && !r.unregistering && !*r.stop.borrow()
-                    };
-                    if current {
-                        if let Err(e) = Self::send_register(&reg_clone).await {
-                            tracing::error!("Re-registration failed: {}", e);
-                        }
-                    }
-                });
+                tracing::info!(device = %r.device_id, server = %r.server_addr, "Proxy registration successful");
+                drop(r);
+                // The machine schedules the refresh.
+                Self::drive(reg, Event::RegisterOk).await;
             }
             401 | 407 => {
                 let (auth_header, server_addr, socket) = {
@@ -908,6 +1068,15 @@ impl SipProxyManager {
                         r.state =
                             ProxyState::Error("Authentication failed — check credentials".into());
                         tracing::error!(device = %r.device_id, "Too many auth attempts");
+                        drop(r);
+                        Self::drive(
+                            reg,
+                            Event::RegisterResponse {
+                                status,
+                                retry_after: None,
+                            },
+                        )
+                        .await;
                         return Ok(());
                     }
 
@@ -955,18 +1124,33 @@ impl SipProxyManager {
                         &r.from_tag,
                         Some(&auth.to_header()),
                         r.expires(),
+                        &r.instance,
                     );
 
                     (msg, r.server_addr, r.socket.clone())
                 };
 
+                Self::drive(reg, Event::RegisterChallenged).await;
                 socket.send_to(auth_header.as_bytes(), server_addr).await?;
                 tracing::debug!("Sent authenticated REGISTER");
             }
             _ if status >= 400 => {
-                let mut r = reg.write().await;
-                r.state = ProxyState::Error(format!("Registration failed: {}", status));
-                tracing::error!(device = %r.device_id, status, "Registration failed");
+                {
+                    let mut r = reg.write().await;
+                    r.state = ProxyState::Error(format!("Registration failed: {}", status));
+                    tracing::error!(device = %r.device_id, status, server = %r.server_addr, "Registration failed");
+                }
+                // 408 and 5xx (503 with its Retry-After) move the
+                // registration to the next target; other refusals end the cycle.
+                let retry_after = message::retry_after_secs(text).map(Duration::from_secs);
+                Self::drive(
+                    reg,
+                    Event::RegisterResponse {
+                        status,
+                        retry_after,
+                    },
+                )
+                .await;
             }
             _ => {}
         }
@@ -1014,6 +1198,7 @@ impl SipProxyManager {
             .resolve(&registrar, account.port, &account.transport)
             .await?;
         let server_addr = resolved
+            .servers
             .first()
             .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", registrar))?
             .addr;
@@ -1042,7 +1227,10 @@ impl SipProxyManager {
             owner_user_id: owner_user_id.to_string(),
             handoff,
             ring_timeout: self.ring_timeout,
-            sources: SourcePolicy::new(resolved.iter().map(|r| r.addr.ip()), self.trusted.clone()),
+            sources: SourcePolicy::new(
+                resolved.servers.iter().map(|r| r.addr.ip()),
+                self.trusted.clone(),
+            ),
         };
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -1088,8 +1276,12 @@ impl SipProxyManager {
             handoff: handoff.clone(),
             stop: tokio::sync::watch::channel(false).0,
             unregistering: false,
-            refresh_generation: 0,
             refresh_after: REFRESH_AFTER,
+            failover: None,
+            resolver: None,
+            lookups: None,
+            instance: message::instance_urn(&account.username, &account.domain),
+            options_cseq: 0,
         }));
         let ended = handoff
             .register_active_call(
@@ -2034,6 +2226,31 @@ Content-Length: 0\r\n\r\n";
             To: <sip:1001@y>\r\nCall-ID: o1\r\nCSeq: 1 OPTIONS\r\n\r\n";
         pbx.send_to(opts.as_bytes(), gw).await.unwrap();
         nothing_arrives(&pbx).await;
+    }
+
+    #[tokio::test]
+    async fn register_carries_rfc5626_instance_and_supported() {
+        let mgr = SipProxyManager::new();
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mgr.register_device(
+            "dev1".into(),
+            account(&pbx),
+            Arc::new(PushManager::new_noop()),
+            Arc::new(HandoffManager::new()),
+        )
+        .await
+        .unwrap();
+        let (register, _) = recv_from(&pbx).await;
+        let instance = message::instance_urn("1001", "pbx.example.com");
+        let contact = message::extract_header(&register, "Contact").unwrap();
+        assert!(
+            contact.ends_with(&format!(";+sip.instance=\"<{instance}>\";reg-id=1")),
+            "{contact}"
+        );
+        assert_eq!(
+            message::extract_header(&register, "Supported").as_deref(),
+            Some("outbound, path")
+        );
     }
 
     #[tokio::test]
