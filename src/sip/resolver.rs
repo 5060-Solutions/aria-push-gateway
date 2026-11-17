@@ -153,7 +153,7 @@ impl SrvResolver {
     }
 
     /// Resolve SRV records and return every target (every address of every
-    /// SRV host), ordered by priority then weighted at random.
+    /// SRV host), ordered by priority (weights are applied per registration).
     async fn resolve_srv(&self, srv_name: &str) -> anyhow::Result<Resolution> {
         let lookup = self.resolver.srv_lookup(srv_name).await?;
 
@@ -203,7 +203,10 @@ impl SrvResolver {
             }
         }
 
-        let servers = order_targets(servers, rand::random::<f64>);
+        // Cached and returned by priority only: each registration does its
+        // own RFC 2782 weighted shuffle (`failover::Rng`), so a shared
+        // cache does not send every user to the same target.
+        servers.sort_by_key(|s| s.priority);
         let ttl = Duration::from_secs(u64::from(min_ttl.max(30)));
         if !servers.is_empty() {
             let mut cache = self.cache.write().await;

@@ -76,6 +76,8 @@ pub struct ProxyRegistration {
     resolver: Option<Arc<SrvResolver>>,
     /// Where lookups report back to the supervisor.
     lookups: Option<tokio::sync::mpsc::UnboundedSender<Event>>,
+    /// See [`SipProxyManager::with_local_targets`].
+    allow_local_targets: bool,
     /// RFC 5626 `+sip.instance` URN, stable for this user.
     instance: String,
     /// CSeq for health-check OPTIONS pings.
@@ -165,6 +167,7 @@ impl ProxyRegistration {
             failover: None,
             resolver: None,
             lookups: None,
+            allow_local_targets: false,
             instance: message::instance_urn("1001", domain),
             options_cseq: 0,
         }
@@ -270,6 +273,9 @@ pub struct SipProxyManager {
     refresh_after: Duration,
     /// Operator allowlist of SIP sources (`TRUSTED_SIP_SOURCES`).
     trusted: Arc<TrustedSources>,
+    /// Trust resolved registrar addresses that are loopback, private,
+    /// link-local, ... (local development only; `SIP_ALLOW_LOCAL_TARGETS`).
+    allow_local_targets: bool,
 }
 
 impl SipProxyManager {
@@ -283,7 +289,15 @@ impl SipProxyManager {
             ring_timeout: super::outgoing::RING_TIMEOUT,
             refresh_after: REFRESH_AFTER,
             trusted: Arc::default(),
+            // Tests run against loopback PBX stand-ins.
+            allow_local_targets: cfg!(test),
         }
+    }
+
+    /// Trust non-public resolved registrar addresses (local development).
+    pub fn with_local_targets(mut self, allow: bool) -> Self {
+        self.allow_local_targets = allow;
+        self
     }
 
     /// Also accept SIP from these IPs/CIDRs on every socket.
@@ -388,6 +402,7 @@ impl SipProxyManager {
             resolved.ttl,
             self.refresh_after,
             started,
+            super::failover::Rng::seeded(rand::random()),
         );
         let server_addr = machine.current();
 
@@ -412,7 +427,10 @@ impl SipProxyManager {
             socket: socket.clone(),
             server_addr,
             peers: SourcePolicy::new(
-                resolved.servers.iter().map(|r| r.addr.ip()),
+                super::trust::trustable_targets(
+                    machine.servers().iter().map(|r| r.addr.ip()),
+                    self.allow_local_targets,
+                ),
                 self.trusted.clone(),
             ),
             local_addr,
@@ -427,6 +445,7 @@ impl SipProxyManager {
             unregistering: false,
             refresh_after: self.refresh_after,
             failover: Some(machine),
+            allow_local_targets: self.allow_local_targets,
             resolver: Some(self.resolver.clone()),
             lookups: Some(lookups_tx),
             instance,
@@ -708,7 +727,12 @@ impl SipProxyManager {
                 }
                 Action::Trust(ips) => {
                     let mut r = reg.write().await;
-                    r.peers.set_ips(ips);
+                    let allow = r.allow_local_targets;
+                    r.peers.set_ips(super::trust::trustable_targets(ips, allow));
+                }
+                Action::HealthCheckFailed(target) => {
+                    let r = reg.read().await;
+                    tracing::warn!(device = %r.device_id, %target, "Registrar missed its health checks; only target, refreshing instead of failing over");
                 }
                 Action::Moved { from, to } => {
                     let r = reg.read().await;
@@ -1228,7 +1252,10 @@ impl SipProxyManager {
             handoff,
             ring_timeout: self.ring_timeout,
             sources: SourcePolicy::new(
-                resolved.servers.iter().map(|r| r.addr.ip()),
+                super::trust::trustable_targets(
+                    resolved.servers.iter().map(|r| r.addr.ip()),
+                    self.allow_local_targets,
+                ),
                 self.trusted.clone(),
             ),
         };
@@ -1280,6 +1307,7 @@ impl SipProxyManager {
             failover: None,
             resolver: None,
             lookups: None,
+            allow_local_targets: false,
             instance: message::instance_urn(&account.username, &account.domain),
             options_cseq: 0,
         }));
@@ -2221,6 +2249,26 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(mgr.get_status("dev1").await, None);
 
         // The receive loop is gone: nothing answers on the old socket.
+        let opts = "OPTIONS sip:1001@127.0.0.1 SIP/2.0\r\n\
+            Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-o\r\nFrom: <sip:x@y>;tag=1\r\n\
+            To: <sip:1001@y>\r\nCall-ID: o1\r\nCSeq: 1 OPTIONS\r\n\r\n";
+        pbx.send_to(opts.as_bytes(), gw).await.unwrap();
+        nothing_arrives(&pbx).await;
+    }
+
+    #[tokio::test]
+    async fn a_registrar_resolving_to_loopback_is_not_trusted_by_default() {
+        let mgr = SipProxyManager::new().with_local_targets(false);
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mgr.register_device(
+            "dev1".into(),
+            account(&pbx),
+            Arc::new(PushManager::new_noop()),
+            Arc::new(HandoffManager::new()),
+        )
+        .await
+        .unwrap();
+        let (_, gw) = recv_from(&pbx).await;
         let opts = "OPTIONS sip:1001@127.0.0.1 SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-o\r\nFrom: <sip:x@y>;tag=1\r\n\
             To: <sip:1001@y>\r\nCall-ID: o1\r\nCSeq: 1 OPTIONS\r\n\r\n";

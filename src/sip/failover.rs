@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use super::resolver::ResolvedServer;
+use super::resolver::{order_targets, ResolvedServer};
 
 /// How long a REGISTER may go unanswered before the target counts as down.
 pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(8);
@@ -34,8 +34,18 @@ pub const OPTIONS_MISSES: u32 = 2;
 pub const OPTIONS_INTERVAL: Duration = Duration::from_secs(30);
 /// Time between probes of a higher-priority target while on a lower one.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-/// How long a failed target is avoided when it gave no `Retry-After`.
+/// How long a failed target is avoided when it gave no `Retry-After`; also
+/// the first step of the backoff once every target has failed.
 pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+/// Shortest cooldown, whatever `Retry-After` says (it must not make us
+/// hammer a struggling registrar).
+pub const MIN_COOLDOWN: Duration = Duration::from_secs(5);
+/// Random extra delay, as a fraction of a timer, so that registrations do
+/// not fail over, probe or re-resolve in lockstep.
+pub const JITTER: f64 = 0.25;
+/// How long a removed SRV target keeps being trusted (a BYE or re-INVITE
+/// for a dialog set up through it may still come from there).
+pub const REMOVED_TARGET_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
 /// Upper bound on a `Retry-After` we honour.
 pub const MAX_COOLDOWN: Duration = Duration::from_secs(300);
 /// Pause before looking a name up again after a failed lookup.
@@ -46,6 +56,55 @@ pub const RESOLVE_RETRY: Duration = Duration::from_secs(30);
 /// this registration itself (bad credentials, forbidden, ...).
 pub fn is_failover_status(status: u16) -> bool {
     status == 408 || (500..600).contains(&status)
+}
+
+/// A small xorshift generator; `None` is "no randomness": no jitter and the
+/// target order as given (for deterministic tests).
+#[derive(Debug, Clone, Copy)]
+pub struct Rng(Option<u64>);
+
+impl Rng {
+    pub fn seeded(seed: u64) -> Self {
+        // splitmix64, so that small or similar seeds give unrelated streams.
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Self(Some((z ^ (z >> 31)) | 1))
+    }
+
+    #[cfg(test)]
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Uniform in `[0, 1)`; 0 without a seed.
+    fn next(&mut self) -> f64 {
+        let Some(x) = self.0.as_mut() else { return 0.0 };
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// `d` plus 0-25%.
+    fn jitter(&mut self, d: Duration) -> Duration {
+        d + d.mul_f64(JITTER * self.next())
+    }
+
+    /// `d` minus 0-25% (for refreshes, which must stay before expiry).
+    fn jitter_down(&mut self, d: Duration) -> Duration {
+        d - d.mul_f64(JITTER * self.next())
+    }
+
+    fn order(&mut self, servers: Vec<ResolvedServer>) -> Vec<ResolvedServer> {
+        if self.0.is_none() {
+            let mut servers = servers;
+            servers.sort_by_key(|s| s.priority);
+            servers
+        } else {
+            order_targets(servers, || self.next())
+        }
+    }
 }
 
 /// Something that happened to the registration.
@@ -84,8 +143,12 @@ pub enum Action {
     Options(SocketAddr),
     /// Look the registrar up again and feed back `Resolved`/`ResolveFailed`.
     Resolve,
-    /// Accept SIP from exactly these IPs (plus the operator allowlist).
+    /// Accept SIP from exactly these IPs (plus the operator allowlist): every
+    /// resolved target of the registrar and recently removed ones.
     Trust(Vec<IpAddr>),
+    /// The only target missed its health checks; a normal refresh follows
+    /// instead of a teardown (for logs).
+    HealthCheckFailed(SocketAddr),
     /// The registration moved (for logs and status).
     Moved { from: SocketAddr, to: SocketAddr },
 }
@@ -120,6 +183,11 @@ pub struct Machine {
     probe_next: Instant,
     /// A final answer other than success or failover ended the cycle.
     halted: bool,
+    rng: Rng,
+    /// Consecutive failures with no healthy target left to move to.
+    exhausted: u32,
+    /// Targets that left the SRV set, trusted until the instant.
+    removed: HashMap<IpAddr, Instant>,
 }
 
 impl Machine {
@@ -132,8 +200,11 @@ impl Machine {
         ttl: Duration,
         refresh_after: Duration,
         now: Instant,
+        mut rng: Rng,
     ) -> (Self, Vec<Action>) {
+        let servers = rng.order(servers);
         let current = servers.first().expect("at least one target").addr;
+        let ttl = rng.jitter(ttl);
         let m = Self {
             servers,
             current,
@@ -153,6 +224,9 @@ impl Machine {
             probe: None,
             probe_next: now,
             halted: false,
+            rng,
+            exhausted: 0,
+            removed: HashMap::new(),
         };
         let actions = vec![m.trust_all(), Action::Register(current)];
         (m, actions)
@@ -170,14 +244,13 @@ impl Machine {
     }
 
     /// The ordered target list.
-    #[cfg(test)]
     pub fn servers(&self) -> &[ResolvedServer] {
         &self.servers
     }
 
     fn trust_all(&self) -> Action {
         let mut ips: Vec<IpAddr> = self.servers.iter().map(|s| s.addr.ip()).collect();
-        ips.push(self.current.ip());
+        ips.extend(self.removed.keys());
         ips.sort();
         ips.dedup();
         Action::Trust(ips)
@@ -221,10 +294,27 @@ impl Machine {
 
     /// Mark `current` down and move to the next target.
     fn fail(&mut self, now: Instant, retry_after: Option<Duration>, out: &mut Vec<Action>) {
-        let cooldown = retry_after
-            .unwrap_or(DEFAULT_COOLDOWN)
-            .clamp(Duration::from_secs(1), MAX_COOLDOWN);
         let from = self.current;
+        // With nowhere healthy to go, back off exponentially (30 s, 60 s,
+        // ... up to 5 min) however short the registrar's own hint.
+        let alternative = self
+            .servers
+            .iter()
+            .any(|s| s.addr != from && self.cooled_down(s.addr, now));
+        let mut cooldown = retry_after
+            .unwrap_or(DEFAULT_COOLDOWN)
+            .clamp(MIN_COOLDOWN, MAX_COOLDOWN);
+        if !alternative {
+            self.exhausted = (self.exhausted + 1).min(16);
+        }
+        if self.exhausted > 0 {
+            let backoff = DEFAULT_COOLDOWN.saturating_mul(1 << (self.exhausted - 1));
+            cooldown = cooldown.max(backoff.min(MAX_COOLDOWN));
+        }
+        let cooldown = self
+            .rng
+            .jitter(cooldown)
+            .min(MAX_COOLDOWN + MAX_COOLDOWN / 4);
         self.cooldown.insert(from, now + cooldown);
         let to = self.next_target(now);
         self.move_to(from, to, now, out);
@@ -264,11 +354,12 @@ impl Machine {
                 self.register_at = None;
                 self.halted = false;
                 self.registered = true;
-                self.refresh_at = now + self.refresh_after;
+                self.exhausted = 0;
+                self.refresh_at = now + self.rng.jitter_down(self.refresh_after);
                 self.options_pending = None;
                 self.options_missed = 0;
-                self.options_next = now + OPTIONS_INTERVAL;
-                self.probe_next = now + PROBE_INTERVAL;
+                self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
+                self.probe_next = now + self.rng.jitter(PROBE_INTERVAL);
             }
             Event::RegisterChallenged => {
                 if self.register_pending.is_some() {
@@ -292,7 +383,7 @@ impl Machine {
             Event::Resolved(servers, ttl) => self.on_resolved(servers, ttl, now, &mut out),
             Event::ResolveFailed => {
                 self.resolving = false;
-                self.resolve_retry_at = Some(now + RESOLVE_RETRY);
+                self.resolve_retry_at = Some(now + self.rng.jitter(RESOLVE_RETRY));
             }
         }
         out
@@ -324,11 +415,24 @@ impl Machine {
         self.resolving = false;
         self.resolve_retry_at = None;
         if servers.is_empty() {
-            self.resolve_retry_at = Some(now + RESOLVE_RETRY);
+            self.resolve_retry_at = Some(now + self.rng.jitter(RESOLVE_RETRY));
             return;
         }
         self.resolved_at = now;
-        self.ttl = ttl;
+        self.ttl = self.rng.jitter(ttl);
+        let servers = self.rng.order(servers);
+        // A target that left the set may still send for dialogs it set up:
+        // keep trusting its IP for a grace period.
+        for gone in self.servers.iter().map(|s| s.addr.ip()) {
+            if !servers.iter().any(|s| s.addr.ip() == gone) {
+                self.removed
+                    .entry(gone)
+                    .or_insert(now + REMOVED_TARGET_GRACE);
+            }
+        }
+        for s in &servers {
+            self.removed.remove(&s.addr.ip());
+        }
         self.servers = servers;
         let live: Vec<SocketAddr> = self.servers.iter().map(|s| s.addr).collect();
         self.cooldown.retain(|a, _| live.contains(a));
@@ -349,6 +453,11 @@ impl Machine {
     }
 
     fn tick(&mut self, now: Instant, out: &mut Vec<Action>) {
+        let before = self.removed.len();
+        self.removed.retain(|_, until| *until > now);
+        if self.removed.len() != before {
+            out.push(self.trust_all());
+        }
         if self.halted {
             self.tick_resolution(now, out);
             return;
@@ -389,6 +498,17 @@ impl Machine {
                 self.options_pending = None;
                 self.options_missed += 1;
                 if self.options_missed >= OPTIONS_MISSES {
+                    if self.servers.len() <= 1 {
+                        // Nowhere to fail over to, and tearing the
+                        // registration down would only lose the binding:
+                        // note it and refresh normally; the REGISTER's own
+                        // timeout decides.
+                        self.options_missed = 0;
+                        self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
+                        self.refresh_at = now;
+                        out.push(Action::HealthCheckFailed(self.current));
+                        return;
+                    }
                     self.fail(now, None, out);
                     return;
                 }
@@ -398,7 +518,7 @@ impl Machine {
         }
         if self.options_pending.is_none() && now >= self.options_next {
             self.options_pending = Some(now);
-            self.options_next = now + OPTIONS_INTERVAL;
+            self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
             out.push(Action::Options(self.current));
         }
     }
@@ -407,7 +527,8 @@ impl Machine {
         if let Some((candidate, sent)) = self.probe {
             if now.duration_since(sent) >= OPTIONS_TIMEOUT {
                 self.probe = None;
-                self.cooldown.insert(candidate, now + DEFAULT_COOLDOWN);
+                let wait = self.rng.jitter(DEFAULT_COOLDOWN);
+                self.cooldown.insert(candidate, now + wait);
             }
             return;
         }
@@ -416,7 +537,7 @@ impl Machine {
         }
         if let Some(candidate) = self.failback_candidate(now) {
             self.probe = Some((candidate, now));
-            self.probe_next = now + PROBE_INTERVAL;
+            self.probe_next = now + self.rng.jitter(PROBE_INTERVAL);
             out.push(Action::Options(candidate));
         }
     }
@@ -520,7 +641,7 @@ mod tests {
                             next.extend(m.handle(ev, now));
                         }
                         Action::Trust(ips) => self.trust = ips,
-                        Action::Moved { .. } => {}
+                        Action::Moved { .. } | Action::HealthCheckFailed(_) => {}
                     }
                 }
                 queue = next;
@@ -546,6 +667,7 @@ mod tests {
             TTL,
             REFRESH,
             now,
+            Rng::none(),
         );
         net.deliver(&mut m, actions, now);
         (m, net, now)
@@ -585,7 +707,8 @@ mod tests {
         let now = Instant::now();
         let mut net = Net::new(&[A, B]);
         net.set_up(A, false);
-        let (mut m, actions) = Machine::start(vec![srv(A, 10), srv(B, 10)], TTL, REFRESH, now);
+        let (mut m, actions) =
+            Machine::start(vec![srv(A, 10), srv(B, 10)], TTL, REFRESH, now, Rng::none());
         net.deliver(&mut m, actions, now);
         assert!(!m.is_registered());
         tick(&mut m, &mut net, now + REGISTER_TIMEOUT);
@@ -801,9 +924,17 @@ mod tests {
         let ips: Vec<IpAddr> = vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
         assert_eq!(net.trust, ips);
 
-        // The set changes: C appears, B leaves. The list follows.
+        // The set changes: C appears, B leaves. The list follows; B is still
+        // trusted for the grace period.
         net.resolution = Some((vec![srv(A, 10), srv(C, 10)], TTL));
         tick(&mut m, &mut net, now + TTL);
+        let ips: Vec<IpAddr> = vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.3".parse().unwrap(),
+        ];
+        assert_eq!(net.trust, ips);
+        tick(&mut m, &mut net, now + TTL + REMOVED_TARGET_GRACE);
         let ips: Vec<IpAddr> = vec!["10.0.0.1".parse().unwrap(), "10.0.0.3".parse().unwrap()];
         assert_eq!(net.trust, ips);
         assert_eq!(m.current(), a(A), "still on A: no re-registration needed");
@@ -834,6 +965,155 @@ mod tests {
         assert!(!net.sent.contains(&Action::Resolve));
         tick(&mut m, &mut net, now + TTL + RESOLVE_RETRY);
         assert!(net.sent.contains(&Action::Resolve));
+    }
+
+    #[test]
+    fn retry_after_has_a_five_second_floor() {
+        let (mut m, mut net, now) = setup(&[(A, 10), (B, 10)]);
+        let actions = m.handle(
+            Event::RegisterResponse {
+                status: 503,
+                retry_after: Some(Duration::from_secs(0)),
+            },
+            now,
+        );
+        net.deliver(&mut m, actions, now);
+        assert_eq!(m.current(), a(B));
+        // B fails; A (503, Retry-After 0) must not be retried before 5 s.
+        let actions = m.handle(Event::SocketError, now + Duration::from_secs(1));
+        net.deliver(&mut m, actions, now + Duration::from_secs(1));
+        let regs = net.registers().len();
+        tick(&mut m, &mut net, now + Duration::from_secs(4));
+        assert_eq!(net.registers().len(), regs, "A is held for at least 5 s");
+    }
+
+    #[test]
+    fn backs_off_exponentially_once_every_target_failed_up_to_five_minutes() {
+        let (mut m, mut net, now) = setup(&[(A, 10)]);
+        net.register_status.insert(a(A), (500, None));
+        let mut t = now;
+        let mut gaps = Vec::new();
+        let actions = m.handle(Event::SocketError, t);
+        net.deliver(&mut m, actions, t);
+        for _ in 0..7 {
+            let sent = net.registers().len();
+            let mut waited = Duration::ZERO;
+            while net.registers().len() == sent {
+                waited += Duration::from_secs(1);
+                tick(&mut m, &mut net, t + waited);
+                assert!(waited <= Duration::from_secs(301));
+            }
+            gaps.push(waited.as_secs());
+            t += waited;
+        }
+        assert_eq!(gaps, [30, 60, 120, 240, 300, 300, 300]);
+    }
+
+    #[test]
+    fn a_successful_register_ends_the_backoff() {
+        let (mut m, mut net, now) = setup(&[(A, 10)]);
+        for _ in 0..3 {
+            let actions = m.handle(Event::SocketError, now);
+            net.deliver(&mut m, actions, now);
+        }
+        let actions = m.handle(Event::RegisterOk, now);
+        net.deliver(&mut m, actions, now);
+        let actions = m.handle(Event::SocketError, now);
+        net.deliver(&mut m, actions, now);
+        tick(&mut m, &mut net, now + DEFAULT_COOLDOWN);
+        assert!(m.is_registered(), "back to the first step: 30 s");
+    }
+
+    #[test]
+    fn a_single_target_survives_missed_pings_and_just_refreshes() {
+        let (mut m, mut net, now) = setup(&[(A, 10)]);
+        net.set_up(A, false);
+        let t1 = now + OPTIONS_INTERVAL;
+        tick(&mut m, &mut net, t1);
+        tick(&mut m, &mut net, t1 + OPTIONS_TIMEOUT);
+        tick(&mut m, &mut net, t1 + OPTIONS_TIMEOUT * 2);
+        assert!(net.sent.contains(&Action::HealthCheckFailed(a(A))));
+        assert!(m.is_registered(), "binding kept");
+        let regs = net.registers().len();
+        let t2 = t1 + OPTIONS_TIMEOUT * 2 + Duration::from_secs(1);
+        tick(&mut m, &mut net, t2);
+        assert_eq!(net.registers().len(), regs + 1, "a normal refresh");
+        assert!(m.is_registered(), "still registered while it is out");
+        // Only the refresh REGISTER going unanswered ends the binding.
+        tick(&mut m, &mut net, t2 + REGISTER_TIMEOUT);
+        assert!(!m.is_registered());
+    }
+
+    #[test]
+    fn each_registration_shuffles_the_same_srv_set_differently() {
+        let set = || {
+            vec![
+                srv("10.0.0.1:5060", 10),
+                srv("10.0.0.2:5060", 10),
+                srv("10.0.0.3:5060", 10),
+                srv("10.0.0.4:5060", 20),
+            ]
+        };
+        let mut firsts = std::collections::HashSet::new();
+        for seed in 1..40u64 {
+            let (m, _) = Machine::start(set(), TTL, REFRESH, Instant::now(), Rng::seeded(seed));
+            assert_eq!(m.servers().last().unwrap().priority, 20, "priority first");
+            firsts.insert(m.current());
+        }
+        assert_eq!(firsts.len(), 3, "users spread over the priority-10 targets");
+    }
+
+    #[test]
+    fn jitter_spreads_timers_between_zero_and_a_quarter() {
+        let now = Instant::now();
+        let mut cooldowns = Vec::new();
+        for seed in 1..50u64 {
+            let (mut m, _) = Machine::start(
+                vec![srv(A, 10), srv(B, 10)],
+                TTL,
+                REFRESH,
+                now,
+                Rng::seeded(seed),
+            );
+            let from = m.current();
+            m.handle(Event::SocketError, now);
+            cooldowns.push(m.cooldown[&from].duration_since(now));
+        }
+        let (lo, hi) = (
+            *cooldowns.iter().min().unwrap(),
+            *cooldowns.iter().max().unwrap(),
+        );
+        assert!(lo >= DEFAULT_COOLDOWN, "{lo:?}");
+        assert!(hi <= DEFAULT_COOLDOWN.mul_f64(1.25), "{hi:?}");
+        assert!(
+            hi - lo > Duration::from_secs(3),
+            "not in lockstep: {lo:?}..{hi:?}"
+        );
+    }
+
+    #[test]
+    fn a_removed_target_stays_trusted_until_the_grace_ends() {
+        let (mut m, mut net, now) = setup(&[(A, 10), (B, 10)]);
+        net.resolution = Some((vec![srv(A, 10)], TTL));
+        tick(&mut m, &mut net, now + TTL);
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(net.trust.contains(&b));
+        tick(
+            &mut m,
+            &mut net,
+            now + TTL + REMOVED_TARGET_GRACE - Duration::from_secs(1),
+        );
+        assert!(net.trust.contains(&b));
+        tick(&mut m, &mut net, now + TTL + REMOVED_TARGET_GRACE);
+        assert!(!net.trust.contains(&b));
+    }
+
+    #[test]
+    fn trust_never_names_an_ip_that_is_not_a_resolved_target() {
+        let (m, net, _) = setup(&[(A, 10), (B, 20)]);
+        for ip in &net.trust {
+            assert!(m.servers().iter().any(|s| s.addr.ip() == *ip));
+        }
     }
 
     #[test]
