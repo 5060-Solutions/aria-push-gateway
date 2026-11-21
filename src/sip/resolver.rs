@@ -13,13 +13,58 @@ use hickory_resolver::TokioAsyncResolver;
 use tokio::sync::RwLock;
 
 /// A resolved SIP server endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServer {
     pub addr: SocketAddr,
-    #[allow(dead_code)] // kept for diagnostics; ordering happens at resolve time
     pub priority: u16,
-    #[allow(dead_code)]
     pub weight: u16,
+}
+
+/// The full ordered target list of a lookup and how long it may be used.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub servers: Vec<ResolvedServer>,
+    pub ttl: Duration,
+}
+
+/// Order targets per RFC 2782: ascending priority, and within one priority a
+/// weighted random order (each pick is drawn in proportion to the remaining
+/// weights; weight 0 targets come after the weighted ones, as the RFC asks
+/// for them to be unlikely). `rand` yields uniform values in `[0, 1)`.
+pub fn order_targets(
+    mut servers: Vec<ResolvedServer>,
+    mut rand: impl FnMut() -> f64,
+) -> Vec<ResolvedServer> {
+    servers.sort_by_key(|s| s.priority);
+    let mut ordered = Vec::with_capacity(servers.len());
+    while !servers.is_empty() {
+        let priority = servers[0].priority;
+        let n = servers
+            .iter()
+            .take_while(|s| s.priority == priority)
+            .count();
+        let mut group: Vec<ResolvedServer> = servers.drain(..n).collect();
+        // Zero weights last, so they are only chosen when nothing else is.
+        group.sort_by_key(|s| s.weight == 0);
+        while !group.is_empty() {
+            let total: u32 = group.iter().map(|s| u32::from(s.weight)).sum();
+            let idx = if total == 0 {
+                0
+            } else {
+                let pick = (rand().clamp(0.0, 0.999_999_9) * f64::from(total)) as u32;
+                let mut acc = 0;
+                group
+                    .iter()
+                    .position(|s| {
+                        acc += u32::from(s.weight);
+                        pick < acc
+                    })
+                    .unwrap_or(0)
+            };
+            ordered.push(group.remove(idx));
+        }
+    }
+    ordered
 }
 
 /// Cached SRV resolution result.
@@ -55,14 +100,17 @@ impl SrvResolver {
         domain: &str,
         port: u16,
         transport: &str,
-    ) -> anyhow::Result<Vec<ResolvedServer>> {
+    ) -> anyhow::Result<Resolution> {
         // An IP literal names the server directly; there is nothing to look up.
         if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
-            return Ok(vec![ResolvedServer {
-                addr: SocketAddr::new(ip, port),
-                priority: 0,
-                weight: 0,
-            }]);
+            return Ok(Resolution {
+                servers: vec![ResolvedServer {
+                    addr: SocketAddr::new(ip, port),
+                    priority: 0,
+                    weight: 0,
+                }],
+                ttl: Duration::from_secs(300),
+            });
         }
 
         let srv_name = srv_service_name(domain, transport);
@@ -71,23 +119,26 @@ impl SrvResolver {
         {
             let cache = self.cache.read().await;
             if let Some(entry) = cache.get(&srv_name) {
-                if entry.resolved_at.elapsed() < entry.ttl {
+                if let Some(left) = entry.ttl.checked_sub(entry.resolved_at.elapsed()) {
                     tracing::debug!(domain = %domain, "Using cached SRV resolution ({} servers)", entry.servers.len());
-                    return Ok(entry.servers.clone());
+                    return Ok(Resolution {
+                        servers: entry.servers.clone(),
+                        ttl: left,
+                    });
                 }
             }
         }
 
         // Try SRV lookup
-        match self.resolve_srv(&srv_name, domain, port).await {
-            Ok(servers) if !servers.is_empty() => {
+        match self.resolve_srv(&srv_name).await {
+            Ok(found) if !found.servers.is_empty() => {
                 tracing::info!(
                     domain = %domain,
                     srv = %srv_name,
-                    count = servers.len(),
+                    count = found.servers.len(),
                     "SRV resolution successful"
                 );
-                return Ok(servers);
+                return Ok(found);
             }
             Ok(_) => {
                 tracing::debug!(domain = %domain, "No SRV records found, falling back to A record");
@@ -101,31 +152,30 @@ impl SrvResolver {
         self.resolve_a_record(domain, port).await
     }
 
-    /// Resolve SRV records and return servers ordered by priority then weight.
-    async fn resolve_srv(
-        &self,
-        srv_name: &str,
-        _domain: &str,
-        _default_port: u16,
-    ) -> anyhow::Result<Vec<ResolvedServer>> {
+    /// Resolve SRV records and return every target (every address of every
+    /// SRV host), ordered by priority (weights are applied per registration).
+    async fn resolve_srv(&self, srv_name: &str) -> anyhow::Result<Resolution> {
         let lookup = self.resolver.srv_lookup(srv_name).await?;
 
         let mut srv_records: Vec<&SRV> = lookup.iter().collect();
 
         // Check for "." target which means "service not available"
         if srv_records.len() == 1 && srv_records[0].target().to_string() == "." {
-            return Ok(vec![]);
+            return Ok(Resolution {
+                servers: vec![],
+                ttl: Duration::ZERO,
+            });
         }
-
-        // Sort by priority (ascending), then by weight (descending) within same priority
-        srv_records.sort_by(|a, b| {
-            a.priority()
-                .cmp(&b.priority())
-                .then_with(|| b.weight().cmp(&a.weight()))
-        });
+        // Honour the SRV records' own TTL as well as the addresses'.
+        let mut min_ttl = lookup
+            .as_lookup()
+            .valid_until()
+            .duration_since(Instant::now())
+            .as_secs()
+            .clamp(30, 300) as u32;
+        srv_records.sort_by_key(|r| r.priority());
 
         let mut servers = Vec::new();
-        let mut min_ttl = 300u32; // default 5 min
 
         for record in &srv_records {
             let target = record.target().to_string();
@@ -135,7 +185,7 @@ impl SrvResolver {
             // Resolve the SRV target hostname to IP
             match self.resolver.lookup_ip(target).await {
                 Ok(ips) => {
-                    if let Some(ip) = ips.iter().next() {
+                    for ip in ips.iter() {
                         servers.push(ResolvedServer {
                             addr: SocketAddr::new(ip, port),
                             priority: record.priority(),
@@ -153,9 +203,12 @@ impl SrvResolver {
             }
         }
 
-        // Cache the result
+        // Cached and returned by priority only: each registration does its
+        // own RFC 2782 weighted shuffle (`failover::Rng`), so a shared
+        // cache does not send every user to the same target.
+        servers.sort_by_key(|s| s.priority);
+        let ttl = Duration::from_secs(u64::from(min_ttl.max(30)));
         if !servers.is_empty() {
-            let ttl = Duration::from_secs(min_ttl.max(30) as u64);
             let mut cache = self.cache.write().await;
             cache.insert(
                 srv_name.to_string(),
@@ -167,15 +220,11 @@ impl SrvResolver {
             );
         }
 
-        Ok(servers)
+        Ok(Resolution { servers, ttl })
     }
 
     /// Fallback: resolve domain as A/AAAA record with the given port.
-    async fn resolve_a_record(
-        &self,
-        domain: &str,
-        port: u16,
-    ) -> anyhow::Result<Vec<ResolvedServer>> {
+    async fn resolve_a_record(&self, domain: &str, port: u16) -> anyhow::Result<Resolution> {
         let ips = self.resolver.lookup_ip(domain).await?;
 
         let mut servers = Vec::new();
@@ -210,7 +259,7 @@ impl SrvResolver {
         );
 
         tracing::info!(domain = %domain, count = servers.len(), "A record fallback resolution");
-        Ok(servers)
+        Ok(Resolution { servers, ttl })
     }
 }
 
@@ -239,8 +288,74 @@ mod tests {
             .await
             .expect("an IP literal must not wait on DNS")
             .unwrap();
-            assert_eq!(servers.len(), 1);
-            assert_eq!(servers[0].addr.to_string(), expected);
+            assert_eq!(servers.servers.len(), 1);
+            assert_eq!(servers.servers[0].addr.to_string(), expected);
         }
+    }
+
+    fn srv(addr: &str, priority: u16, weight: u16) -> ResolvedServer {
+        ResolvedServer {
+            addr: addr.parse().unwrap(),
+            priority,
+            weight,
+        }
+    }
+
+    fn addrs(v: &[ResolvedServer]) -> Vec<String> {
+        v.iter().map(|s| s.addr.to_string()).collect()
+    }
+
+    #[test]
+    fn targets_are_ordered_by_priority_first() {
+        let list = vec![
+            srv("10.0.0.3:5060", 20, 100),
+            srv("10.0.0.1:5060", 10, 1),
+            srv("10.0.0.2:5060", 10, 1),
+        ];
+        let out = order_targets(list, || 0.0);
+        assert_eq!(out[2].addr.to_string(), "10.0.0.3:5060");
+        assert_eq!(out[0].priority, 10);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn weights_pick_in_proportion_and_zero_weights_come_last() {
+        let list = || {
+            vec![
+                srv("10.0.0.1:5060", 10, 0),
+                srv("10.0.0.2:5060", 10, 30),
+                srv("10.0.0.3:5060", 10, 70),
+            ]
+        };
+        // Pick below 30/100 chooses the first weighted target, above it the second.
+        let low = order_targets(list(), || 0.1);
+        assert_eq!(
+            addrs(&low),
+            ["10.0.0.2:5060", "10.0.0.3:5060", "10.0.0.1:5060"]
+        );
+        let high = order_targets(list(), || 0.5);
+        assert_eq!(
+            addrs(&high),
+            ["10.0.0.3:5060", "10.0.0.2:5060", "10.0.0.1:5060"]
+        );
+    }
+
+    #[test]
+    fn weighted_order_follows_the_weights_statistically() {
+        let mut first_heavy = 0;
+        let mut seed = 0u32;
+        for _ in 0..1000 {
+            let out = order_targets(
+                vec![srv("10.0.0.1:5060", 1, 90), srv("10.0.0.2:5060", 1, 10)],
+                || {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f64::from(seed >> 8) / f64::from(1u32 << 24)
+                },
+            );
+            if out[0].addr.to_string() == "10.0.0.1:5060" {
+                first_heavy += 1;
+            }
+        }
+        assert!((850..950).contains(&first_heavy), "{first_heavy}");
     }
 }

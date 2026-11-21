@@ -78,7 +78,14 @@ async fn main() -> anyhow::Result<()> {
     if !trusted_sources.is_empty() {
         tracing::info!(?trusted_sources, "Extra trusted SIP sources");
     }
-    let sip_proxy = Arc::new(sip::SipProxyManager::new().with_trusted_sources(trusted_sources));
+    let sip_proxy = Arc::new(
+        sip::SipProxyManager::new()
+            .with_trusted_sources(trusted_sources)
+            .with_local_targets(
+                std::env::var("SIP_ALLOW_LOCAL_TARGETS")
+                    .is_ok_and(|v| matches!(v.as_str(), "1" | "true")),
+            ),
+    );
 
     // Initialize push notification clients
     let push_manager = Arc::new(push::PushManager::new(&config.push)?);

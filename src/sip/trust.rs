@@ -76,6 +76,33 @@ fn in_prefix(ip: IpAddr, net: IpAddr, len: u8) -> bool {
     }
 }
 
+/// Whether SIP from `ip` may be trusted merely because a registrar name
+/// resolved to it. A device chooses its registrar, so a name pointing at
+/// loopback, a private/ULA or link-local address, the unspecified address or
+/// a multicast one must not open the gateway's own network to SIP.
+pub fn is_public_target(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || v4.is_broadcast()),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments()[0];
+            // fc00::/7 unique local, fe80::/10 link local.
+            !((seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// The IPs of resolved registrar targets that may be trusted: all of them
+/// with `allow_local` (local development), else only public ones.
+pub fn trustable_targets(ips: impl IntoIterator<Item = IpAddr>, allow_local: bool) -> Vec<IpAddr> {
+    ips.into_iter()
+        .filter(|ip| allow_local || is_public_target(*ip))
+        .collect()
+}
+
 /// The sources one socket accepts: its peer's resolved IPs plus the
 /// allowlist.
 #[derive(Debug, Default, Clone)]
@@ -90,6 +117,12 @@ impl SourcePolicy {
             ips: ips.into_iter().map(|ip| ip.to_canonical()).collect(),
             allow,
         }
+    }
+
+    /// Replace the resolved IPs: every target of the registrar, so a call
+    /// sent by whichever PBX node holds the user's binding is accepted.
+    pub fn set_ips(&mut self, ips: impl IntoIterator<Item = IpAddr>) {
+        self.ips = ips.into_iter().map(|ip| ip.to_canonical()).collect();
     }
 
     /// Accept SIP from this IP too (tests only).
@@ -122,6 +155,52 @@ mod tests {
         assert!(!p.admits(addr("127.0.0.1:5060")));
         // IPv4-mapped IPv6 sources are the same address.
         assert!(p.admits(addr("[::ffff:203.0.113.7]:5060")));
+    }
+
+    #[test]
+    fn non_public_targets_are_never_trusted_unless_allowed() {
+        let ips = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:10.0.0.1",
+            "203.0.113.7",
+            "2001:db8::1",
+        ]
+        .map(|s| s.parse::<IpAddr>().unwrap());
+        let kept = trustable_targets(ips, false);
+        assert_eq!(
+            kept,
+            vec![
+                "203.0.113.7".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+        assert_eq!(trustable_targets(ips, true).len(), ips.len());
+    }
+
+    #[test]
+    fn set_ips_trusts_every_target_and_drops_removed_ones() {
+        let mut p = SourcePolicy::new(["203.0.113.7".parse().unwrap()], Arc::default());
+        assert!(!p.admits(addr("203.0.113.8:5060")));
+        p.set_ips([
+            "203.0.113.7".parse().unwrap(),
+            "203.0.113.8".parse().unwrap(),
+        ]);
+        assert!(p.admits(addr("203.0.113.7:5060")));
+        assert!(p.admits(addr("203.0.113.8:5060")));
+        p.set_ips(["203.0.113.8".parse().unwrap()]);
+        assert!(!p.admits(addr("203.0.113.7:5060")));
+        assert!(p.admits(addr("203.0.113.8:5060")));
     }
 
     #[test]

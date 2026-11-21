@@ -4,6 +4,7 @@
 //! incoming INVITEs to trigger push notifications.
 
 pub mod digest;
+pub mod failover;
 pub mod message;
 pub mod outgoing;
 pub mod proxy;
