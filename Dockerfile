@@ -1,4 +1,4 @@
-FROM rust:1.94-alpine AS builder
+FROM rust:1.100-alpine AS builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 
@@ -7,7 +7,7 @@ COPY . .
 RUN cargo build --release
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates
 
