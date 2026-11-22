@@ -171,7 +171,7 @@ mod auth {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(b"secret").unwrap(),
         )
         .unwrap();
 
