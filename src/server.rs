@@ -952,7 +952,9 @@ mod tests {
     ) {
         use crate::sip::proxy::ProxyRegistration;
         let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let reg = Arc::new(tokio::sync::RwLock::new(ProxyRegistration::for_test(
             gw,
             "pbx.example.com",

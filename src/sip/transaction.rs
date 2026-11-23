@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use super::transport::SipSocket;
 use tokio::sync::oneshot;
 
 use super::message;
@@ -27,15 +27,19 @@ pub const T2: Duration = Duration::from_secs(4);
 pub const TIMEOUT: Duration = Duration::from_secs(32);
 
 /// Identity of a socket, for "did this arrive where the dialog lives".
-pub fn socket_id(socket: &Arc<UdpSocket>) -> usize {
+pub fn socket_id(socket: &Arc<crate::sip::transport::SipSocket>) -> usize {
     Arc::as_ptr(socket) as *const () as usize
 }
 
 /// Send `msg` to `dest`, then retransmit it with doubling intervals (T1 up
 /// to `cap`) until `done` completes (returns `true`) or `TIMEOUT` passes
 /// (returns `false`). A send error ends the attempt early (`false`).
+///
+/// On a reliable transport (TCP/TLS) the message is sent once: the stream
+/// delivers it, and retransmission timers are for UDP only (RFC 3261
+/// §17.1.1.2, §17.2.1). The wait for `done` and the timeout are the same.
 pub async fn retransmit_until<F: Future>(
-    socket: &UdpSocket,
+    socket: &SipSocket,
     dest: SocketAddr,
     msg: &str,
     cap: Duration,
@@ -44,10 +48,13 @@ pub async fn retransmit_until<F: Future>(
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     let mut interval = T1;
     tokio::pin!(done);
+    let reliable = socket.is_reliable();
+    let mut first = true;
     loop {
-        if socket.send_to(msg.as_bytes(), dest).await.is_err() {
+        if (first || !reliable) && socket.send_to(msg.as_bytes(), dest).await.is_err() {
             return false;
         }
+        first = false;
         let wake = (tokio::time::Instant::now() + interval).min(deadline);
         tokio::select! {
             _ = &mut done => return true,
@@ -76,7 +83,7 @@ pub struct ServerTransactions {
     inner: std::sync::Mutex<Inner>,
 }
 
-fn key(socket: &Arc<UdpSocket>, request: &str) -> Option<ResponseKey> {
+fn key(socket: &Arc<crate::sip::transport::SipSocket>, request: &str) -> Option<ResponseKey> {
     Some((
         socket_id(socket),
         message::extract_via_branch(request)?,
@@ -95,7 +102,7 @@ impl ServerTransactions {
     /// of the request get it again (for 64·T1).
     pub fn remember(
         &self,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         request: &str,
         response: &str,
         dest: SocketAddr,
@@ -113,14 +120,18 @@ impl ServerTransactions {
 
     /// The response previously sent for this exact request (same socket,
     /// branch and method), if it is a retransmission.
-    pub fn replay(&self, socket: &Arc<UdpSocket>, request: &str) -> Option<String> {
+    pub fn replay(
+        &self,
+        socket: &Arc<crate::sip::transport::SipSocket>,
+        request: &str,
+    ) -> Option<String> {
         self.replay_with_dest(socket, request).map(|(r, _)| r)
     }
 
     /// [`Self::replay`], with where the response was sent.
     pub fn replay_with_dest(
         &self,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         request: &str,
     ) -> Option<(String, SocketAddr)> {
         let k = key(socket, request)?;
@@ -133,7 +144,11 @@ impl ServerTransactions {
     }
 
     /// Whether a final response was sent for the INVITE with this branch.
-    pub fn answered_invite(&self, socket: &Arc<UdpSocket>, branch: &str) -> bool {
+    pub fn answered_invite(
+        &self,
+        socket: &Arc<crate::sip::transport::SipSocket>,
+        branch: &str,
+    ) -> bool {
         self.lock().responses.contains_key(&(
             socket_id(socket),
             branch.to_string(),
@@ -143,7 +158,7 @@ impl ServerTransactions {
 
     /// Absorb an ACK for a non-2xx final response; returns whether it
     /// matched one (same socket and INVITE branch).
-    pub fn ack(&self, socket: &Arc<UdpSocket>, ack: &str) -> bool {
+    pub fn ack(&self, socket: &Arc<crate::sip::transport::SipSocket>, ack: &str) -> bool {
         let Some(branch) = message::extract_via_branch(ack) else {
             return false;
         };
@@ -161,7 +176,7 @@ impl ServerTransactions {
     /// arrives or 64·T1 passes.
     pub fn send_final(
         self: &Arc<Self>,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         dest: SocketAddr,
         invite: &str,
         response: String,
@@ -185,10 +200,11 @@ impl ServerTransactions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
 
     #[tokio::test]
     async fn retransmits_until_done_then_stops() {
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = SipSocket::from(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let dest = b.local_addr().unwrap();
@@ -206,8 +222,12 @@ mod tests {
 
     #[tokio::test]
     async fn remembers_responses_per_socket_branch_and_method() {
-        let s1 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let s2 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let s1 = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        let s2 = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let t = ServerTransactions::default();
         let bye = "BYE sip:x SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK-1\r\nCSeq: 2 BYE\r\n\r\n";
         t.remember(

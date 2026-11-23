@@ -126,6 +126,11 @@ pub enum Event {
     },
     /// Sending to, or receiving from, the socket failed.
     SocketError,
+    /// The TCP/TLS flow to the current target broke (closed, reset, or a
+    /// keep-alive pong went missing; RFC 5626 §4.4). Re-register at once on
+    /// a new connection, to the same target; if that cannot be done the
+    /// usual failover follows.
+    FlowFailed,
     /// A response to an OPTIONS ping, from this address.
     OptionsResponse { from: SocketAddr },
     /// A fresh resolution.
@@ -188,6 +193,9 @@ pub struct Machine {
     exhausted: u32,
     /// Targets that left the SRV set, trusted until the instant.
     removed: HashMap<IpAddr, Instant>,
+    /// Every timer is divided by this (1 in production; tests with real
+    /// sockets run the same behaviour faster).
+    speedup: u32,
 }
 
 impl Machine {
@@ -227,9 +235,20 @@ impl Machine {
             rng,
             exhausted: 0,
             removed: HashMap::new(),
+            speedup: 1,
         };
         let actions = vec![m.trust_all(), Action::Register(current)];
         (m, actions)
+    }
+
+    /// Run every timer `speedup` times faster (tests with real sockets).
+    #[cfg(test)]
+    pub fn set_speedup(&mut self, speedup: u32) {
+        self.speedup = speedup.max(1);
+    }
+
+    fn t(&self, d: Duration) -> Duration {
+        d / self.speedup
     }
 
     /// The target the registration is on.
@@ -302,19 +321,21 @@ impl Machine {
             .iter()
             .any(|s| s.addr != from && self.cooled_down(s.addr, now));
         let mut cooldown = retry_after
-            .unwrap_or(DEFAULT_COOLDOWN)
-            .clamp(MIN_COOLDOWN, MAX_COOLDOWN);
+            .unwrap_or(self.t(DEFAULT_COOLDOWN))
+            .clamp(self.t(MIN_COOLDOWN), self.t(MAX_COOLDOWN));
         if !alternative {
             self.exhausted = (self.exhausted + 1).min(16);
         }
         if self.exhausted > 0 {
-            let backoff = DEFAULT_COOLDOWN.saturating_mul(1 << (self.exhausted - 1));
-            cooldown = cooldown.max(backoff.min(MAX_COOLDOWN));
+            let backoff = self
+                .t(DEFAULT_COOLDOWN)
+                .saturating_mul(1 << (self.exhausted - 1));
+            cooldown = cooldown.max(backoff.min(self.t(MAX_COOLDOWN)));
         }
         let cooldown = self
             .rng
             .jitter(cooldown)
-            .min(MAX_COOLDOWN + MAX_COOLDOWN / 4);
+            .min(self.t(MAX_COOLDOWN) + self.t(MAX_COOLDOWN) / 4);
         self.cooldown.insert(from, now + cooldown);
         let to = self.next_target(now);
         self.move_to(from, to, now, out);
@@ -358,8 +379,8 @@ impl Machine {
                 self.refresh_at = now + self.rng.jitter_down(self.refresh_after);
                 self.options_pending = None;
                 self.options_missed = 0;
-                self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
-                self.probe_next = now + self.rng.jitter(PROBE_INTERVAL);
+                self.options_next = now + self.rng.jitter(self.t(OPTIONS_INTERVAL));
+                self.probe_next = now + self.rng.jitter(self.t(PROBE_INTERVAL));
             }
             Event::RegisterChallenged => {
                 if self.register_pending.is_some() {
@@ -379,11 +400,27 @@ impl Machine {
                 }
             }
             Event::SocketError => self.fail(now, None, &mut out),
+            Event::FlowFailed => {
+                if self.halted {
+                    // Nothing to recover: the account was refused.
+                } else if self.register_pending.is_some() && !self.registered {
+                    // The target took the connection but dropped it before
+                    // answering our REGISTER: count it as down.
+                    self.fail(now, None, &mut out);
+                } else if self.register_at.is_none() {
+                    self.registered = false;
+                    self.options_pending = None;
+                    self.options_missed = 0;
+                    self.probe = None;
+                    self.register_pending = Some(now);
+                    out.push(Action::Register(self.current));
+                }
+            }
             Event::OptionsResponse { from } => self.on_options_response(from, now, &mut out),
             Event::Resolved(servers, ttl) => self.on_resolved(servers, ttl, now, &mut out),
             Event::ResolveFailed => {
                 self.resolving = false;
-                self.resolve_retry_at = Some(now + self.rng.jitter(RESOLVE_RETRY));
+                self.resolve_retry_at = Some(now + self.rng.jitter(self.t(RESOLVE_RETRY)));
             }
         }
         out
@@ -415,7 +452,7 @@ impl Machine {
         self.resolving = false;
         self.resolve_retry_at = None;
         if servers.is_empty() {
-            self.resolve_retry_at = Some(now + self.rng.jitter(RESOLVE_RETRY));
+            self.resolve_retry_at = Some(now + self.rng.jitter(self.t(RESOLVE_RETRY)));
             return;
         }
         self.resolved_at = now;
@@ -466,7 +503,7 @@ impl Machine {
         // A REGISTER that was never answered.
         if self
             .register_pending
-            .is_some_and(|sent| now.duration_since(sent) >= REGISTER_TIMEOUT)
+            .is_some_and(|sent| now.duration_since(sent) >= self.t(REGISTER_TIMEOUT))
         {
             self.fail(now, None, out);
             return;
@@ -494,7 +531,7 @@ impl Machine {
 
     fn tick_health(&mut self, now: Instant, out: &mut Vec<Action>) {
         if let Some(sent) = self.options_pending {
-            if now.duration_since(sent) >= OPTIONS_TIMEOUT {
+            if now.duration_since(sent) >= self.t(OPTIONS_TIMEOUT) {
                 self.options_pending = None;
                 self.options_missed += 1;
                 if self.options_missed >= OPTIONS_MISSES {
@@ -504,7 +541,7 @@ impl Machine {
                         // note it and refresh normally; the REGISTER's own
                         // timeout decides.
                         self.options_missed = 0;
-                        self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
+                        self.options_next = now + self.rng.jitter(self.t(OPTIONS_INTERVAL));
                         self.refresh_at = now;
                         out.push(Action::HealthCheckFailed(self.current));
                         return;
@@ -518,16 +555,16 @@ impl Machine {
         }
         if self.options_pending.is_none() && now >= self.options_next {
             self.options_pending = Some(now);
-            self.options_next = now + self.rng.jitter(OPTIONS_INTERVAL);
+            self.options_next = now + self.rng.jitter(self.t(OPTIONS_INTERVAL));
             out.push(Action::Options(self.current));
         }
     }
 
     fn tick_failback(&mut self, now: Instant, out: &mut Vec<Action>) {
         if let Some((candidate, sent)) = self.probe {
-            if now.duration_since(sent) >= OPTIONS_TIMEOUT {
+            if now.duration_since(sent) >= self.t(OPTIONS_TIMEOUT) {
                 self.probe = None;
-                let wait = self.rng.jitter(DEFAULT_COOLDOWN);
+                let wait = self.rng.jitter(self.t(DEFAULT_COOLDOWN));
                 self.cooldown.insert(candidate, now + wait);
             }
             return;
@@ -537,7 +574,7 @@ impl Machine {
         }
         if let Some(candidate) = self.failback_candidate(now) {
             self.probe = Some((candidate, now));
-            self.probe_next = now + self.rng.jitter(PROBE_INTERVAL);
+            self.probe_next = now + self.rng.jitter(self.t(PROBE_INTERVAL));
             out.push(Action::Options(candidate));
         }
     }
@@ -566,6 +603,7 @@ mod tests {
             addr: addr.parse().unwrap(),
             priority,
             weight: 10,
+            host: "pbx.example.com".into(),
         }
     }
 
@@ -1124,5 +1162,31 @@ mod tests {
         assert_eq!(m.current(), a(B));
         assert!(m.is_registered());
         assert_eq!(*net.registers().last().unwrap(), a(B));
+    }
+
+    #[test]
+    fn a_broken_flow_re_registers_at_once_on_the_same_target() {
+        let (mut m, mut net, now) = setup(&[(A, 10), (B, 10)]);
+        let t = now + Duration::from_secs(100);
+        let actions = m.handle(Event::FlowFailed, t);
+        net.deliver(&mut m, actions, t);
+        assert_eq!(m.current(), a(A), "a flow failure is not a failover");
+        assert!(m.is_registered());
+        assert_eq!(net.registers(), vec![a(A), a(A)]);
+    }
+
+    #[test]
+    fn a_flow_that_breaks_before_the_register_is_answered_fails_over() {
+        let (mut m, mut net, now) = setup(&[(A, 10), (B, 10)]);
+        net.set_up(A, false);
+        let t = now + Duration::from_secs(100);
+        let actions = m.handle(Event::FlowFailed, t);
+        net.deliver(&mut m, actions, t);
+        assert_eq!(m.current(), a(A), "first: reconnect and re-register on A");
+        // A accepted the connection, then dropped it before answering.
+        let actions = m.handle(Event::FlowFailed, t);
+        net.deliver(&mut m, actions, t);
+        assert_eq!(m.current(), a(B));
+        assert!(m.is_registered());
     }
 }

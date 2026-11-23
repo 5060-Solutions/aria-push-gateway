@@ -61,7 +61,7 @@ struct PendingCall {
     /// Pre-allocated RTP relay for this call (allocated when INVITE arrives).
     rtp_relay: Option<Arc<RtpRelay>>,
     /// The socket the INVITE arrived on (and its responses leave from).
-    socket: Arc<tokio::net::UdpSocket>,
+    socket: Arc<crate::sip::transport::SipSocket>,
     /// Our To tag for every response to this INVITE.
     local_tag: String,
     /// Top Via branch of the INVITE (identifies its transaction).
@@ -149,7 +149,7 @@ pub struct ActiveCall {
     pub proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
     /// The socket that owns this dialog; in-dialog requests are only
     /// accepted when they arrive on it.
-    socket: Arc<tokio::net::UdpSocket>,
+    socket: Arc<crate::sip::transport::SipSocket>,
     /// Dialog identifiers and routing used for in-dialog requests (BYE, REFER).
     pub dialog: Dialog,
     /// Last CSeq number the gateway used for a request on this dialog.
@@ -187,7 +187,7 @@ impl ActiveCall {
         owner: CallOwner,
         pbx_addr: SocketAddr,
         proxy_reg: Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
-        socket: Arc<tokio::net::UdpSocket>,
+        socket: Arc<crate::sip::transport::SipSocket>,
         dialog: Dialog,
         initial_cseq: u32,
         rtp_relay: Option<Arc<RtpRelay>>,
@@ -216,7 +216,7 @@ impl ActiveCall {
     /// Whether `request` from the PBX belongs to this call's dialog and
     /// arrived on the socket that owns it: same Call-ID, the PBX's tag in
     /// From and ours in To (RFC 3261 §12.2.2).
-    fn owns_request(&self, request: &str, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+    fn owns_request(&self, request: &str, socket: &Arc<crate::sip::transport::SipSocket>) -> bool {
         Arc::ptr_eq(&self.socket, socket)
             && message::extract_header(request, "Call-ID").as_deref()
                 == Some(self.dialog.call_id.as_str())
@@ -344,13 +344,16 @@ fn cseq_number(msg: &str) -> Option<u32> {
 }
 
 /// Whether two handles name the same socket.
-fn c_matches(a: &Arc<tokio::net::UdpSocket>, b: &Arc<tokio::net::UdpSocket>) -> bool {
+fn c_matches(
+    a: &Arc<crate::sip::transport::SipSocket>,
+    b: &Arc<crate::sip::transport::SipSocket>,
+) -> bool {
     Arc::ptr_eq(a, b)
 }
 
 /// Fire-and-forget UDP send from synchronous context (a lock is held).
 fn try_send(
-    socket: &Arc<tokio::net::UdpSocket>,
+    socket: &Arc<crate::sip::transport::SipSocket>,
     msg: &str,
     dest: SocketAddr,
 ) -> std::io::Result<usize> {
@@ -799,7 +802,13 @@ pub fn refer_notify_status(notify: &str) -> Option<u16> {
 /// Outstanding client transactions (REFER, BYE): Via branch -> where the
 /// final response goes, and the socket the request was sent on (the only
 /// one whose responses may complete it).
-type PendingRefers = HashMap<String, (oneshot::Sender<String>, Arc<tokio::net::UdpSocket>)>;
+type PendingRefers = HashMap<
+    String,
+    (
+        oneshot::Sender<String>,
+        Arc<crate::sip::transport::SipSocket>,
+    ),
+>;
 
 fn lock_refers(
     refers: &std::sync::Mutex<PendingRefers>,
@@ -1301,7 +1310,7 @@ impl HandoffManager {
     fn retransmit_2xx(
         self: &Arc<Self>,
         call_id: String,
-        socket: Arc<tokio::net::UdpSocket>,
+        socket: Arc<crate::sip::transport::SipSocket>,
         dest: SocketAddr,
         ok: String,
         ack: oneshot::Receiver<()>,
@@ -1394,7 +1403,11 @@ impl HandoffManager {
     /// Handle an ACK from the PBX: either for a non-2xx final we are
     /// retransmitting (same branch as the INVITE), or for a 2xx on one of
     /// this socket's dialogs (matching CSeq). Returns whether it matched.
-    pub async fn handle_ack(&self, ack: &str, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+    pub async fn handle_ack(
+        &self,
+        ack: &str,
+        socket: &Arc<crate::sip::transport::SipSocket>,
+    ) -> bool {
         if self.uas.ack(socket, ack) {
             return true;
         }
@@ -1423,7 +1436,7 @@ impl HandoffManager {
         &self,
         invite: &str,
         from: SocketAddr,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> InviteDisposition {
         let call_id = message::extract_header(invite, "Call-ID").unwrap_or_default();
         let branch = message::extract_via_branch(invite).unwrap_or_default();
@@ -1469,7 +1482,7 @@ impl HandoffManager {
         self: &Arc<Self>,
         invite: &str,
         from: SocketAddr,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> Option<String> {
         let call_id = message::extract_header(invite, "Call-ID").unwrap_or_default();
         let cseq = cseq_number(invite).unwrap_or(0);
@@ -1522,7 +1535,7 @@ impl HandoffManager {
     pub async fn handle_cancel(
         &self,
         cancel: &str,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> CancelOutcome {
         let call_id = message::extract_header(cancel, "Call-ID").unwrap_or_default();
         let branch = message::extract_via_branch(cancel).unwrap_or_default();
@@ -1573,7 +1586,7 @@ impl HandoffManager {
         &self,
         cancel: &str,
         from: SocketAddr,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> anyhow::Result<()> {
         match self.handle_cancel(cancel, socket).await {
             CancelOutcome::Cancelled {
@@ -1676,7 +1689,7 @@ impl HandoffManager {
         call_id: &str,
         bye_raw: &str,
         from: SocketAddr,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> anyhow::Result<Option<CallOwner>> {
         let call = {
             let mut active = self.active.write().await;
@@ -1896,7 +1909,7 @@ impl HandoffManager {
     /// waits for the first send.
     async fn send_bye(
         &self,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         dest: SocketAddr,
         bye: String,
         branch: String,
@@ -1924,7 +1937,7 @@ impl HandoffManager {
 
     /// Whether a ringing or active call, or an open client transaction,
     /// still uses `socket` (so a retiring registration keeps it open).
-    pub async fn socket_in_use(&self, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+    pub async fn socket_in_use(&self, socket: &Arc<crate::sip::transport::SipSocket>) -> bool {
         self.has_client_transactions(socket)
             || self
                 .pending
@@ -1941,7 +1954,7 @@ impl HandoffManager {
     }
 
     /// Whether a client transaction (BYE/REFER) is still open on `socket`.
-    pub fn has_client_transactions(&self, socket: &Arc<tokio::net::UdpSocket>) -> bool {
+    pub fn has_client_transactions(&self, socket: &Arc<crate::sip::transport::SipSocket>) -> bool {
         lock_refers(&self.pending_refers)
             .values()
             .any(|(_, s)| Arc::ptr_eq(s, socket))
@@ -2316,7 +2329,7 @@ impl HandoffManager {
     pub async fn repeat_reinvite_ack(
         &self,
         response: &str,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         from: SocketAddr,
     ) -> bool {
         let (Some(call_id), Some(cseq)) = (
@@ -2352,7 +2365,7 @@ impl HandoffManager {
     /// RFC 3261 §17.1.2 (UDP), until a final response arrives or we give up.
     async fn refer_transaction(
         &self,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         pbx_addr: SocketAddr,
         refer: &str,
         branch: &str,
@@ -2392,7 +2405,7 @@ impl HandoffManager {
     pub async fn handle_refer_response_on(
         &self,
         response: &str,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> bool {
         let (Some(status), Some(branch)) = (
             message::parse_status_code(response),
@@ -2469,7 +2482,7 @@ impl HandoffManager {
         &self,
         call_id: &str,
         notify: &str,
-        socket: &Arc<tokio::net::UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
     ) -> bool {
         let in_dialog = self
             .active
@@ -3026,8 +3039,12 @@ Content-Length: 0\r\n\r\n";
     async fn refer_final_response_is_delivered_by_branch() {
         let mgr = HandoffManager::new();
         let (tx, rx) = oneshot::channel();
-        let own = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let other = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let own = Arc::new(crate::sip::transport::SipSocket::from(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        let other = Arc::new(crate::sip::transport::SipSocket::from(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         lock_refers(&mgr.pending_refers).insert("z9hG4bK-ref".into(), (tx, own.clone()));
 
         let resp = |status: &str, branch: &str| {
@@ -3090,7 +3107,9 @@ Content-Length: 0\r\n\r\n";
 
         let mgr = Arc::new(mgr);
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
             gw,
             "pbx.example.com",
@@ -3652,7 +3671,9 @@ Content-Length: 0\r\n\r\n";
         for _ in 0..20 {
             let mgr = Arc::new(HandoffManager::new());
             let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let gw = Arc::new(crate::sip::transport::SipSocket::from(
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ));
             let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
                 gw,
                 "pbx.example.com",
@@ -3711,7 +3732,9 @@ Content-Length: 0\r\n\r\n";
         for _ in 0..20 {
             let mgr = Arc::new(HandoffManager::new());
             let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let gw = Arc::new(crate::sip::transport::SipSocket::from(
+                UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ));
             let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
                 gw,
                 "pbx.example.com",
@@ -3760,7 +3783,9 @@ Content-Length: 0\r\n\r\n";
 
         let mgr = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
             gw,
             "pbx.example.com",
@@ -4009,7 +4034,7 @@ Content-Length: 0\r\n\r\n";
 
     fn test_registration(
         mgr: &Arc<HandoffManager>,
-        gw: Arc<tokio::net::UdpSocket>,
+        gw: Arc<crate::sip::transport::SipSocket>,
     ) -> Arc<RwLock<crate::sip::proxy::ProxyRegistration>> {
         Arc::new(RwLock::new(crate::sip::proxy::ProxyRegistration::for_test(
             gw,
@@ -4028,7 +4053,9 @@ Content-Length: 0\r\n\r\n";
     ) -> (String, tokio::net::UdpSocket, SocketAddr, String) {
         use tokio::net::UdpSocket;
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let gw_addr = gw.local_addr().unwrap();
         let token = mgr
             .create_pending_call(
@@ -4072,7 +4099,9 @@ Content-Length: 0\r\n\r\n";
     ) -> (tokio::net::UdpSocket, SocketAddr) {
         use tokio::net::UdpSocket;
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let gw_addr = gw.local_addr().unwrap();
         mgr.register_active_call(
             token.into(),
@@ -4459,7 +4488,9 @@ Content-Length: 0\r\n\r\n";
         let h = attended_harness().await;
         let (_pbx, ringing) = {
             let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let gw = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let gw = Arc::new(crate::sip::transport::SipSocket::from(
+                tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            ));
             let reg = test_registration(&h.mgr, gw);
             let token = h
                 .mgr

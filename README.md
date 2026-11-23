@@ -152,6 +152,61 @@ The gateway starts on `0.0.0.0:8080` by default. Override with `--listen`:
 ./target/release/aria-gateway --listen 0.0.0.0:443
 ```
 
+## Transport to the PBX
+
+A device's `sip_transport` decides how the gateway reaches its registrar:
+
+| `sip_transport` | SRV names asked | Fallback without SRV |
+|---|---|---|
+| `udp` | `_sip._udp.<domain>` | A/AAAA of the domain at `sip_port`, UDP |
+| `tcp` | `_sip._tcp.<domain>` | A/AAAA at `sip_port`, TCP |
+| `tls` | `_sips._tcp.<domain>` | A/AAAA at `sip_port`, TLS |
+| `auto` | `_sips._tcp`, then `_sip._tcp`, then `_sip._udp`; the first one published wins | A/AAAA at `sip_port`, UDP |
+
+TLS is never traded for cleartext. `tls` only asks `_sips._tcp`. `auto` stops at
+`_sips._tcp` once the domain publishes it, even when none of its targets resolve
+(an error, not a fallback). A lookup failure on `_sips._tcp` is an error too.
+The transport is fixed when the registration starts. A later re-resolution asks
+for the same transport, and a TLS handshake failure fails over to the next TLS
+target, never to UDP.
+
+**Certificates.** TLS uses the web PKI roots (webpki-roots). An extra PEM CA
+bundle can be added with `SIP_TLS_CA_FILE`; verification is never disabled. The
+certificate is checked against the SRV target's host name when it is the SIP
+domain or a name under it (`node1.sip.ariaroute.com` for `sip.ariaroute.com`).
+Otherwise it is checked against the domain itself (RFC 5922), so an
+unauthenticated SRV answer cannot point at a host that merely has some valid
+certificate.
+
+**Flows (TCP/TLS).** Each registration holds one connection to the registrar
+it is on, and outgoing calls open their own. Messages are framed by
+`Content-Length`. RFC 3261 retransmission timers (A/E/G, and the 2xx
+retransmission until ACK) run on UDP only. On a stream a request or response is
+written once, and the transaction timeouts stay the same. Each REGISTER carries
+`+sip.instance`, `reg-id` and `Supported: outbound` (RFC 5626). The gateway
+sends a double-CRLF keep-alive every 80-100 % of the registrar's `Flow-Timer`,
+or every 25 s when there is none. If no CRLF pong arrives within 10 s, the flow
+has failed. A flow failure (the connection closed or reset, or a missing pong)
+re-registers at once on a new connection to the same node. If that node refuses
+the connection, or drops it before answering the REGISTER, the registration
+fails over.
+
+**Failover and failback** (unchanged rules, now on every transport). A
+registration moves to the next SRV target on a connect failure, an unanswered
+REGISTER (8 s), 408/5xx (503 `Retry-After` honoured, 5 s–5 min), or two missed
+OPTIONS health checks. From a lower-priority target it probes better ones with
+OPTIONS every ~30 s (on a separate connection for TCP/TLS) and moves back to the
+first one that answers. Targets of *equal* priority are load-shared by weight
+and there is no failback between them. Every timer is jittered by up to 25 %.
+Each device's registration moves on its own, so a node outage moves every
+registration it held without unregistering any device.
+
+**PBX settings** for TLS from the gateway (aria-cloud-pbx `aria-sip-proxy`):
+the gateway opens one stream per device plus one per outgoing call, all from
+the gateway's IP. Raise `SIP_STREAM_MAX_PER_IP` (default 32) above the
+number of devices plus concurrent calls. List the gateway's public IP in
+`PUSH_GATEWAY_SIP_SOURCES` on every node.
+
 ## Docker
 
 Build from the `5060/` parent directory (the gateway depends on the sibling `aria-sip-core` crate):
@@ -237,7 +292,7 @@ Fields that end up in SIP messages are validated, and anything else gets
 - `sip_username`: URI user characters only;
 - `sip_domain` and `sip_registrar`: hostname or IP, no port or parameters;
 - `sip_auth_username`: a user, optionally `user@host`;
-- `sip_transport`: `udp`, `tcp` or `tls`;
+- `sip_transport`: `udp`, `tcp`, `tls` or `auto` (see [Transport to the PBX](#transport-to-the-pbx));
 - `sip_display_name` and `sip_password`: no control characters;
 - `platform`: `ios` or `android`.
 
@@ -465,7 +520,7 @@ re-INVITE only from the release that implements it (see the release notes).
 
 The gateway is designed to be self-hosted. Requirements:
 
-- **Network:** The gateway needs UDP connectivity to your SIP server for REGISTER/INVITE traffic. It also needs outbound HTTPS to APNs/FCM.
+- **Network:** The gateway needs UDP, TCP or TLS connectivity to your SIP server for REGISTER/INVITE traffic (see [Transport to the PBX](#transport-to-the-pbx)). It also needs outbound HTTPS to APNs/FCM.
 - **SIP sources:** A registration accepts SIP only from the IPs its registrar resolves to, and an outgoing call only from the IPs of the server it dialled, on any source port. Anything else is dropped and logged. Spoofed in-dialog requests from an accepted IP are still refused: they must match the dialog's Call-ID and both tags and arrive on the socket that owns the dialog.
   - **Floating IPs and multi-node PBXs:** a PBX bound to `0.0.0.0` behind a floating/reserved IP (e.g. a DigitalOcean reserved IP) sends from the droplet's own address, not the resolved one. A host with several addresses, or several proxy nodes (NOTIFY/MESSAGE from another node), behaves the same way. List those source addresses in `TRUSTED_SIP_SOURCES` (env) or `[sip] trusted_sources` (gateway.toml) as comma-separated IPs/CIDRs, e.g. `TRUSTED_SIP_SOURCES="10.10.0.0/16,203.0.113.7"`. A blank env value falls back to the config, and an invalid entry stops startup. Without this, those deployments drop every incoming call.
 - **Database:** Uses SQLite (no external database needed). The file is created automatically.

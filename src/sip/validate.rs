@@ -45,7 +45,7 @@ pub fn is_valid_host(host: &str) -> bool {
 /// A supported transport name, normalised to lower case.
 pub fn normalize_transport(transport: &str) -> Option<String> {
     let t = transport.to_ascii_lowercase();
-    matches!(t.as_str(), "udp" | "tcp" | "tls").then_some(t)
+    matches!(t.as_str(), "udp" | "tcp" | "tls" | "auto").then_some(t)
 }
 
 /// A display name: printable text without control characters. It is
