@@ -172,6 +172,11 @@ pub struct ActiveCall {
     ack_wait: std::sync::Mutex<Option<(u32, oneshot::Sender<()>)>>,
     /// The latest 2xx we sent to an INVITE on this dialog and its CSeq.
     last_2xx: std::sync::Mutex<Option<(u32, String)>>,
+    /// Set while a media-update re-INVITE of ours is outstanding.
+    reinvite_pending: AtomicBool,
+    /// The ACK of our latest answered re-INVITE and its CSeq, re-sent if
+    /// the PBX repeats its 2xx (our ACK was lost).
+    reinvite_ack: std::sync::Mutex<Option<(u32, String)>>,
     /// Dropped together with the call, which wakes the receiver returned by
     /// [`HandoffManager::register_active_call`] however the call ended.
     _ended: Option<oneshot::Sender<()>>,
@@ -202,6 +207,8 @@ impl ActiveCall {
             invite_branch: None,
             ack_wait: std::sync::Mutex::new(None),
             last_2xx: std::sync::Mutex::new(None),
+            reinvite_pending: AtomicBool::new(false),
+            reinvite_ack: std::sync::Mutex::new(None),
             _ended: None,
         }
     }
@@ -639,6 +646,94 @@ impl TransferTarget {
             Self::Uri(u) => u.clone(),
         }
     }
+}
+
+/// Why a media update (re-INVITE) failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaUpdateError {
+    /// No active call has this token.
+    NotFound,
+    /// The SDP is not a usable audio offer.
+    InvalidSdp(&'static str),
+    /// Another media update (or a relayed call, whose media the gateway
+    /// carries itself) — not now.
+    Conflict,
+    /// The PBX refused the re-INVITE with this status; the call keeps its
+    /// previous media.
+    Rejected(u16),
+    /// No final response from the PBX.
+    Timeout,
+    /// The re-INVITE could not be sent.
+    Send(String),
+}
+
+impl std::fmt::Display for MediaUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no such active call"),
+            Self::InvalidSdp(why) => write!(f, "invalid SDP: {why}"),
+            Self::Conflict => write!(f, "a media update is already in progress"),
+            Self::Rejected(code) => write!(f, "PBX refused the re-INVITE with {code}"),
+            Self::Timeout => write!(f, "no answer to the re-INVITE"),
+            Self::Send(e) => write!(f, "send failed: {e}"),
+        }
+    }
+}
+
+/// Largest SDP accepted for a media update.
+const MAX_MEDIA_SDP: usize = 8 * 1024;
+
+/// Check an SDP offered for a media update: an audio session description
+/// with a connection address, no control characters except line breaks.
+fn validate_media_sdp(sdp: &str) -> Result<(), MediaUpdateError> {
+    if sdp.len() > MAX_MEDIA_SDP {
+        return Err(MediaUpdateError::InvalidSdp("too large"));
+    }
+    if !sdp.starts_with("v=0") {
+        return Err(MediaUpdateError::InvalidSdp("must start with v=0"));
+    }
+    if sdp
+        .chars()
+        .any(|c| c.is_control() && c != '\r' && c != '\n')
+    {
+        return Err(MediaUpdateError::InvalidSdp("control characters"));
+    }
+    if message::extract_sdp_media_address(sdp).is_none() {
+        return Err(MediaUpdateError::InvalidSdp(
+            "no c= address and m=audio port",
+        ));
+    }
+    Ok(())
+}
+
+/// `new` with the `o=` line of `previous`, its session version incremented
+/// (RFC 3264 §8: a modified offer keeps the origin and bumps the version).
+/// `new` is returned with CRLF line ends either way.
+fn next_session_version(previous: &str, new: &str) -> String {
+    let prev_origin = previous
+        .lines()
+        .find(|l| l.starts_with("o="))
+        .map(str::trim_end);
+    let bumped = prev_origin.and_then(|o| {
+        let mut f: Vec<String> = o.split(' ').map(str::to_string).collect();
+        let v: u64 = f.get(2)?.parse().ok()?;
+        f[2] = (v + 1).to_string();
+        Some(f.join(" "))
+    });
+    let mut out = String::with_capacity(new.len() + 16);
+    for line in new.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("o=") {
+            if let Some(o) = &bumped {
+                out.push_str(o);
+                out.push_str("\r\n");
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Why a transfer request failed.
@@ -2081,6 +2176,164 @@ impl HandoffManager {
         result
     }
 
+    /// Move an answered call's media to a new address: send the PBX an
+    /// in-dialog re-INVITE carrying `sdp` (the phone's new offer, e.g. after
+    /// a network change), and return the PBX's SDP answer.
+    ///
+    /// The offer keeps the call's previous `o=` line with the version
+    /// incremented. A 2xx is ACKed (and the ACK repeated if the 2xx is);
+    /// a refusal is ACKed per RFC 3261 §17.1.1.3 and leaves the call up on
+    /// its previous media. Over UDP the INVITE is retransmitted until a
+    /// final response or 8 s; over a stream it is sent once.
+    pub async fn update_media(
+        &self,
+        call_token: &str,
+        sdp: &str,
+    ) -> Result<String, MediaUpdateError> {
+        validate_media_sdp(sdp)?;
+        self.settle_accepts().await;
+        let call_id = self
+            .active_call_id(call_token)
+            .await
+            .ok_or(MediaUpdateError::NotFound)?;
+
+        let (dialog, pbx_addr, proxy_reg, contact, offer, cseq) = {
+            let active = self.active.read().await;
+            let call = active.get(&call_id).ok_or(MediaUpdateError::NotFound)?;
+            if call.rtp_relay.is_some()
+                || call
+                    .reinvite_pending
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return Err(MediaUpdateError::Conflict);
+            }
+            (
+                call.dialog.clone(),
+                call.pbx_addr,
+                call.proxy_reg.clone(),
+                call.contact.clone(),
+                next_session_version(&call.local_sdp, sdp),
+                call.next_cseq(),
+            )
+        };
+        let result = self
+            .run_reinvite(
+                &call_id, &dialog, pbx_addr, &proxy_reg, &contact, &offer, cseq,
+            )
+            .await;
+        if let Some(call) = self.active.read().await.get(&call_id) {
+            call.reinvite_pending.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_reinvite(
+        &self,
+        call_id: &str,
+        dialog: &Dialog,
+        pbx_addr: SocketAddr,
+        proxy_reg: &Arc<RwLock<super::sip::proxy::ProxyRegistration>>,
+        contact: &str,
+        offer: &str,
+        cseq: u32,
+    ) -> Result<String, MediaUpdateError> {
+        let (socket, local_addr) = {
+            let reg = proxy_reg.read().await;
+            (reg.socket.clone(), reg.local_addr)
+        };
+        let branch = message::generate_branch();
+        let contact_header = if contact.is_empty() {
+            String::new()
+        } else {
+            format!("Contact: <{contact}>\r\n")
+        };
+        let head = build_in_dialog_request(
+            "INVITE",
+            dialog,
+            cseq,
+            local_addr,
+            &branch,
+            &format!("{contact_header}Content-Type: application/sdp\r\n"),
+        );
+        let head = head
+            .strip_suffix("Content-Length: 0\r\n\r\n")
+            .unwrap_or(&head);
+        let invite = format!("{head}Content-Length: {}\r\n\r\n{offer}", offer.len());
+
+        let response = self
+            .refer_transaction(&socket, pbx_addr, &invite, &branch)
+            .await
+            .map_err(|e| match e {
+                TransferError::Timeout => MediaUpdateError::Timeout,
+                other => MediaUpdateError::Send(other.to_string()),
+            })?;
+        let status = message::parse_status_code(&response).unwrap_or(500);
+        if !(200..300).contains(&status) {
+            // A non-2xx final response is ACKed in its own transaction.
+            if let Some(ack) = message::build_non2xx_ack(&invite, &response) {
+                let _ = socket.send_to(ack.as_bytes(), pbx_addr).await;
+            }
+            tracing::warn!(call_id = %call_id, status, "PBX refused the media update re-INVITE");
+            return Err(MediaUpdateError::Rejected(status));
+        }
+        let ack = build_in_dialog_request(
+            "ACK",
+            dialog,
+            cseq,
+            local_addr,
+            &message::generate_branch(),
+            "",
+        );
+        let _ = socket.send_to(ack.as_bytes(), pbx_addr).await;
+        let answer = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        if let Some(call) = self.active.write().await.get_mut(call_id) {
+            call.local_sdp = offer.to_string();
+            *call
+                .reinvite_ack
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((cseq, ack));
+        }
+        tracing::info!(call_id = %call_id, "Media update re-INVITE answered");
+        Ok(answer)
+    }
+
+    /// The PBX repeated a 2xx to one of our re-INVITEs (our ACK was lost):
+    /// send the ACK again. Returns whether `response` was such a 2xx.
+    pub async fn repeat_reinvite_ack(
+        &self,
+        response: &str,
+        socket: &Arc<tokio::net::UdpSocket>,
+        from: SocketAddr,
+    ) -> bool {
+        let (Some(call_id), Some(cseq)) = (
+            message::extract_header(response, "Call-ID"),
+            cseq_number(response),
+        ) else {
+            return false;
+        };
+        let ack = {
+            let active = self.active.read().await;
+            let Some(call) = active.get(&call_id) else {
+                return false;
+            };
+            let guard = call
+                .reinvite_ack
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some((c, ack)) if *c == cseq => ack.clone(),
+                _ => return false,
+            }
+        };
+        let _ = socket.send_to(ack.as_bytes(), from).await;
+        true
+    }
+
     /// Allocate the next local CSeq on an active call's dialog.
     async fn next_cseq(&self, call_id: &str) -> Option<u32> {
         self.active.read().await.get(call_id).map(|c| c.next_cseq())
@@ -2131,15 +2384,16 @@ impl HandoffManager {
         &self,
         response: &str,
         socket: &Arc<tokio::net::UdpSocket>,
-    ) {
+    ) -> bool {
         let (Some(status), Some(branch)) = (
             message::parse_status_code(response),
             message::extract_via_branch(response),
         ) else {
-            return;
+            return false;
         };
         if status < 200 {
-            return;
+            // A provisional response for a transaction of ours is ours.
+            return lock_refers(&self.pending_refers).contains_key(&branch);
         }
         let slot = {
             let mut refers = lock_refers(&self.pending_refers);
@@ -2152,8 +2406,12 @@ impl HandoffManager {
                 None => None,
             }
         };
-        if let Some((tx, _)) = slot {
-            let _ = tx.send(response.to_string());
+        match slot {
+            Some((tx, _)) => {
+                let _ = tx.send(response.to_string());
+                true
+            }
+            None => false,
         }
     }
 
@@ -2910,6 +3168,198 @@ Content-Length: 0\r\n\r\n";
             CallStatus::Ended(info) => assert_eq!(info.reason, "transferred"),
             _ => panic!("call should be ended"),
         }
+    }
+
+    fn sdp_at(ip: &str, port: u16, version: u32) -> String {
+        format!(
+            "v=0\r\no=phone 42 {version} IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 0\r\n"
+        )
+    }
+
+    fn answer_to(request: &str, status: &str, body: &str) -> String {
+        format!(
+            "SIP/2.0 {status}\r\n\
+             Via: {}\r\n\
+             From: {}\r\n\
+             To: {}\r\n\
+             Call-ID: {}\r\n\
+             CSeq: {}\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            message::extract_header(request, "Via").unwrap(),
+            message::extract_header(request, "From").unwrap(),
+            message::extract_header(request, "To").unwrap(),
+            message::extract_header(request, "Call-ID").unwrap(),
+            message::extract_header(request, "CSeq").unwrap(),
+            body.len(),
+        )
+    }
+
+    #[tokio::test]
+    async fn media_update_re_invites_the_pbx_with_the_new_address_and_acks() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                mgr.update_media("tok", &sdp_at("198.51.100.7", 40000, 1))
+                    .await
+            })
+        };
+        let invite = recv_text(&pbx).await;
+        assert!(
+            invite.starts_with("INVITE sip:2000@10.0.0.1:5060 SIP/2.0\r\n"),
+            "{invite}"
+        );
+        assert_eq!(
+            message::extract_header(&invite, "CSeq").unwrap(),
+            "3 INVITE"
+        );
+        assert_eq!(
+            message::extract_header(&invite, "Call-ID").unwrap(),
+            "outbound-call-1"
+        );
+        assert!(message::extract_to_tag(&invite).is_some(), "in-dialog");
+        assert_eq!(
+            message::extract_header(&invite, "Content-Type").unwrap(),
+            "application/sdp"
+        );
+        let body = invite.split_once("\r\n\r\n").unwrap().1;
+        assert!(body.contains("c=IN IP4 198.51.100.7\r\n"));
+        assert!(body.contains("m=audio 40000 "));
+        assert_eq!(
+            message::extract_header(&invite, "Content-Length").unwrap(),
+            body.len().to_string()
+        );
+
+        let answer = sdp_at("203.0.113.9", 30000, 2);
+        mgr.handle_refer_response(&answer_to(&invite, "200 OK", &answer))
+            .await;
+        assert_eq!(task.await.unwrap().unwrap(), answer);
+        let ack = recv_text(&pbx).await;
+        assert!(
+            ack.starts_with("ACK sip:2000@10.0.0.1:5060 SIP/2.0\r\n"),
+            "{ack}"
+        );
+        assert_eq!(message::extract_header(&ack, "CSeq").unwrap(), "3 ACK");
+        assert!(mgr.is_call_active("outbound-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_2xx_to_the_re_invite_gets_the_ack_again() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                mgr.update_media("tok", &sdp_at("198.51.100.7", 40000, 1))
+                    .await
+            })
+        };
+        let invite = recv_text(&pbx).await;
+        let ok = answer_to(&invite, "200 OK", &sdp_at("203.0.113.9", 30000, 2));
+        mgr.handle_refer_response(&ok).await;
+        task.await.unwrap().unwrap();
+        let ack = recv_text(&pbx).await;
+        let reg = mgr.active.read().await["outbound-call-1"].proxy_reg.clone();
+        let gw = reg.read().await.socket.clone();
+        let pbx_addr = pbx.local_addr().unwrap();
+        assert!(mgr.repeat_reinvite_ack(&ok, &gw, pbx_addr).await);
+        assert_eq!(recv_text(&pbx).await, ack);
+    }
+
+    #[tokio::test]
+    async fn a_second_media_update_bumps_the_session_version_again() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        for (round, want) in [(0u32, "o=phone 42 6 "), (1, "o=phone 42 7 ")] {
+            let task = {
+                let mgr = mgr.clone();
+                // The phone restarts its own numbering; the gateway keeps
+                // the dialog's origin and increments it.
+                let first = round == 0;
+                tokio::spawn(async move {
+                    let sdp = if first {
+                        sdp_at("198.51.100.7", 40000, 6)
+                    } else {
+                        sdp_at("192.0.2.1", 41000, 1)
+                    };
+                    mgr.update_media("tok", &sdp).await
+                })
+            };
+            let invite = recv_text(&pbx).await;
+            // First: the call's original SDP had no o= line, so the
+            // phone's is used. Then the previous origin, version + 1.
+            assert!(invite.contains(want), "{invite}");
+            mgr.handle_refer_response(&answer_to(&invite, "200 OK", "v=0\r\n"))
+                .await;
+            task.await.unwrap().unwrap();
+            let _ack = recv_text(&pbx).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_media_update_keeps_the_call_and_acks_the_refusal() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                mgr.update_media("tok", &sdp_at("198.51.100.7", 40000, 1))
+                    .await
+            })
+        };
+        let invite = recv_text(&pbx).await;
+        mgr.handle_refer_response(&answer_to(&invite, "488 Not Acceptable Here", ""))
+            .await;
+        assert_eq!(task.await.unwrap(), Err(MediaUpdateError::Rejected(488)));
+        let ack = recv_text(&pbx).await;
+        assert!(ack.starts_with("ACK "), "{ack}");
+        assert_eq!(
+            message::extract_via_branch(&ack),
+            message::extract_via_branch(&invite),
+            "non-2xx ACK is in the INVITE's transaction"
+        );
+        assert!(mgr.is_call_active("outbound-call-1").await);
+    }
+
+    #[tokio::test]
+    async fn media_updates_are_validated_and_need_a_live_call() {
+        let Harness { mgr, .. } = outgoing_call_harness().await;
+        assert!(matches!(
+            mgr.update_media("tok", "not sdp").await,
+            Err(MediaUpdateError::InvalidSdp(_))
+        ));
+        assert!(matches!(
+            mgr.update_media("tok", "v=0\r\ns=-\r\n").await,
+            Err(MediaUpdateError::InvalidSdp(_))
+        ));
+        assert!(matches!(
+            mgr.update_media("tok", &format!("{}a=x:\u{0}\r\n", sdp_at("1.2.3.4", 5, 1)))
+                .await,
+            Err(MediaUpdateError::InvalidSdp(_))
+        ));
+        assert_eq!(
+            mgr.update_media("nope", &sdp_at("1.2.3.4", 5, 1)).await,
+            Err(MediaUpdateError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_media_updates_are_refused() {
+        let Harness { mgr, pbx } = outgoing_call_harness().await;
+        let task = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                mgr.update_media("tok", &sdp_at("198.51.100.7", 40000, 1))
+                    .await
+            })
+        };
+        let invite = recv_text(&pbx).await;
+        assert_eq!(
+            mgr.update_media("tok", &sdp_at("198.51.100.8", 40000, 1))
+                .await,
+            Err(MediaUpdateError::Conflict)
+        );
+        mgr.handle_refer_response(&answer_to(&invite, "200 OK", "v=0\r\n"))
+            .await;
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

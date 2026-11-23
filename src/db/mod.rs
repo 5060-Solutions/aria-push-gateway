@@ -220,26 +220,26 @@ impl Database {
         &self,
         user_id: &str,
         push_token: &str,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<Vec<String>> {
         if push_token.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP \
-             WHERE user_id = ? AND push_token = ? AND active = TRUE",
+             WHERE user_id = ? AND push_token = ? AND active = TRUE RETURNING id",
         )
         .bind(user_id)
         .bind(push_token)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        if rows.rows_affected() > 0 {
+        if !ids.is_empty() {
             tracing::info!(
                 user = %user_id,
-                deactivated = rows.rows_affected(),
+                deactivated = ids.len(),
                 "deactivated old device registrations by push token"
             );
         }
-        Ok(rows.rows_affected())
+        Ok(ids)
     }
 
     /// Deactivate `user_id`'s active devices for a SIP username. Called before
@@ -249,24 +249,24 @@ impl Database {
         &self,
         user_id: &str,
         sip_username: &str,
-    ) -> anyhow::Result<u64> {
-        let rows = sqlx::query(
+    ) -> anyhow::Result<Vec<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE devices SET active = FALSE, updated_at = CURRENT_TIMESTAMP \
-             WHERE user_id = ? AND sip_username = ? AND active = TRUE",
+             WHERE user_id = ? AND sip_username = ? AND active = TRUE RETURNING id",
         )
         .bind(user_id)
         .bind(sip_username)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        if rows.rows_affected() > 0 {
+        if !ids.is_empty() {
             tracing::info!(
                 user = %user_id,
                 sip_user = %sip_username,
-                deactivated = rows.rows_affected(),
+                deactivated = ids.len(),
                 "deactivated old device registrations"
             );
         }
-        Ok(rows.rows_affected())
+        Ok(ids)
     }
 
     /// How many active devices of users other than `user_id` carry this push

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthUser, JwtSecret};
 use crate::db::{Database, DeviceRecord};
-use crate::handoff::{self, AcceptError, CallOwner, HandoffManager, TransferError};
+use crate::handoff::{
+    self, AcceptError, CallOwner, HandoffManager, MediaUpdateError, TransferError,
+};
 use crate::push::PushManager;
 use crate::sip::proxy::{is_valid_client_ref, OriginateRefusal};
 use crate::sip::{validate, SipProxyManager};
@@ -66,6 +68,7 @@ pub fn build_router(
         .route("/v1/calls/{token}/reject", post(reject_call))
         .route("/v1/calls/{token}/hangup", post(hangup_call))
         .route("/v1/calls/{token}/transfer", post(transfer_call))
+        .route("/v1/calls/{token}/media", post(update_media))
         .route("/v1/calls/{token}/status", get(get_call_status))
         // Health check
         .route("/health", get(health_check))
@@ -289,19 +292,36 @@ async fn register_device(
     // several extensions). Only the caller's devices are touched: a matching
     // username or push token on another user's device is left alone, since
     // nothing here proves the caller owns that SIP account or phone.
-    if let Err(e) = state
+    //
+    // Their SIP registrations and push entries end too: a deactivated
+    // device's binding would otherwise keep refreshing next to the new one
+    // (a second binding for the same phone, which the PBX forks to).
+    let mut replaced = Vec::new();
+    match state
         .db
         .deactivate_user_devices_for_sip_user(&record.user_id, &record.sip_username)
         .await
     {
-        tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by SIP user");
+        Ok(ids) => replaced.extend(ids),
+        Err(e) => {
+            tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by SIP user")
+        }
     }
-    if let Err(e) = state
+    match state
         .db
         .deactivate_user_devices_for_token(&record.user_id, &record.push_token)
         .await
     {
-        tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by token");
+        Ok(ids) => replaced.extend(ids),
+        Err(e) => {
+            tracing::warn!(user = %record.user_id, %e, "failed to deactivate old devices by token")
+        }
+    }
+    replaced.sort();
+    replaced.dedup();
+    for old in &replaced {
+        let _ = state.sip_proxy.unregister_device(old).await;
+        state.push_manager.unregister_device(old).await;
     }
     match state
         .db
@@ -744,6 +764,51 @@ async fn transfer_call(
     })?;
 
     Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct UpdateMediaRequest {
+    /// The phone's new SDP offer (its new address after a network change).
+    sdp: String,
+}
+
+#[derive(Serialize)]
+struct UpdateMediaResponse {
+    sdp_answer: String,
+}
+
+/// Move an answered call's media: the gateway re-INVITEs the PBX with the
+/// phone's new SDP and returns the PBX's answer.
+///
+/// 200 with the answer; 400 for an unusable SDP; 404 for an unknown call;
+/// 409 while another media update of the call is in progress; 502 when the
+/// PBX refuses (the call stays up on its previous media); 504 when the PBX
+/// does not answer.
+async fn update_media(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(token): Path<String>,
+    body: Result<Json<UpdateMediaRequest>, JsonRejection>,
+) -> Result<Json<UpdateMediaResponse>, ApiError> {
+    require_call_owner(&state, &auth, &token).await?;
+    let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sdp_answer = state
+        .handoff
+        .update_media(&token, &req.sdp)
+        .await
+        .map_err(|e| {
+            tracing::warn!(token = %token, "Media update failed: {e}");
+            ApiError::from(match e {
+                MediaUpdateError::InvalidSdp(_) => StatusCode::BAD_REQUEST,
+                MediaUpdateError::NotFound => StatusCode::NOT_FOUND,
+                MediaUpdateError::Conflict => StatusCode::CONFLICT,
+                MediaUpdateError::Rejected(_) | MediaUpdateError::Send(_) => {
+                    StatusCode::BAD_GATEWAY
+                }
+                MediaUpdateError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            })
+        })?;
+    Ok(Json(UpdateMediaResponse { sdp_answer }))
 }
 
 #[cfg(test)]
@@ -1298,6 +1363,19 @@ Content-Length: 0\r\n\r\n";
         push_token: &str,
         pbx: &tokio::net::UdpSocket,
     ) -> String {
+        let id = post_device(app, user, sip_username, push_token, pbx).await;
+        assert!(recv_text(pbx).await.starts_with("REGISTER "));
+        id
+    }
+
+    /// `POST /v1/devices` without reading what the PBX receives.
+    async fn post_device(
+        app: &TestApp,
+        user: &str,
+        sip_username: &str,
+        push_token: &str,
+        pbx: &tokio::net::UdpSocket,
+    ) -> String {
         let jwt = auth::create_token(user, JWT_SECRET, 3600).unwrap();
         let body = serde_json::json!({
             "platform": "android",
@@ -1320,7 +1398,6 @@ Content-Length: 0\r\n\r\n";
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{resp}");
-        assert!(recv_text(pbx).await.starts_with("REGISTER "));
         let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
         json["device_id"].as_str().unwrap().to_string()
     }
@@ -1359,6 +1436,83 @@ Content-Length: 0\r\n\r\n";
         assert!(!app.device_active("bob-same-phone").await);
         assert!(app.device_active("bob-other").await);
         assert!(app.device_active(&new_dev).await);
+    }
+
+    #[tokio::test]
+    async fn re_registering_retires_the_old_devices_sip_binding() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The phone registers, then registers again (a new device id, e.g.
+        // after failing back from another gateway instance).
+        let _first = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
+        let mut buf = vec![0u8; 65535];
+        let second = post_device(&app, "bob", "1001", "phone-token", &pbx).await;
+        // The old registration sends its Expires: 0 (the PBX must not keep
+        // two bindings for one phone, which it would fork INVITEs to).
+        let mut saw_unregister = false;
+        for _ in 0..4 {
+            let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), pbx.recv(&mut buf))
+                    .await
+            else {
+                break;
+            };
+            let m = String::from_utf8_lossy(&buf[..n]).to_string();
+            if m.starts_with("REGISTER ")
+                && crate::sip::message::extract_header(&m, "Expires").as_deref() == Some("0")
+            {
+                saw_unregister = true;
+                break;
+            }
+        }
+        assert!(saw_unregister, "the replaced device was not unregistered");
+        assert!(app.device_active(&second).await);
+    }
+
+    #[tokio::test]
+    async fn media_route_is_owner_only_and_maps_errors() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "alice").await;
+        let path = format!("/v1/calls/{token}/media");
+        let (status, _) = app.call(Method::POST, &path, "mallory").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // `{}` carries no SDP: 400.
+        let (status, _) = app.call(Method::POST, &path, "alice").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A usable offer is re-INVITEd and the PBX's answer returned.
+        let jwt = auth::create_token("alice", JWT_SECRET, 3600).unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"sdp": "v=0\r\no=p 1 1 IN IP4 192.0.2.5\r\nc=IN IP4 192.0.2.5\r\nm=audio 4000 RTP/AVP 0\r\n"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let router = app.router.clone();
+        let task = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+        let invite = recv_text(&pbx).await;
+        assert!(invite.starts_with("INVITE "), "{invite}");
+        assert!(invite.contains("c=IN IP4 192.0.2.5"));
+        let answer = "v=0\r\nc=IN IP4 203.0.113.1\r\nm=audio 30000 RTP/AVP 0\r\n";
+        let ok = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nCall-ID: {}\r\nCSeq: {}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{answer}",
+            crate::sip::message::extract_header(&invite, "Via").unwrap(),
+            crate::sip::message::extract_header(&invite, "Call-ID").unwrap(),
+            crate::sip::message::extract_header(&invite, "CSeq").unwrap(),
+            answer.len()
+        );
+        app.handoff.handle_refer_response(&ok).await;
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sdp_answer"], answer);
     }
 
     // ── Outgoing calls ──────────────────────────────────────────────────────

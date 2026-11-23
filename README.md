@@ -244,7 +244,11 @@ Fields that end up in SIP messages are validated, and anything else gets
 The display name is always sent as an escaped quoted string.
 
 Registering a device deactivates the caller's own earlier devices with the
-same `sip_username` or the same `push_token`. It never touches another user's
+same `sip_username` or the same `push_token`, and ends their SIP registrations
+(an `Expires: 0` REGISTER) and push entries. The PBX therefore never holds two
+bindings for one phone, which it would fork incoming calls to. That happens, for
+example, when a phone re-registers after failing back from another gateway
+instance. It never touches another user's
 devices: if another user has an active device with the same push token, both
 registrations are kept and a warning is logged.
 
@@ -280,6 +284,7 @@ re-registration fails.
 | `POST` | `/v1/calls/{token}/reject` | Reject call (sends 603 to PBX) |
 | `POST` | `/v1/calls/{token}/hangup` | Hang up active call (sends BYE to PBX) |
 | `POST` | `/v1/calls/{token}/transfer` | Blind- or attended-transfer an active call (sends REFER to PBX) |
+| `POST` | `/v1/calls/{token}/media` | Move an answered call's media to the phone's new address (re-INVITE; see below) |
 | `GET` | `/v1/calls/{token}/status` | Poll call state: `pending`, `active`, `ended` (with `reason`) or `unknown` |
 
 Offer, accept, reject, hangup and transfer answer `404` when the token is
@@ -426,6 +431,29 @@ Outcome, reported on **both** calls' `/status`:
 - **Abandoned.** If the app hangs up the transferred call while the transfer is
   pending, the consultation call is released with `"transfer":"failed"`,
   `"transfer_code":487`.
+
+### Media update (network change)
+
+`POST /v1/calls/{token}/media` with `{"sdp": "<the phone's new SDP offer>"}`
+moves an answered call's media to a new address, for example after the phone
+switched from Wi-Fi to cellular. The gateway sends the PBX an in-dialog
+re-INVITE carrying the SDP. The `o=` line is the call's previous one with the
+session version incremented (RFC 3264). The answer is
+`200 {"sdp_answer": "<PBX's SDP>"}`.
+
+| Status | Meaning |
+|--------|---------|
+| `200` | The PBX accepted. The call's media is now on the new address |
+| `400` | Missing body, or an SDP that is not `v=0` with a `c=` address and an `m=audio` port, contains control characters, or is over 8 KB |
+| `404` | Unknown token, another user's call, or a call that is not answered |
+| `409` | Another media update of this call is in progress |
+| `502` | The PBX refused (e.g. `488`/`491`; the refusal is ACKed). The call stays up on its previous media |
+| `504` | No final response within 8 s |
+
+The 2xx is ACKed, and the ACK is sent again if the PBX repeats the 2xx. Over UDP
+the INVITE is retransmitted until a final response. The PBX's media relay must
+honour the new address: aria-cloud-pbx re-points the relay leg on such a
+re-INVITE only from the release that implements it (see the release notes).
 
 ### Health
 
