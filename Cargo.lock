@@ -2330,7 +2330,7 @@ dependencies = [
 [[package]]
 name = "rsip-derives"
 version = "0.4.0"
-source = "git+https://github.com/5060-Solutions/5060-sip.git#cd8ad0312f6dd29193591f0b1404649e17811800"
+source = "git+https://github.com/5060-Solutions/5060-sip.git#bfdf737ca2c4ea3244816f5a09ea2c554b7381e7"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -2655,7 +2655,7 @@ dependencies = [
 [[package]]
 name = "sip-5060"
 version = "0.6.0"
-source = "git+https://github.com/5060-Solutions/5060-sip.git#cd8ad0312f6dd29193591f0b1404649e17811800"
+source = "git+https://github.com/5060-Solutions/5060-sip.git#bfdf737ca2c4ea3244816f5a09ea2c554b7381e7"
 dependencies = [
  "bstr",
  "bytes",
