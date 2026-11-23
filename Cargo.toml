@@ -18,7 +18,7 @@ path = "src/main.rs"
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["full"] }
 sip-5060 = { git = "https://github.com/5060-Solutions/5060-sip.git" }
 
 # SIP protocol
-rand = "0.8"
+rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
@@ -47,7 +47,7 @@ jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 subtle = "2"
 
 # Config
-toml = "0.8"
+toml = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Serialization
