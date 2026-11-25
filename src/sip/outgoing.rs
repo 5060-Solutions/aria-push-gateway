@@ -18,7 +18,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -37,7 +36,7 @@ pub type Outcome = anyhow::Result<(String, String)>;
 
 /// Everything the INVITE transaction needs.
 pub struct OutgoingInvite {
-    pub socket: Arc<UdpSocket>,
+    pub socket: Arc<crate::sip::transport::SipSocket>,
     pub server_addr: SocketAddr,
     pub local_addr: SocketAddr,
     pub account: SipAccountConfig,

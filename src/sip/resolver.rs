@@ -1,10 +1,13 @@
 //! DNS SRV resolver for SIP upstream discovery.
 //!
-//! Resolves `_sip._udp.<domain>` (and TCP/TLS variants) to an ordered list of
-//! server addresses, with priority/weight-based ordering and TTL-aware caching.
-//! Falls back to A/AAAA record lookup when no SRV records exist.
+//! Resolves `_sips._tcp.<domain>`, `_sip._tcp.<domain>` or `_sip._udp.<domain>`
+//! (or walks all three for `auto`, never stepping down from a published TLS
+//! service) to an ordered list of server addresses, with priority/weight-based
+//! ordering and TTL-aware caching. Falls back to A/AAAA record lookup when no
+//! SRV records exist.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -12,12 +15,18 @@ use hickory_resolver::proto::rr::rdata::SRV;
 use hickory_resolver::TokioAsyncResolver;
 use tokio::sync::RwLock;
 
+use super::transport::Transport;
+
 /// A resolved SIP server endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServer {
     pub addr: SocketAddr,
     pub priority: u16,
     pub weight: u16,
+    /// The SRV target (or the domain itself for an A/AAAA answer): what a
+    /// TLS certificate is checked against (see
+    /// [`super::transport::tls_server_name`]).
+    pub host: String,
 }
 
 /// The full ordered target list of a lookup and how long it may be used.
@@ -25,6 +34,8 @@ pub struct ResolvedServer {
 pub struct Resolution {
     pub servers: Vec<ResolvedServer>,
     pub ttl: Duration,
+    /// The transport every server in the list is reached over.
+    pub transport: Transport,
 }
 
 /// Order targets per RFC 2782: ascending priority, and within one priority a
@@ -67,17 +78,139 @@ pub fn order_targets(
     ordered
 }
 
+/// The transport a registration asks for: one transport, or `auto`, which
+/// walks `_sips._tcp`, `_sip._tcp`, `_sip._udp` (RFC 3263 §4.1) and uses the
+/// first one the domain publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Wanted {
+    One(Transport),
+    Auto,
+}
+
+impl Wanted {
+    /// From a configured transport name (`udp`, `tcp`, `tls`, `auto`).
+    /// Anything unknown is UDP, as it always was.
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("auto") {
+            Self::Auto
+        } else {
+            Self::One(Transport::parse(s).unwrap_or(Transport::Udp))
+        }
+    }
+
+    /// The SRV names to ask, in order, with the transport each is for.
+    pub fn srv_names(self, domain: &str) -> Vec<(String, Transport)> {
+        let tls = (format!("_sips._tcp.{domain}"), Transport::Tls);
+        let tcp = (format!("_sip._tcp.{domain}"), Transport::Tcp);
+        let udp = (format!("_sip._udp.{domain}"), Transport::Udp);
+        match self {
+            Self::One(Transport::Tls) => vec![tls],
+            Self::One(Transport::Tcp) => vec![tcp],
+            Self::One(Transport::Udp) => vec![udp],
+            Self::Auto => vec![tls, tcp, udp],
+        }
+    }
+
+    /// The transport of an A/AAAA fallback (RFC 3263 §4.1: UDP for `auto`).
+    fn fallback(self) -> Transport {
+        match self {
+            Self::One(t) => t,
+            Self::Auto => Transport::Udp,
+        }
+    }
+}
+
+/// One SRV record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrvRecord {
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub target: String,
+}
+
+/// Answers from a table instead of DNS (tests).
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct StaticDns {
+    pub srv: HashMap<String, Vec<SrvRecord>>,
+    pub hosts: HashMap<String, Vec<IpAddr>>,
+}
+
+enum Backend {
+    Dns(Box<TokioAsyncResolver>),
+    #[cfg(test)]
+    Static(StaticDns),
+}
+
+impl Backend {
+    /// SRV records and their TTL; no records is `Ok(empty)`.
+    async fn srv(&self, name: &str) -> anyhow::Result<(Vec<SrvRecord>, Duration)> {
+        match self {
+            #[cfg(test)]
+            Self::Static(t) => Ok((
+                t.srv.get(name).cloned().unwrap_or_default(),
+                Duration::from_secs(60),
+            )),
+            Self::Dns(r) => {
+                let lookup = match r.srv_lookup(name).await {
+                    Ok(l) => l,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            hickory_resolver::error::ResolveErrorKind::NoRecordsFound { .. }
+                        ) =>
+                    {
+                        return Ok((Vec::new(), Duration::from_secs(30)))
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let ttl = lookup
+                    .as_lookup()
+                    .valid_until()
+                    .saturating_duration_since(Instant::now());
+                let records = lookup
+                    .iter()
+                    .map(|r: &SRV| SrvRecord {
+                        priority: r.priority(),
+                        weight: r.weight(),
+                        port: r.port(),
+                        target: r.target().to_string().trim_end_matches('.').to_string(),
+                    })
+                    .collect();
+                Ok((records, ttl))
+            }
+        }
+    }
+
+    async fn ips(&self, host: &str) -> anyhow::Result<(Vec<IpAddr>, Duration)> {
+        match self {
+            #[cfg(test)]
+            Self::Static(t) => t
+                .hosts
+                .get(host)
+                .cloned()
+                .map(|ips| (ips, Duration::from_secs(60)))
+                .ok_or_else(|| anyhow::anyhow!("NXDOMAIN {host}")),
+            Self::Dns(r) => {
+                let ips = r.lookup_ip(host).await?;
+                let ttl = ips.valid_until().saturating_duration_since(Instant::now());
+                Ok((ips.iter().collect(), ttl))
+            }
+        }
+    }
+}
+
 /// Cached SRV resolution result.
 struct CachedResolution {
-    servers: Vec<ResolvedServer>,
+    resolution: Resolution,
     resolved_at: Instant,
-    ttl: Duration,
 }
 
 /// DNS SRV resolver with TTL-aware caching.
 pub struct SrvResolver {
-    resolver: TokioAsyncResolver,
-    cache: RwLock<std::collections::HashMap<String, CachedResolution>>,
+    backend: Backend,
+    cache: RwLock<HashMap<(String, Wanted), CachedResolution>>,
 }
 
 impl SrvResolver {
@@ -86,191 +219,187 @@ impl SrvResolver {
         let resolver =
             TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Ok(Self {
-            resolver,
-            cache: RwLock::new(std::collections::HashMap::new()),
+            backend: Backend::Dns(Box::new(resolver)),
+            cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// A resolver answering from `table` only.
+    #[cfg(test)]
+    pub fn with_static(table: StaticDns) -> Self {
+        Self {
+            backend: Backend::Static(table),
+            cache: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Resolve a SIP domain to an ordered list of server addresses.
     ///
-    /// Queries `_sip._<transport>.<domain>` for SRV records. Falls back to
-    /// A/AAAA resolution on the domain directly if no SRV records are found.
+    /// `transport` is `udp`, `tcp`, `tls` or `auto` (see [`Wanted`]). SRV
+    /// first; with none published, A/AAAA of the domain at `port`.
+    ///
+    /// TLS is never given up for a cleartext transport: `tls` only asks
+    /// `_sips._tcp`, and `auto` stops at `_sips._tcp` once the domain
+    /// publishes it, even if none of its targets resolve (an error).
     pub async fn resolve(
         &self,
         domain: &str,
         port: u16,
         transport: &str,
     ) -> anyhow::Result<Resolution> {
+        self.resolve_wanted(domain, port, Wanted::parse(transport))
+            .await
+    }
+
+    /// [`Self::resolve`] for a parsed transport.
+    pub async fn resolve_wanted(
+        &self,
+        domain: &str,
+        port: u16,
+        wanted: Wanted,
+    ) -> anyhow::Result<Resolution> {
         // An IP literal names the server directly; there is nothing to look up.
-        if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+        if let Ok(ip) = domain.trim_matches(['[', ']']).parse::<IpAddr>() {
+            let t = wanted.fallback();
             return Ok(Resolution {
                 servers: vec![ResolvedServer {
                     addr: SocketAddr::new(ip, port),
                     priority: 0,
                     weight: 0,
+                    host: domain.to_string(),
                 }],
                 ttl: Duration::from_secs(300),
+                transport: t,
             });
         }
 
-        let srv_name = srv_service_name(domain, transport);
-
-        // Check cache first
+        let key = (domain.to_ascii_lowercase(), wanted);
         {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(&srv_name) {
-                if let Some(left) = entry.ttl.checked_sub(entry.resolved_at.elapsed()) {
-                    tracing::debug!(domain = %domain, "Using cached SRV resolution ({} servers)", entry.servers.len());
-                    return Ok(Resolution {
-                        servers: entry.servers.clone(),
-                        ttl: left,
-                    });
+            if let Some(entry) = cache.get(&key) {
+                if let Some(left) = entry
+                    .resolution
+                    .ttl
+                    .checked_sub(entry.resolved_at.elapsed())
+                {
+                    let mut r = entry.resolution.clone();
+                    r.ttl = left;
+                    return Ok(r);
                 }
             }
         }
 
-        // Try SRV lookup
-        match self.resolve_srv(&srv_name).await {
-            Ok(found) if !found.servers.is_empty() => {
-                tracing::info!(
-                    domain = %domain,
-                    srv = %srv_name,
-                    count = found.servers.len(),
-                    "SRV resolution successful"
-                );
-                return Ok(found);
+        let resolution = match self.resolve_srv(domain, wanted).await? {
+            Some(r) => r,
+            None => {
+                self.resolve_a_record(domain, port, wanted.fallback())
+                    .await?
             }
-            Ok(_) => {
-                tracing::debug!(domain = %domain, "No SRV records found, falling back to A record");
-            }
-            Err(e) => {
-                tracing::debug!(domain = %domain, "SRV lookup failed ({}), falling back to A record", e);
-            }
-        }
-
-        // Fallback to A/AAAA record
-        self.resolve_a_record(domain, port).await
+        };
+        self.cache.write().await.insert(
+            key,
+            CachedResolution {
+                resolution: resolution.clone(),
+                resolved_at: Instant::now(),
+            },
+        );
+        Ok(resolution)
     }
 
-    /// Resolve SRV records and return every target (every address of every
-    /// SRV host), ordered by priority (weights are applied per registration).
-    async fn resolve_srv(&self, srv_name: &str) -> anyhow::Result<Resolution> {
-        let lookup = self.resolver.srv_lookup(srv_name).await?;
-
-        let mut srv_records: Vec<&SRV> = lookup.iter().collect();
-
-        // Check for "." target which means "service not available"
-        if srv_records.len() == 1 && srv_records[0].target().to_string() == "." {
-            return Ok(Resolution {
-                servers: vec![],
-                ttl: Duration::ZERO,
-            });
-        }
-        // Honour the SRV records' own TTL as well as the addresses'.
-        let mut min_ttl = lookup
-            .as_lookup()
-            .valid_until()
-            .duration_since(Instant::now())
-            .as_secs()
-            .clamp(30, 300) as u32;
-        srv_records.sort_by_key(|r| r.priority());
-
-        let mut servers = Vec::new();
-
-        for record in &srv_records {
-            let target = record.target().to_string();
-            let target = target.trim_end_matches('.');
-            let port = record.port();
-
-            // Resolve the SRV target hostname to IP
-            match self.resolver.lookup_ip(target).await {
-                Ok(ips) => {
-                    for ip in ips.iter() {
-                        servers.push(ResolvedServer {
-                            addr: SocketAddr::new(ip, port),
-                            priority: record.priority(),
-                            weight: record.weight(),
-                        });
-                    }
-                    // Track minimum TTL from the A/AAAA records
-                    let valid_until = ips.valid_until();
-                    let ttl_secs = valid_until.duration_since(Instant::now()).as_secs() as u32;
-                    min_ttl = min_ttl.min(ttl_secs.max(30));
-                }
+    /// Walk the SRV names for `wanted`. `None` when the domain publishes
+    /// none of them (fall back to A/AAAA).
+    async fn resolve_srv(
+        &self,
+        domain: &str,
+        wanted: Wanted,
+    ) -> anyhow::Result<Option<Resolution>> {
+        for (name, transport) in wanted.srv_names(domain) {
+            let (mut records, srv_ttl) = match self.backend.srv(&name).await {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(target = %target, "Failed to resolve SRV target: {}", e);
+                    tracing::debug!(srv = %name, "SRV lookup failed: {e}");
+                    if transport == Transport::Tls && wanted == Wanted::Auto {
+                        // Not knowing whether TLS is published is no reason
+                        // to choose cleartext.
+                        anyhow::bail!("SRV lookup of {name} failed; not falling back to an unencrypted transport: {e}");
+                    }
+                    continue;
+                }
+            };
+            // A target of "." means the service is decidedly not available.
+            records.retain(|r| !r.target.is_empty() && r.target != ".");
+            if records.is_empty() {
+                continue;
+            }
+            let mut ttl = srv_ttl.clamp(Duration::from_secs(30), Duration::from_secs(300));
+            let mut servers = Vec::new();
+            for r in &records {
+                match self.backend.ips(&r.target).await {
+                    Ok((ips, ip_ttl)) => {
+                        ttl = ttl.min(ip_ttl.max(Duration::from_secs(30)));
+                        for ip in ips {
+                            servers.push(ResolvedServer {
+                                addr: SocketAddr::new(ip, r.port),
+                                priority: r.priority,
+                                weight: r.weight,
+                                host: r.target.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target = %r.target, "Failed to resolve SRV target: {e}")
+                    }
                 }
             }
+            if servers.is_empty() {
+                if transport == Transport::Tls {
+                    anyhow::bail!(
+                        "{domain} publishes {name} but none of its targets resolve; not falling back to an unencrypted transport"
+                    );
+                }
+                continue;
+            }
+            // Cached and returned by priority only: each registration does
+            // its own RFC 2782 weighted shuffle (`failover::Rng`), so a shared
+            // cache does not send every user to the same target.
+            servers.sort_by_key(|s| s.priority);
+            tracing::info!(domain = %domain, srv = %name, count = servers.len(), "SRV resolution successful");
+            return Ok(Some(Resolution {
+                servers,
+                ttl,
+                transport,
+            }));
         }
-
-        // Cached and returned by priority only: each registration does its
-        // own RFC 2782 weighted shuffle (`failover::Rng`), so a shared
-        // cache does not send every user to the same target.
-        servers.sort_by_key(|s| s.priority);
-        let ttl = Duration::from_secs(u64::from(min_ttl.max(30)));
-        if !servers.is_empty() {
-            let mut cache = self.cache.write().await;
-            cache.insert(
-                srv_name.to_string(),
-                CachedResolution {
-                    servers: servers.clone(),
-                    resolved_at: Instant::now(),
-                    ttl,
-                },
-            );
-        }
-
-        Ok(Resolution { servers, ttl })
+        Ok(None)
     }
 
     /// Fallback: resolve domain as A/AAAA record with the given port.
-    async fn resolve_a_record(&self, domain: &str, port: u16) -> anyhow::Result<Resolution> {
-        let ips = self.resolver.lookup_ip(domain).await?;
-
-        let mut servers = Vec::new();
-        for ip in ips.iter() {
-            servers.push(ResolvedServer {
+    async fn resolve_a_record(
+        &self,
+        domain: &str,
+        port: u16,
+        transport: Transport,
+    ) -> anyhow::Result<Resolution> {
+        let (ips, ttl) = self.backend.ips(domain).await?;
+        let servers: Vec<ResolvedServer> = ips
+            .into_iter()
+            .map(|ip| ResolvedServer {
                 addr: SocketAddr::new(ip, port),
                 priority: 0,
                 weight: 0,
-            });
-        }
-
+                host: domain.to_string(),
+            })
+            .collect();
         if servers.is_empty() {
             anyhow::bail!("No A/AAAA records found for {}", domain);
         }
-
-        // Cache the A record result too
-        let ttl = {
-            let valid_until = ips.valid_until();
-            let ttl_secs = valid_until.duration_since(Instant::now()).as_secs().max(30);
-            Duration::from_secs(ttl_secs)
-        };
-
-        let srv_name = format!("_a_fallback.{}", domain);
-        let mut cache = self.cache.write().await;
-        cache.insert(
-            srv_name,
-            CachedResolution {
-                servers: servers.clone(),
-                resolved_at: Instant::now(),
-                ttl,
-            },
-        );
-
         tracing::info!(domain = %domain, count = servers.len(), "A record fallback resolution");
-        Ok(Resolution { servers, ttl })
+        Ok(Resolution {
+            servers,
+            ttl: ttl.max(Duration::from_secs(30)),
+            transport,
+        })
     }
-}
-
-/// Build the SRV service name for SIP.
-fn srv_service_name(domain: &str, transport: &str) -> String {
-    let proto = match transport.to_lowercase().as_str() {
-        "tcp" => "tcp",
-        "tls" => "tls",
-        _ => "udp",
-    };
-    format!("_sip._{}.{}", proto, domain)
 }
 
 #[cfg(test)]
@@ -298,6 +427,7 @@ mod tests {
             addr: addr.parse().unwrap(),
             priority,
             weight,
+            host: "pbx.example.com".into(),
         }
     }
 
@@ -357,5 +487,108 @@ mod tests {
             }
         }
         assert!((850..950).contains(&first_heavy), "{first_heavy}");
+    }
+
+    /// (priority, port, target) of one SRV record.
+    type Rec<'a> = (u16, u16, &'a str);
+
+    fn table(srv: &[(&str, &[Rec<'_>])], hosts: &[(&str, &str)]) -> SrvResolver {
+        let mut t = StaticDns::default();
+        for (name, recs) in srv {
+            t.srv.insert(
+                name.to_string(),
+                recs.iter()
+                    .map(|(prio, port, target)| SrvRecord {
+                        priority: *prio,
+                        weight: 50,
+                        port: *port,
+                        target: target.to_string(),
+                    })
+                    .collect(),
+            );
+        }
+        for (h, ip) in hosts {
+            t.hosts.insert(h.to_string(), vec![ip.parse().unwrap()]);
+        }
+        SrvResolver::with_static(t)
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_sips_and_keeps_the_target_names() {
+        let r = table(
+            &[
+                (
+                    "_sips._tcp.sip.test",
+                    &[(10, 5061, "node1.sip.test"), (10, 5061, "node2.sip.test")],
+                ),
+                ("_sip._udp.sip.test", &[(10, 5060, "node1.sip.test")]),
+            ],
+            &[
+                ("node1.sip.test", "10.0.0.1"),
+                ("node2.sip.test", "10.0.0.2"),
+            ],
+        );
+        let res = r.resolve("sip.test", 5060, "auto").await.unwrap();
+        assert_eq!(res.transport, Transport::Tls);
+        assert_eq!(res.servers.len(), 2);
+        assert!(res.servers.iter().all(|s| s.addr.port() == 5061));
+        let hosts: Vec<_> = res.servers.iter().map(|s| s.host.as_str()).collect();
+        assert!(hosts.contains(&"node1.sip.test") && hosts.contains(&"node2.sip.test"));
+    }
+
+    #[tokio::test]
+    async fn auto_walks_tls_then_tcp_then_udp() {
+        let r = table(
+            &[
+                ("_sip._tcp.a.test", &[(10, 5060, "n.a.test")]),
+                ("_sip._udp.a.test", &[(10, 5060, "n.a.test")]),
+            ],
+            &[("n.a.test", "10.0.0.1")],
+        );
+        assert_eq!(
+            r.resolve("a.test", 5060, "auto").await.unwrap().transport,
+            Transport::Tcp
+        );
+        let r = table(
+            &[("_sip._udp.b.test", &[(10, 5060, "n.b.test")])],
+            &[("n.b.test", "10.0.0.1")],
+        );
+        assert_eq!(
+            r.resolve("b.test", 5060, "auto").await.unwrap().transport,
+            Transport::Udp
+        );
+    }
+
+    #[tokio::test]
+    async fn a_published_tls_service_is_never_traded_for_cleartext() {
+        // _sips is published but its target does not resolve: an error, not UDP.
+        let r = table(
+            &[
+                ("_sips._tcp.c.test", &[(10, 5061, "gone.c.test")]),
+                ("_sip._udp.c.test", &[(10, 5060, "n.c.test")]),
+            ],
+            &[("n.c.test", "10.0.0.1"), ("c.test", "10.0.0.9")],
+        );
+        assert!(r.resolve("c.test", 5060, "auto").await.is_err());
+        assert!(r.resolve("c.test", 5061, "tls").await.is_err());
+        // Explicit UDP still works for a device configured for it.
+        assert_eq!(
+            r.resolve("c.test", 5060, "udp").await.unwrap().transport,
+            Transport::Udp
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_without_srv_uses_the_domain_at_the_given_port() {
+        let r = table(&[], &[("d.test", "10.0.0.4")]);
+        let res = r.resolve("d.test", 5061, "tls").await.unwrap();
+        assert_eq!(res.transport, Transport::Tls);
+        assert_eq!(res.servers[0].addr.to_string(), "10.0.0.4:5061");
+        assert_eq!(res.servers[0].host, "d.test");
+        // auto with nothing published is UDP (RFC 3263 §4.1).
+        assert_eq!(
+            r.resolve("d.test", 5060, "auto").await.unwrap().transport,
+            Transport::Udp
+        );
     }
 }

@@ -15,6 +15,7 @@ use super::digest::DigestAuth;
 use super::failover::{Action, Event, Machine};
 use super::message;
 use super::resolver::SrvResolver;
+use super::transport::{Flow, SipSocket, TlsClient, Transport};
 use super::trust::{SourcePolicy, TrustedSources};
 use crate::handoff::{CallOwner, HandoffManager, InviteDisposition};
 use crate::push::PushManager;
@@ -49,7 +50,7 @@ impl SipAccountConfig {
 pub struct ProxyRegistration {
     pub(crate) device_id: String,
     config: SipAccountConfig,
-    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) socket: Arc<crate::sip::transport::SipSocket>,
     server_addr: SocketAddr,
     /// Sources accepted on this registration: the IPs the registrar
     /// resolved to plus the operator allowlist (any port).
@@ -82,6 +83,11 @@ pub struct ProxyRegistration {
     instance: String,
     /// CSeq for health-check OPTIONS pings.
     options_cseq: u32,
+    /// The transport the registration resolved to; fixed for its lifetime
+    /// (re-resolution asks for the same one, so TLS is never traded away).
+    transport: Transport,
+    /// TLS settings, for failback probes on a fresh connection.
+    tls: Option<TlsClient>,
 }
 
 /// Re-register at 80% of the 3600 s binding.
@@ -97,6 +103,17 @@ impl ProxyRegistration {
         } else {
             3600
         }
+    }
+
+    /// The name the certificate of `target` is checked against.
+    fn tls_name_for(&self, target: SocketAddr) -> String {
+        let domain = self.config.effective_registrar();
+        let host = self
+            .failover
+            .as_ref()
+            .and_then(|m| m.servers().iter().find(|s| s.addr == target))
+            .map_or(domain, |s| s.host.as_str());
+        super::transport::tls_server_name(domain, host)
     }
 
     /// Whether a packet from `from` may be processed on this registration.
@@ -133,7 +150,7 @@ impl ProxyRegistration {
     /// A registration bound to `socket`, for exercising call handling in tests.
     #[cfg(test)]
     pub(crate) fn for_test(
-        socket: Arc<UdpSocket>,
+        socket: Arc<crate::sip::transport::SipSocket>,
         domain: &str,
         handoff: Arc<HandoffManager>,
     ) -> Self {
@@ -170,6 +187,8 @@ impl ProxyRegistration {
             allow_local_targets: false,
             instance: message::instance_urn("1001", domain),
             options_cseq: 0,
+            transport: Transport::Udp,
+            tls: None,
         }
     }
 }
@@ -276,6 +295,22 @@ pub struct SipProxyManager {
     /// Trust resolved registrar addresses that are loopback, private,
     /// link-local, ... (local development only; `SIP_ALLOW_LOCAL_TARGETS`).
     allow_local_targets: bool,
+    /// Certificate checking for TLS to the PBX; `None` if the roots could
+    /// not be loaded, and then TLS registrations fail rather than downgrade.
+    tls: Option<TlsClient>,
+    /// Test knobs: failover timers divided by this, and flow keep-alive
+    /// (interval, pong timeout) overrides.
+    #[cfg(test)]
+    test_timing: TestTiming,
+}
+
+/// See [`SipProxyManager::with_test_timing`].
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub struct TestTiming {
+    pub speedup: u32,
+    pub keepalive: Option<Duration>,
+    pub pong_timeout: Option<Duration>,
 }
 
 impl SipProxyManager {
@@ -291,7 +326,61 @@ impl SipProxyManager {
             trusted: Arc::default(),
             // Tests run against loopback PBX stand-ins.
             allow_local_targets: cfg!(test),
+            tls: TlsClient::from_env()
+                .inspect_err(|e| tracing::error!("SIP TLS client unavailable: {e}"))
+                .ok(),
+            #[cfg(test)]
+            test_timing: TestTiming::default(),
         }
+    }
+
+    /// Faster failover timers and keep-alives (tests with real sockets).
+    #[cfg(test)]
+    pub fn with_test_timing(mut self, timing: TestTiming) -> Self {
+        self.test_timing = timing;
+        self
+    }
+
+    /// Use these TLS settings (tests: a private CA).
+    #[cfg(test)]
+    pub fn with_tls(mut self, tls: TlsClient) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// Resolve registrars with this resolver (tests: a static table).
+    #[cfg(test)]
+    pub fn with_resolver(mut self, resolver: SrvResolver) -> Self {
+        self.resolver = Arc::new(resolver);
+        self
+    }
+
+    /// A socket for `transport`: a UDP socket, or a (not yet connected) flow.
+    async fn new_socket(&self, transport: Transport) -> anyhow::Result<Arc<SipSocket>> {
+        Ok(Arc::new(match transport {
+            Transport::Udp => SipSocket::from(UdpSocket::bind("0.0.0.0:0").await?),
+            Transport::Tcp => SipSocket::stream(self.flow(Transport::Tcp, None)),
+            Transport::Tls => {
+                let tls = self.tls.clone().ok_or_else(|| {
+                    anyhow::anyhow!("TLS to the PBX is unavailable (no trust roots); not falling back to cleartext")
+                })?;
+                SipSocket::stream(self.flow(Transport::Tls, Some(tls)))
+            }
+        }))
+    }
+
+    fn flow(&self, transport: Transport, tls: Option<TlsClient>) -> Arc<Flow> {
+        let flow = Flow::new(transport, tls);
+        #[cfg(test)]
+        {
+            if let Some(k) = self.test_timing.keepalive {
+                flow.pin_keepalive(k);
+            }
+            if let Some(p) = self.test_timing.pong_timeout {
+                flow.set_pong_timeout(p);
+            }
+        }
+        flow
     }
 
     /// Trust non-public resolved registrar addresses (local development).
@@ -370,14 +459,6 @@ impl SipProxyManager {
         push_manager: Arc<PushManager>,
         handoff: Arc<HandoffManager>,
     ) -> anyhow::Result<()> {
-        if config.transport != "udp" {
-            tracing::warn!(
-                device = %device_id,
-                transport = %config.transport,
-                "Only UDP transport is currently supported — registering over UDP"
-            );
-        }
-
         tracing::info!(
             device = %device_id,
             user = %config.username,
@@ -397,24 +478,33 @@ impl SipProxyManager {
             "Failed to resolve {registrar}"
         );
         let started = std::time::Instant::now();
-        let (machine, start_actions) = Machine::start(
+        #[allow(unused_mut)]
+        let (mut machine, start_actions) = Machine::start(
             resolved.servers.clone(),
             resolved.ttl,
             self.refresh_after,
             started,
             super::failover::Rng::seeded(rand::random()),
         );
+        #[cfg(test)]
+        {
+            machine.set_speedup(self.test_timing.speedup);
+        }
         let server_addr = machine.current();
+        let transport = resolved.transport;
 
-        // Bind UDP socket
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-        let local_addr = socket.local_addr()?;
-
-        // Discover actual local IP by connecting to server
-        let probe = UdpSocket::bind("0.0.0.0:0").await?;
-        probe.connect(server_addr).await?;
-        let real_local_ip = probe.local_addr()?.ip();
-        let local_addr = SocketAddr::new(real_local_ip, local_addr.port());
+        let socket = self.new_socket(transport).await?;
+        let local_addr = match socket.flow() {
+            // Known once the flow connects (on the first REGISTER).
+            Some(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            None => {
+                // Discover actual local IP by connecting to server
+                let port = socket.local_addr()?.port();
+                let probe = UdpSocket::bind("0.0.0.0:0").await?;
+                probe.connect(server_addr).await?;
+                SocketAddr::new(probe.local_addr()?.ip(), port)
+            }
+        };
 
         let call_id = message::generate_call_id();
         let from_tag = format!("{:08x}", rand::random::<u32>());
@@ -450,6 +540,8 @@ impl SipProxyManager {
             lookups: Some(lookups_tx),
             instance,
             options_cseq: 0,
+            transport,
+            tls: self.tls.clone(),
         }));
 
         // Store registration, retiring any previous one for this device
@@ -545,6 +637,9 @@ impl SipProxyManager {
                     }
                 }
             }
+            if let Some(flow) = socket_clone.flow() {
+                flow.shutdown();
+            }
             tracing::debug!(device = %device_id_clone, "Registration receive loop ended");
         });
 
@@ -609,7 +704,7 @@ impl SipProxyManager {
                 &registrar,
                 &r.local_addr.ip().to_string(),
                 r.local_addr.port(),
-                &r.config.transport,
+                r.transport.param(),
                 &r.call_id,
                 r.cseq,
                 &r.from_tag,
@@ -665,7 +760,22 @@ impl SipProxyManager {
                         r.state = ProxyState::Registering;
                         (r.device_id.clone(), moved)
                     };
-                    if moved {
+                    let (socket, name) = {
+                        let r = reg.read().await;
+                        (r.socket.clone(), r.tls_name_for(to))
+                    };
+                    if let Some(flow) = socket.flow() {
+                        // A stream: (re)connect to the target first. A flow
+                        // already on it is kept.
+                        if let Err(e) = flow.ensure(to, &name).await {
+                            tracing::error!(device = %device_id, target = %to, "SIP flow connect failed: {e}");
+                            send_failed = true;
+                            continue;
+                        }
+                        if let Some(local) = flow.local_addr() {
+                            reg.write().await.local_addr = local;
+                        }
+                    } else if moved {
                         // The route to the new target may leave from another
                         // interface.
                         if let Some(ip) = Self::local_ip_towards(to).await {
@@ -679,7 +789,7 @@ impl SipProxyManager {
                     }
                 }
                 Action::Options(to) => {
-                    let (msg, socket) = {
+                    let (msg, socket, transport, tls, name, lookups) = {
                         let mut r = reg.write().await;
                         r.options_cseq += 1;
                         let msg = message::build_options(
@@ -691,8 +801,36 @@ impl SipProxyManager {
                             &format!("gwping-{}", r.call_id),
                             r.options_cseq,
                         );
-                        (msg, r.socket.clone())
+                        (
+                            msg,
+                            r.socket.clone(),
+                            r.transport,
+                            r.tls.clone(),
+                            r.tls_name_for(to),
+                            r.lookups.clone(),
+                        )
                     };
+                    if socket.flow().is_some_and(|f| f.peer() != Some(to)) {
+                        // A failback probe of a target the flow is not on:
+                        // ask it on a connection of its own.
+                        if let Some(lookups) = lookups {
+                            tokio::spawn(async move {
+                                if super::transport::probe(
+                                    transport,
+                                    tls,
+                                    to,
+                                    &name,
+                                    &msg,
+                                    super::failover::OPTIONS_TIMEOUT,
+                                )
+                                .await
+                                {
+                                    let _ = lookups.send(Event::OptionsResponse { from: to });
+                                }
+                            });
+                        }
+                        continue;
+                    }
                     if let Err(e) = socket.send_to(msg.as_bytes(), to).await {
                         tracing::debug!(target = %to, "OPTIONS send failed: {e}");
                         // Only the current target's health depends on it; a
@@ -709,18 +847,22 @@ impl SipProxyManager {
                             r.lookups.clone(),
                             r.config.effective_registrar().to_string(),
                             r.config.port,
-                            r.config.transport.clone(),
+                            r.transport,
                         )
                     };
                     if let (Some(resolver), Some(lookups)) = (resolver, lookups) {
                         tokio::spawn(async move {
-                            let event = match resolver.resolve(&registrar, port, &transport).await {
-                                Ok(found) => Event::Resolved(found.servers, found.ttl),
-                                Err(e) => {
-                                    tracing::warn!(%registrar, "SRV re-resolution failed: {e}");
-                                    Event::ResolveFailed
-                                }
-                            };
+                            // The same transport as at the start: a TLS
+                            // registration never re-resolves to cleartext.
+                            let wanted = super::resolver::Wanted::One(transport);
+                            let event =
+                                match resolver.resolve_wanted(&registrar, port, wanted).await {
+                                    Ok(found) => Event::Resolved(found.servers, found.ttl),
+                                    Err(e) => {
+                                        tracing::warn!(%registrar, "SRV re-resolution failed: {e}");
+                                        Event::ResolveFailed
+                                    }
+                                };
                             let _ = lookups.send(event);
                         });
                     }
@@ -758,17 +900,25 @@ impl SipProxyManager {
         mut lookups: tokio::sync::mpsc::UnboundedReceiver<Event>,
     ) {
         tokio::spawn(async move {
-            let (mut stop, period) = {
+            let (mut stop, period, mut flow_failures) = {
                 let r = reg.read().await;
                 (
                     r.stop.subscribe(),
                     (r.refresh_after / 4).clamp(Duration::from_millis(20), Duration::from_secs(1)),
+                    r.socket.flow().map(|f| f.failures()),
                 )
             };
             loop {
+                let flow_failed = async {
+                    match flow_failures.as_mut() {
+                        Some(rx) => rx.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                };
                 let event = tokio::select! {
                     _ = tokio::time::sleep(period) => Event::Tick,
                     Some(found) = lookups.recv() => found,
+                    true = flow_failed => Event::FlowFailed,
                     _ = stop.wait_for(|stopped| *stopped) => return,
                 };
                 Self::drive(&reg, event).await;
@@ -826,7 +976,7 @@ impl SipProxyManager {
     /// call's own socket, which only carries that call's dialog.
     async fn handle_request_on(
         handoff: &Arc<HandoffManager>,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         reg: Option<&Arc<RwLock<ProxyRegistration>>>,
         text: &str,
         from: SocketAddr,
@@ -934,7 +1084,11 @@ impl SipProxyManager {
         Ok(())
     }
 
-    async fn reply(socket: &UdpSocket, resp: Option<String>, to: SocketAddr) -> anyhow::Result<()> {
+    async fn reply(
+        socket: &crate::sip::transport::SipSocket,
+        resp: Option<String>,
+        to: SocketAddr,
+    ) -> anyhow::Result<()> {
         if let Some(resp) = resp {
             socket.send_to(resp.as_bytes(), to).await?;
         }
@@ -949,7 +1103,7 @@ impl SipProxyManager {
     async fn offer_incoming_call(
         reg: &Arc<RwLock<ProxyRegistration>>,
         handoff: &Arc<HandoffManager>,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         text: &str,
         from: SocketAddr,
     ) -> anyhow::Result<()> {
@@ -1091,7 +1245,17 @@ impl SipProxyManager {
                     return Ok(());
                 }
                 r.state = ProxyState::Registered;
-                tracing::info!(device = %r.device_id, server = %r.server_addr, "Proxy registration successful");
+                if let Some(flow) = r.socket.flow() {
+                    // RFC 5626 §4.4.1: ping at 80-100 % of the registrar's
+                    // Flow-Timer, else every 25 s.
+                    let flow_timer = message::extract_header(text, "Flow-Timer")
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    flow.set_keepalive(super::transport::keepalive_interval(
+                        flow_timer,
+                        rand::random::<f64>(),
+                    ));
+                }
+                tracing::info!(device = %r.device_id, server = %r.server_addr, transport = ?r.transport, "Proxy registration successful");
                 drop(r);
                 // The machine schedules the refresh.
                 Self::drive(reg, Event::RegisterOk).await;
@@ -1155,7 +1319,7 @@ impl SipProxyManager {
                         &registrar,
                         &r.local_addr.ip().to_string(),
                         r.local_addr.port(),
-                        &r.config.transport,
+                        r.transport.param(),
                         &r.call_id,
                         r.cseq,
                         &r.from_tag,
@@ -1234,17 +1398,32 @@ impl SipProxyManager {
             .resolver
             .resolve(&registrar, account.port, &account.transport)
             .await?;
-        let server_addr = resolved
-            .servers
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("Cannot resolve {}", registrar))?
-            .addr;
-
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-        let local_port = socket.local_addr()?.port();
-        let probe = UdpSocket::bind("0.0.0.0:0").await?;
-        probe.connect(server_addr).await?;
-        let local_addr = SocketAddr::new(probe.local_addr()?.ip(), local_port);
+        anyhow::ensure!(!resolved.servers.is_empty(), "Cannot resolve {registrar}");
+        let socket = self.new_socket(resolved.transport).await?;
+        let (server_addr, local_addr) = match socket.flow() {
+            Some(flow) => {
+                // The first target that takes a connection (in SRV order).
+                let mut connected = None;
+                for server in &resolved.servers {
+                    let name = super::transport::tls_server_name(&registrar, &server.host);
+                    if flow.ensure(server.addr, &name).await.is_ok() {
+                        connected = flow.local_addr().map(|l| (server.addr, l));
+                        break;
+                    }
+                }
+                connected.ok_or_else(|| anyhow::anyhow!("Cannot connect to {registrar}"))?
+            }
+            None => {
+                let server_addr = resolved.servers[0].addr;
+                let local_port = socket.local_addr()?.port();
+                let probe = UdpSocket::bind("0.0.0.0:0").await?;
+                probe.connect(server_addr).await?;
+                (
+                    server_addr,
+                    SocketAddr::new(probe.local_addr()?.ip(), local_port),
+                )
+            }
+        };
 
         let target_uri = if destination_uri.starts_with("sip:") {
             destination_uri.to_string()
@@ -1287,7 +1466,7 @@ impl SipProxyManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_outgoing_call(
         handoff: &Arc<HandoffManager>,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<crate::sip::transport::SipSocket>,
         server_addr: SocketAddr,
         local_addr: SocketAddr,
         account: &SipAccountConfig,
@@ -1323,6 +1502,8 @@ impl SipProxyManager {
             allow_local_targets: false,
             instance: message::instance_urn(&account.username, &account.domain),
             options_cseq: 0,
+            transport: socket.transport(),
+            tls: None,
         }));
         let ended = handoff
             .register_active_call(
@@ -1335,10 +1516,11 @@ impl SipProxyManager {
                 None,
                 local_sdp.to_string(),
                 format!(
-                    "sip:{}@{}:{};transport=udp",
+                    "sip:{}@{}:{};transport={}",
                     account.username,
                     local_addr.ip(),
-                    local_addr.port()
+                    local_addr.port(),
+                    socket.transport().param()
                 ),
             )
             .await;
@@ -1362,7 +1544,7 @@ impl SipProxyManager {
     /// and any BYE we sent has been answered (or timed out), so the task and
     /// its socket don't outlive the call.
     fn spawn_outgoing_call_loop(
-        socket: Arc<UdpSocket>,
+        socket: Arc<crate::sip::transport::SipSocket>,
         sources: SourcePolicy,
         handoff: Arc<HandoffManager>,
         call_id: String,
@@ -1453,6 +1635,9 @@ impl SipProxyManager {
                 }
                 // Other responses (200 OK to our BYE, etc.) are ignored.
             }
+            if let Some(flow) = socket.flow() {
+                flow.shutdown();
+            }
             tracing::debug!(call_id = %call_id, "Outgoing call receive loop ended");
         })
     }
@@ -1492,7 +1677,9 @@ Content-Length: 0\r\n\r\n";
     async fn outgoing_call_trusting(trusted: Option<SourcePolicy>) -> OutgoingCall {
         let handoff = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let gw_addr = gw.local_addr().unwrap();
         let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
             gw.clone(),
@@ -1622,7 +1809,9 @@ Content-Length: 0\r\n\r\n";
         let handoff = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let pbx_addr = pbx.local_addr().unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let reg = Arc::new(RwLock::new(ProxyRegistration::for_test(
             gw,
             "pbx.example.com",
@@ -1685,7 +1874,9 @@ Content-Length: 0\r\n\r\n";
         let pbx_addr = pbx.local_addr().unwrap();
         let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let foreign_addr = foreign.local_addr().unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let mut r = ProxyRegistration::for_test(gw, "pbx.example.com", handoff.clone());
         r.trust_peer(pbx_addr);
         let reg = Arc::new(RwLock::new(r));
@@ -1833,7 +2024,9 @@ Content-Length: 0\r\n\r\n";
     #[tokio::test]
     async fn bye_on_another_registrations_socket_does_not_end_the_call() {
         let r = registered_with_call().await;
-        let other_gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let other_gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let mut other = ProxyRegistration::for_test(other_gw, "pbx.example.com", r.handoff.clone());
         other.trust_peer(r.pbx_addr);
         let other = Arc::new(RwLock::new(other));
@@ -1922,7 +2115,9 @@ Content-Length: 0\r\n\r\n";
         let handoff = Arc::new(HandoffManager::new());
         let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let pbx_addr = pbx.local_addr().unwrap();
-        let gw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let gw = Arc::new(crate::sip::transport::SipSocket::from(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
         let mut r = ProxyRegistration::for_test(gw, "pbx.example.com", handoff.clone());
         r.trust_peer(pbx_addr);
         r.push_manager = fcm.manager("test-device").await;
