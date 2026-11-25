@@ -173,7 +173,7 @@ pub struct ActiveCall {
     /// The latest 2xx we sent to an INVITE on this dialog and its CSeq.
     last_2xx: std::sync::Mutex<Option<(u32, String)>>,
     /// Set while a media-update re-INVITE of ours is outstanding.
-    reinvite_pending: AtomicBool,
+    reinvite_pending: Arc<AtomicBool>,
     /// The ACK of our latest answered re-INVITE and its CSeq, re-sent if
     /// the PBX repeats its 2xx (our ACK was lost).
     reinvite_ack: std::sync::Mutex<Option<(u32, String)>>,
@@ -207,7 +207,7 @@ impl ActiveCall {
             invite_branch: None,
             ack_wait: std::sync::Mutex::new(None),
             last_2xx: std::sync::Mutex::new(None),
-            reinvite_pending: AtomicBool::new(false),
+            reinvite_pending: Arc::new(AtomicBool::new(false)),
             reinvite_ack: std::sync::Mutex::new(None),
             _ended: None,
         }
@@ -645,6 +645,15 @@ impl TransferTarget {
             Self::Number(n) => format!("sip:{}@{}", n.replace('#', "%23"), domain),
             Self::Uri(u) => u.clone(),
         }
+    }
+}
+
+/// Clears a call's "media update outstanding" flag when dropped.
+struct PendingGuard(Arc<AtomicBool>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -2197,7 +2206,7 @@ impl HandoffManager {
             .await
             .ok_or(MediaUpdateError::NotFound)?;
 
-        let (dialog, pbx_addr, proxy_reg, contact, offer, cseq) = {
+        let (dialog, pbx_addr, proxy_reg, contact, offer, cseq, _pending) = {
             let active = self.active.read().await;
             let call = active.get(&call_id).ok_or(MediaUpdateError::NotFound)?;
             if call.rtp_relay.is_some()
@@ -2215,6 +2224,9 @@ impl HandoffManager {
                 call.contact.clone(),
                 next_session_version(&call.local_sdp, sdp),
                 call.next_cseq(),
+                // Cleared on drop, so a caller that goes away mid-update
+                // (the HTTP request is cancelled) cannot wedge the call.
+                PendingGuard(call.reinvite_pending.clone()),
             )
         };
         let result = self
@@ -2222,9 +2234,6 @@ impl HandoffManager {
                 &call_id, &dialog, pbx_addr, &proxy_reg, &contact, &offer, cseq,
             )
             .await;
-        if let Some(call) = self.active.read().await.get(&call_id) {
-            call.reinvite_pending.store(false, Ordering::SeqCst);
-        }
         result
     }
 
