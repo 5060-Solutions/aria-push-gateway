@@ -346,42 +346,77 @@ pub fn extract_sdp_media_address(sdp: &str) -> Option<(String, u16)> {
     }
 }
 
+/// Whether an SDP body carries SDES-SRTP keys (`a=crypto:` lines, RFC 4568).
+pub fn sdp_has_sdes_keys(sdp: &str) -> bool {
+    sdp.lines().any(|l| l.trim_start().starts_with("a=crypto:"))
+}
+
+/// Log a warning when SDES-SRTP keys cross the gateway<->PBX hop on a
+/// transport without TLS: `a=crypto:` carries the media keys in the
+/// signalling, so over UDP or TCP anyone on that path can decrypt the call
+/// audio. Returns whether it warned. `what` names the message, e.g.
+/// "200 OK to PBX".
+pub fn warn_if_sdes_in_clear(
+    transport: super::transport::Transport,
+    call_id: &str,
+    sdp: &str,
+    what: &str,
+) -> bool {
+    if transport == super::transport::Transport::Tls || !sdp_has_sdes_keys(sdp) {
+        return false;
+    }
+    tracing::warn!(
+        call_id = %call_id,
+        transport = transport.param(),
+        message = what,
+        "SDP with SDES-SRTP keys (a=crypto) crosses the PBX hop without TLS; \
+         the media keys are readable on that path"
+    );
+    true
+}
+
 /// Rewrite the media address in an SDP body.
 ///
-/// Replaces the IP in `c=IN IP4 ...` lines and the port in `m=audio ...` lines.
+/// Replaces the IP in `c=IN IP4 ...` lines and the origin line, and the
+/// port in `m=audio ...` lines. Every other line, including the transport
+/// protocol of the `m=` line (`RTP/SAVP`), `a=crypto:` keys and the line
+/// endings, is kept byte for byte.
 pub fn rewrite_sdp_media_address(sdp: &str, new_ip: &str, new_port: u16) -> String {
-    let mut result = Vec::new();
+    let mut result = String::with_capacity(sdp.len() + 16);
 
-    for line in sdp.lines() {
-        let trimmed = line.trim();
+    for raw in sdp.split_inclusive('\n') {
+        let content = raw.trim_end_matches(['\r', '\n']);
+        let ending = &raw[content.len()..];
+        let trimmed = content.trim();
         if trimmed.starts_with("c=IN IP4 ") || trimmed.starts_with("c=IN IP4\t") {
-            result.push(format!("c=IN IP4 {}", new_ip));
+            result.push_str(&format!("c=IN IP4 {}", new_ip));
         } else if trimmed.starts_with("m=audio ") {
             // m=audio PORT RTP/AVP payload_types...
             let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
             if parts.len() >= 3 {
-                result.push(format!("m=audio {} {}", new_port, parts[2]));
+                result.push_str(&format!("m=audio {} {}", new_port, parts[2]));
             } else {
-                result.push(line.to_string());
+                result.push_str(content);
             }
         } else if trimmed.starts_with("o=") {
             // Also rewrite the origin line IP if present
             // o=- sess_id sess_version IN IP4 addr
             let parts: Vec<&str> = trimmed.splitn(6, ' ').collect();
             if parts.len() == 6 && parts[4] == "IP4" {
-                result.push(format!(
+                result.push_str(&format!(
                     "{} {} {} {} {} {}",
                     parts[0], parts[1], parts[2], parts[3], parts[4], new_ip
                 ));
             } else {
-                result.push(line.to_string());
+                result.push_str(content);
             }
         } else {
-            result.push(line.to_string());
+            result.push_str(content);
         }
+        result.push_str(ending);
     }
 
-    result.join("\r\n")
+    result
 }
 
 /// Build a 200 OK for an INVITE with our `to_tag`, the INVITE's
@@ -669,5 +704,75 @@ mod tests {
         assert!(!cancel.contains("Authorization"));
         assert!(!cancel.contains("v=0"));
         assert!(build_cancel("BYE sip:x SIP/2.0\r\n\r\n").is_none());
+    }
+
+    /// An SDES-SRTP offer as the Aria phone sends it: two crypto suites,
+    /// one with lifetime/MKI key params and a session param.
+    const SAVP_SDP: &str = "v=0\r\n\
+o=aria 1700000000 1 IN IP4 198.51.100.7\r\n\
+s=-\r\n\
+c=IN IP4 198.51.100.7\r\n\
+t=0 0\r\n\
+m=audio 40000 RTP/SAVP 0 8 101\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR|2^20|1:4 UNENCRYPTED_SRTCP\r\n\
+a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:NzB4d1BINUAvLEw6UzF3WSJ+PSdFcGdUJShpX1Zj\r\n\
+a=rtcp-mux\r\n\
+a=sendrecv\r\n";
+
+    fn crypto_lines(sdp: &str) -> Vec<&str> {
+        sdp.split("\r\n")
+            .filter(|l| l.starts_with("a=crypto:"))
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_keeps_savp_and_crypto_lines_byte_for_byte() {
+        let out = rewrite_sdp_media_address(SAVP_SDP, "203.0.113.50", 31000);
+        assert!(out.contains("c=IN IP4 203.0.113.50\r\n"));
+        assert!(out.contains("m=audio 31000 RTP/SAVP 0 8 101\r\n"), "{out}");
+        assert!(!out.contains("RTP/AVP "));
+        assert_eq!(crypto_lines(&out), crypto_lines(SAVP_SDP));
+        assert_eq!(crypto_lines(&out).len(), 2);
+        // Only c=, o= and the m= port differ; everything else is identical,
+        // line endings included.
+        let expected = SAVP_SDP
+            .replace("c=IN IP4 198.51.100.7", "c=IN IP4 203.0.113.50")
+            .replace("IN IP4 198.51.100.7\r\ns=", "IN IP4 203.0.113.50\r\ns=")
+            .replace("m=audio 40000 ", "m=audio 31000 ");
+        assert_eq!(out, expected);
+        assert!(sdp_has_sdes_keys(&out));
+    }
+
+    #[test]
+    fn rewrite_keeps_line_endings() {
+        let lf = "v=0\nc=IN IP4 1.2.3.4\nm=audio 5 RTP/SAVP 0\na=crypto:1 X inline:k\n";
+        assert_eq!(
+            rewrite_sdp_media_address(lf, "5.6.7.8", 9),
+            "v=0\nc=IN IP4 5.6.7.8\nm=audio 9 RTP/SAVP 0\na=crypto:1 X inline:k\n"
+        );
+        let unterminated = "v=0\r\nm=audio 5 RTP/AVP 0";
+        assert_eq!(
+            rewrite_sdp_media_address(unterminated, "5.6.7.8", 9),
+            "v=0\r\nm=audio 9 RTP/AVP 0"
+        );
+    }
+
+    #[test]
+    fn sdes_keys_in_clear_are_warned_about_except_over_tls() {
+        use crate::sip::transport::Transport;
+        let plain = "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 4000 RTP/AVP 0\r\n";
+        assert!(warn_if_sdes_in_clear(Transport::Udp, "c", SAVP_SDP, "t"));
+        assert!(warn_if_sdes_in_clear(Transport::Tcp, "c", SAVP_SDP, "t"));
+        assert!(!warn_if_sdes_in_clear(Transport::Tls, "c", SAVP_SDP, "t"));
+        assert!(!warn_if_sdes_in_clear(Transport::Udp, "c", plain, "t"));
+    }
+
+    #[test]
+    fn sdes_keys_are_detected() {
+        assert!(sdp_has_sdes_keys(SAVP_SDP));
+        assert!(!sdp_has_sdes_keys(
+            "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 4000 RTP/AVP 0\r\n"
+        ));
     }
 }

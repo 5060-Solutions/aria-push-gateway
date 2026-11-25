@@ -209,6 +209,9 @@ pub enum OriginateRefusal {
     /// Another outgoing call of this user is pending under the same
     /// `client_ref`.
     ClientRefInUse,
+    /// The far end answered the INVITE with this final non-2xx status
+    /// (e.g. 488 when it will not take the offered media).
+    Rejected(u16),
 }
 
 impl std::fmt::Display for OriginateRefusal {
@@ -216,6 +219,7 @@ impl std::fmt::Display for OriginateRefusal {
         match self {
             Self::Cancelled => write!(f, "outgoing call cancelled"),
             Self::ClientRefInUse => write!(f, "client_ref already in use by a pending call"),
+            Self::Rejected(status) => write!(f, "Outgoing call rejected with status {status}"),
         }
     }
 }
@@ -1135,6 +1139,9 @@ impl SipProxyManager {
         let caller_name = message::extract_display_name(text);
         let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
 
+        if let Some((_, sdp)) = text.split_once("\r\n\r\n") {
+            message::warn_if_sdes_in_clear(socket.transport(), &call_id, sdp, "INVITE from PBX");
+        }
         // SDP passes through unchanged — phone talks directly to PBX relay
         let call_token = handoff
             .create_pending_call(

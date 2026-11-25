@@ -7,12 +7,22 @@
 //! A forwarding task relays packets bidirectionally. The phone's actual
 //! address is learned from the first received packet (symmetric RTP / comedia)
 //! to handle NAT traversal.
+//!
+//! Payloads are opaque: datagrams are forwarded byte for byte, never parsed,
+//! so SDES-SRTP (and SRTCP multiplexed on the same port, RFC 5761) passes
+//! through with its encryption and authentication tag intact. There is no
+//! RTP+1 RTCP socket pair: RTCP is relayed only when the endpoints use
+//! `a=rtcp-mux`.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+
+/// Receive buffer size: any UDP datagram fits, so a packet is never
+/// truncated (a cut SRTP/SRTCP packet would fail its authentication tag).
+const MAX_DATAGRAM: usize = 65_536;
 
 /// Manages a pair of RTP relay sockets for one call.
 pub struct RtpRelay {
@@ -76,7 +86,7 @@ impl RtpRelay {
         let pbx_target = pbx_addr;
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut buf = vec![0u8; MAX_DATAGRAM];
             while running.load(Ordering::Relaxed) {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -122,7 +132,7 @@ impl RtpRelay {
         let running = self.running.clone();
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048];
+            let mut buf = vec![0u8; MAX_DATAGRAM];
             while running.load(Ordering::Relaxed) {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -169,5 +179,78 @@ impl RtpRelay {
 impl Drop for RtpRelay {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn recv(sock: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for relayed packet")
+            .unwrap();
+        buf.truncate(len);
+        (buf, from)
+    }
+
+    /// An SRTP-looking packet: RTP header, arbitrary "ciphertext" covering
+    /// every byte value, and a 10-byte auth tag.
+    fn srtp_packet(seq: u16, len: usize) -> Vec<u8> {
+        let mut p = vec![0x80, 0x00];
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0x03, 0x20, 0xde, 0xad, 0xbe, 0xef]);
+        p.extend((0..len).map(|i| (i * 7 + seq as usize) as u8));
+        p.extend_from_slice(&[0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18, 0x29, 0x3a]);
+        p
+    }
+
+    /// An SRTCP sender report as sent with rtcp-mux: RTCP header, encrypted
+    /// part, E-flag + index word and an 80-bit auth tag.
+    fn srtcp_packet() -> Vec<u8> {
+        let mut p = vec![0x80, 200, 0x00, 0x06, 0xde, 0xad, 0xbe, 0xef];
+        p.extend((0u8..=255).rev().take(24));
+        p.extend_from_slice(&[0x80, 0x00, 0x00, 0x01]);
+        p.extend_from_slice(&[0xff; 10]);
+        p
+    }
+
+    #[tokio::test]
+    async fn srtp_and_srtcp_are_relayed_byte_for_byte_both_ways() {
+        let (relay, phone_port, pbx_port) = RtpRelay::allocate().await.unwrap();
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        relay.start(pbx.local_addr().unwrap());
+        let to_phone_side: SocketAddr = format!("127.0.0.1:{phone_port}").parse().unwrap();
+        let to_pbx_side: SocketAddr = format!("127.0.0.1:{pbx_port}").parse().unwrap();
+
+        // Phone -> PBX: the first packet also teaches the relay the phone's
+        // address. Sizes go up to a full Ethernet MTU and beyond the old
+        // 2 KiB receive buffer.
+        for (seq, len) in [(1u16, 160usize), (2, 1400), (3, 4000)] {
+            let pkt = srtp_packet(seq, len);
+            phone.send_to(&pkt, to_phone_side).await.unwrap();
+            let (got, from) = recv(&pbx).await;
+            assert_eq!(got, pkt, "phone->pbx packet {seq} changed");
+            assert_eq!(from.port(), pbx_port, "sent from the PBX-facing socket");
+        }
+        let rtcp = srtcp_packet();
+        phone.send_to(&rtcp, to_phone_side).await.unwrap();
+        assert_eq!(recv(&pbx).await.0, rtcp, "phone->pbx SRTCP changed");
+
+        // PBX -> phone.
+        for (seq, len) in [(100u16, 160usize), (101, 1400), (102, 4000)] {
+            let pkt = srtp_packet(seq, len);
+            pbx.send_to(&pkt, to_pbx_side).await.unwrap();
+            let (got, from) = recv(&phone).await;
+            assert_eq!(got, pkt, "pbx->phone packet {seq} changed");
+            assert_eq!(from.port(), phone_port, "sent from the phone-facing socket");
+        }
+        pbx.send_to(&rtcp, to_pbx_side).await.unwrap();
+        assert_eq!(recv(&phone).await.0, rtcp, "pbx->phone SRTCP changed");
+        relay.stop();
     }
 }

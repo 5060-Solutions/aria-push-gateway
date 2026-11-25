@@ -1255,6 +1255,13 @@ impl HandoffManager {
             }
         }
 
+        message::warn_if_sdes_in_clear(
+            call.socket.transport(),
+            &call.call_id,
+            &rewritten_sdp,
+            "200 OK to PBX",
+        );
+
         // Build 200 OK with the rewritten SDP and send to PBX
         let local_addr = call.proxy_reg.read().await.local_addr;
         let contact_uri = gateway_contact(local_addr);
@@ -2283,6 +2290,7 @@ impl HandoffManager {
             .strip_suffix("Content-Length: 0\r\n\r\n")
             .unwrap_or(&head);
         let invite = format!("{head}Content-Length: {}\r\n\r\n{offer}", offer.len());
+        message::warn_if_sdes_in_clear(socket.transport(), call_id, offer, "re-INVITE to PBX");
 
         let response = self
             .refer_transaction(&socket, pbx_addr, &invite, &branch)

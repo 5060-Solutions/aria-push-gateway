@@ -406,7 +406,9 @@ and that ref until a final response arrives.
 | `404` | The caller has no active device for `sip_username` + `sip_domain` |
 | `409` | `{"error":"cancelled"}`: cancelled via `/v1/calls/cancel` |
 | `409` | `{"error":"client_ref_in_use"}`: the caller already has a pending call with this `client_ref` |
-| `502` | The INVITE failed, timed out (30 s) or was rejected |
+| `502` | `{"error":"media_not_acceptable","sip_status":488}`: the PBX answered `488` or `606` (it will not take the offered media, e.g. an `RTP/SAVP` offer to a PBX without SRTP; the app may retry with `RTP/AVP`) |
+| `502` | `{"error":"call_failed","sip_status":N}`: any other final non-2xx `N` from the PBX (e.g. `486`, `403`) |
+| `502` | No body: the INVITE timed out (30 s), the PBX was unreachable, or the INVITE could not be sent |
 
 **Cancel body:** `{"client_ref": "<ref>"}`
 
@@ -528,13 +530,30 @@ session version incremented (RFC 3264). The answer is
 | `400` | Missing body, or an SDP that is not `v=0` with a `c=` address and an `m=audio` port, contains control characters, or is over 8 KB |
 | `404` | Unknown token, another user's call, or a call that is not answered |
 | `409` | Another media update of this call is in progress |
-| `502` | The PBX refused (e.g. `488`/`491`; the refusal is ACKed). The call stays up on its previous media |
+| `502` | The PBX refused (the refusal is ACKed). The call stays up on its previous media. Body `{"error":"media_not_acceptable","sip_status":488}` for `488`/`606`, otherwise `{"error":"media_update_rejected","sip_status":N}` (e.g. `491`) |
+| `502` | No body: the re-INVITE could not be sent |
 | `504` | No final response within 8 s |
 
 The 2xx is ACKed, and the ACK is sent again if the PBX repeats the 2xx. Over UDP
 the INVITE is retransmitted until a final response. The PBX's media relay must
 honour the new address: aria-cloud-pbx re-points the relay leg on such a
 re-INVITE only from the release that implements it (see the release notes).
+
+### SRTP (SDES)
+
+The gateway carries SDP between the app and the PBX unchanged, so an
+`RTP/SAVP` offer or answer with SDES `a=crypto:` lines (RFC 4568) reaches the
+other side byte for byte and SRTP runs end to end between the phone and the
+PBX. Media goes directly between the phone and the PBX's media address; the
+optional gateway RTP relay (not enabled for calls today) rewrites only the
+`c=`/`o=` address and the `m=audio` port, and forwards datagrams (SRTP, and
+SRTCP when `a=rtcp-mux` is used) without parsing them. It has no RTP+1 RTCP
+port, so without `rtcp-mux` RTCP is not relayed.
+
+The SDES keys travel in the SIP signalling. When an SDP with `a=crypto:` is
+sent to or received from the PBX over UDP or TCP the gateway logs a warning,
+since the keys are then readable on that hop: use `sip_transport: "tls"` to
+keep them confidential.
 
 ### Health
 

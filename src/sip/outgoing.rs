@@ -132,6 +132,12 @@ impl OutgoingInvite {
         let mut cseq: u32 = 1;
         let mut invite = self.build_invite(cseq, &message::generate_branch(), None);
         let mut auth_attempts = 0;
+        message::warn_if_sdes_in_clear(
+            self.socket.transport(),
+            &self.call_id,
+            &self.sdp_offer,
+            "INVITE to PBX",
+        );
         if let Err(e) = self.send(&invite).await {
             report(&mut result, Err(e.into()));
             return;
@@ -367,9 +373,7 @@ impl OutgoingInvite {
                     let outcome = if cancel_wanted {
                         Err(OriginateRefusal::Cancelled.into())
                     } else {
-                        Err(anyhow::anyhow!(
-                            "Outgoing call rejected with status {status}"
-                        ))
+                        Err(OriginateRefusal::Rejected(status).into())
                     };
                     // The INVITE is over: its client_ref is free again.
                     drop(slot);
