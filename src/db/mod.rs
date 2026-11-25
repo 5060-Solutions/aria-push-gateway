@@ -16,6 +16,11 @@ pub struct DeviceRecord {
     pub platform: String, // "ios" or "android"
     pub push_token: String,
     pub bundle_id: Option<String>,
+    /// The token for ordinary (alert) notifications. On iOS this is the
+    /// regular APNs device token, which is not the PushKit token in
+    /// `push_token`; on Android the same FCM token serves both. `None` for an
+    /// app that has not sent one.
+    pub alert_token: Option<String>,
 
     // SIP credentials (encrypted at rest in production)
     pub sip_username: String,
@@ -108,6 +113,18 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Added after the first release: an existing database has no column.
+        let has_alert_token: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'alert_token'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_alert_token == 0 {
+            sqlx::query("ALTER TABLE devices ADD COLUMN alert_token TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+
         Ok(())
     }
 
@@ -115,13 +132,14 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO devices (
-                id, user_id, platform, push_token, bundle_id,
+                id, user_id, platform, push_token, bundle_id, alert_token,
                 sip_username, sip_password, sip_domain, sip_registrar,
                 sip_transport, sip_port, sip_auth_username, sip_display_name,
                 active, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 push_token = excluded.push_token,
+                alert_token = excluded.alert_token,
                 sip_username = excluded.sip_username,
                 sip_password = excluded.sip_password,
                 sip_domain = excluded.sip_domain,
@@ -139,6 +157,7 @@ impl Database {
         .bind(&device.platform)
         .bind(&device.push_token)
         .bind(&device.bundle_id)
+        .bind(&device.alert_token)
         .bind(&device.sip_username)
         .bind(&device.sip_password)
         .bind(&device.sip_domain)
@@ -192,6 +211,19 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+
+    /// The user's active devices.
+    pub async fn list_active_devices_for_user(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<DeviceRecord>> {
+        Ok(sqlx::query_as::<_, DeviceRecord>(
+            "SELECT * FROM devices WHERE user_id = ? AND active = TRUE ORDER BY created_at",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn deactivate_device(&self, id: &str) -> anyhow::Result<()> {

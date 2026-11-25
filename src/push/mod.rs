@@ -42,6 +42,9 @@ pub enum PushError {
     NoDevice,
     /// The device's provider (`"APNs"` or `"FCM"`) is not configured.
     NotConfigured(&'static str),
+    /// An iOS device with no alert token: its push token is a PushKit one,
+    /// which cannot show an alert.
+    NoAlertToken,
     /// The device has a platform the gateway can't push to.
     UnknownPlatform(String),
     /// The provider credential (APNs JWT, FCM access token) couldn't be had.
@@ -64,6 +67,7 @@ impl std::fmt::Display for PushError {
         match self {
             Self::NoDevice => write!(f, "device not registered for push"),
             Self::NotConfigured(p) => write!(f, "{p} not configured"),
+            Self::NoAlertToken => write!(f, "device has no alert token"),
             Self::UnknownPlatform(p) => write!(f, "unknown platform: {p}"),
             Self::Credentials(e) => write!(f, "push credentials unavailable: {e}"),
             Self::Rejected {
@@ -84,6 +88,7 @@ impl PushError {
         match self {
             Self::NoDevice => "No push device registered",
             Self::NotConfigured(_) => "Push provider not configured",
+            Self::NoAlertToken => "No alert token",
             Self::UnknownPlatform(_) => "Unsupported device platform",
             Self::Credentials(_) => "Push credentials unavailable",
             Self::Rejected { .. } => "Push rejected by provider",
@@ -176,6 +181,61 @@ struct ApnsAps {
 struct ApnsAlert {
     title: String,
     body: String,
+}
+
+/// An ordinary alert notification (not a call): what a text message sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alert {
+    pub title: String,
+    pub body: Option<String>,
+    /// Alerts with the same id are grouped (iOS `thread-id`, Android tag).
+    pub thread_id: Option<String>,
+    /// Delivered beside the alert.
+    pub data: std::collections::BTreeMap<String, String>,
+}
+
+/// The APNs body of an alert: a visible banner with the app's data beside
+/// `aps`. The caller refuses a `data` key named `aps`.
+fn apns_alert_payload(alert: &Alert) -> serde_json::Value {
+    let mut aps_alert = serde_json::json!({ "title": alert.title });
+    if let Some(body) = &alert.body {
+        aps_alert["body"] = body.clone().into();
+    }
+    let mut aps = serde_json::json!({ "alert": aps_alert, "sound": "default" });
+    if let Some(thread) = &alert.thread_id {
+        aps["thread-id"] = thread.clone().into();
+    }
+    let mut payload = serde_json::Map::new();
+    for (k, v) in &alert.data {
+        payload.insert(k.clone(), v.clone().into());
+    }
+    payload.insert("aps".into(), aps);
+    payload.into()
+}
+
+/// The FCM message for an alert: a notification the system shows by itself,
+/// with the app's data beside it.
+fn fcm_alert_message(token: &str, alert: &Alert) -> serde_json::Value {
+    let mut notification = serde_json::json!({ "title": alert.title });
+    if let Some(body) = &alert.body {
+        notification["body"] = body.clone().into();
+    }
+    let mut android_notification = serde_json::json!({ "channel_id": "messages" });
+    if let Some(thread) = &alert.thread_id {
+        android_notification["tag"] = thread.clone().into();
+    }
+    serde_json::json!({
+        "message": {
+            "token": token,
+            "notification": notification,
+            "data": alert.data,
+            "android": {
+                "priority": "HIGH",
+                "ttl": "3600s",
+                "notification": android_notification,
+            }
+        }
+    })
 }
 
 /// Google OAuth2 token response.
@@ -287,6 +347,83 @@ impl PushManager {
                     .await
             }
             _ => Err(PushError::UnknownPlatform(device.platform.clone())),
+        }
+    }
+
+    /// Send an alert notification to `device`.
+    pub async fn send_alert(&self, device: &DeviceRecord, alert: &Alert) -> Result<(), PushError> {
+        match device.platform.as_str() {
+            "ios" => self.send_apns_alert(device, alert).await,
+            "android" => self.send_fcm_alert(device, alert).await,
+            _ => Err(PushError::UnknownPlatform(device.platform.clone())),
+        }
+    }
+
+    async fn send_apns_alert(&self, device: &DeviceRecord, alert: &Alert) -> Result<(), PushError> {
+        let token = device
+            .alert_token
+            .as_deref()
+            .ok_or(PushError::NoAlertToken)?;
+        let apns = self.apns.as_ref().ok_or(PushError::NotConfigured("APNs"))?;
+        let jwt = Self::get_apns_jwt(apns)
+            .await
+            .map_err(|e| PushError::Credentials(e.to_string()))?;
+        let topic = device.bundle_id.as_deref().unwrap_or(&apns.bundle_id);
+        let resp = apns
+            .http
+            .post(format!("{}/3/device/{}", apns.host, token))
+            .header("authorization", format!("bearer {}", jwt))
+            .header("apns-push-type", "alert")
+            .header("apns-priority", "10")
+            .header("apns-topic", topic)
+            .json(&apns_alert_payload(alert))
+            .send()
+            .await
+            .map_err(|e| PushError::Transport {
+                provider: "APNs",
+                error: e.to_string(),
+            })?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            Err(PushError::Rejected {
+                provider: "APNs",
+                status,
+                body,
+            })
+        }
+    }
+
+    async fn send_fcm_alert(&self, device: &DeviceRecord, alert: &Alert) -> Result<(), PushError> {
+        let fcm = self.fcm.as_ref().ok_or(PushError::NotConfigured("FCM"))?;
+        // The same FCM token serves calls and alerts.
+        let token = device.alert_token.as_deref().unwrap_or(&device.push_token);
+        let access_token = Self::get_fcm_token(fcm)
+            .await
+            .map_err(|e| PushError::Credentials(e.to_string()))?;
+        let resp = fcm
+            .http
+            .post(&fcm.send_url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .json(&fcm_alert_message(token, alert))
+            .send()
+            .await
+            .map_err(|e| PushError::Transport {
+                provider: "FCM",
+                error: e.to_string(),
+            })?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            Err(PushError::Rejected {
+                provider: "FCM",
+                status,
+                body,
+            })
         }
     }
 
@@ -627,6 +764,7 @@ pub(crate) fn test_device(id: &str, platform: &str) -> DeviceRecord {
         platform: platform.into(),
         push_token: format!("push-{id}"),
         bundle_id: None,
+        alert_token: None,
         sip_username: "1001".into(),
         sip_password: "pw".into(),
         sip_domain: "pbx.example.com".into(),
@@ -770,6 +908,58 @@ mod tests {
         let wait = manager.refresh_credentials().await;
         assert!(wait > Duration::from_secs(2900), "{wait:?}");
         assert!(wait <= Duration::from_secs(3000), "{wait:?}");
+    }
+
+    fn alert() -> Alert {
+        Alert {
+            title: "+15551230000".into(),
+            body: Some("hello".into()),
+            thread_id: Some("did:+15551230000".into()),
+            data: [("type".to_string(), "sms".to_string())].into(),
+        }
+    }
+
+    #[test]
+    fn an_apns_alert_is_a_banner_with_the_data_beside_aps() {
+        let p = apns_alert_payload(&alert());
+        assert_eq!(p["aps"]["alert"]["title"], "+15551230000");
+        assert_eq!(p["aps"]["alert"]["body"], "hello");
+        assert_eq!(p["aps"]["thread-id"], "did:+15551230000");
+        assert_eq!(p["type"], "sms");
+        assert!(p["aps"].get("content-available").is_none());
+
+        let mut quiet = alert();
+        quiet.body = None;
+        assert!(apns_alert_payload(&quiet)["aps"]["alert"]
+            .get("body")
+            .is_none());
+    }
+
+    #[test]
+    fn an_fcm_alert_is_a_notification_message_with_the_data() {
+        let m = fcm_alert_message("tok", &alert());
+        assert_eq!(m["message"]["token"], "tok");
+        assert_eq!(m["message"]["notification"]["title"], "+15551230000");
+        assert_eq!(m["message"]["data"]["type"], "sms");
+        assert_eq!(
+            m["message"]["android"]["notification"]["tag"],
+            "did:+15551230000"
+        );
+    }
+
+    #[tokio::test]
+    async fn alerts_reach_android_and_an_ios_device_without_a_token_is_refused() {
+        let fcm = mock::MockFcm::start().await;
+        let manager = fcm.manager("dev").await;
+        manager
+            .send_alert(&test_device("dev", "android"), &alert())
+            .await
+            .unwrap();
+        let err = manager
+            .send_alert(&test_device("ios", "ios"), &alert())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PushError::NoAlertToken), "{err}");
     }
 
     #[tokio::test]
