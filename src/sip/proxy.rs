@@ -1057,6 +1057,19 @@ impl SipProxyManager {
                 handoff.handle_refer_response_on(text, &socket).await;
                 Ok(())
             }
+            // Responses to a media-update re-INVITE of ours.
+            "INVITE" => {
+                let (handoff, socket) = {
+                    let r = reg.read().await;
+                    (r.handoff.clone(), r.socket.clone())
+                };
+                if !handoff.handle_refer_response_on(text, &socket).await
+                    && (200..300).contains(&status)
+                {
+                    handoff.repeat_reinvite_ack(text, &socket, from).await;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1418,12 +1431,21 @@ impl SipProxyManager {
                             handoff.handle_refer_response_on(text, &socket).await;
                         }
                         // The PBX didn't get our ACK and repeats its 2xx.
-                        Some("INVITE")
+                        Some("INVITE") => {
+                            // A response to our media-update re-INVITE, a
+                            // repeated 2xx to it, or a repeated 2xx to the
+                            // call's INVITE (our ACK was lost).
+                            if handoff.handle_refer_response_on(text, &socket).await
+                                || handoff.repeat_reinvite_ack(text, &socket, from).await
+                            {
+                                continue;
+                            }
                             if message::parse_status_code(text)
-                                .is_some_and(|c| (200..300).contains(&c)) =>
-                        {
-                            if let Some(ack) = &ack {
-                                let _ = socket.send_to(ack.as_bytes(), from).await;
+                                .is_some_and(|c| (200..300).contains(&c))
+                            {
+                                if let Some(ack) = &ack {
+                                    let _ = socket.send_to(ack.as_bytes(), from).await;
+                                }
                             }
                         }
                         _ => {}
