@@ -55,6 +55,8 @@ pub fn build_router(
     Router::new()
         // Auth
         .route("/v1/auth/token", post(create_token))
+        // Notifications a trusted backend asks for
+        .route("/v1/notify", post(notify_user))
         // Device management
         .route("/v1/devices", post(register_device))
         .route("/v1/devices/{id}", get(get_device_status))
@@ -105,6 +107,25 @@ fn issuer_key_matches(presented: &str, expected: &str) -> bool {
     bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+/// Whether `presented` is the issuer key. A missing, empty, `"auto"` or wrong
+/// key is 401; with no issuer key configured the backend-only endpoints are
+/// disabled (503).
+fn check_issuer_key(state: &AppState, presented: Option<&str>) -> Result<(), StatusCode> {
+    let Some(expected) = state.token_issuer_key.as_deref() else {
+        tracing::warn!("backend request refused: TOKEN_ISSUER_KEY is not configured");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let presented = presented.unwrap_or_default();
+    if presented.is_empty()
+        || presented.eq_ignore_ascii_case("auto")
+        || !issuer_key_matches(presented, expected)
+    {
+        tracing::warn!("backend request refused: invalid api_key");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
 /// Mint a JWT for `user_id`.
 ///
 /// Only a trusted backend holding `TOKEN_ISSUER_KEY` may call this. A missing,
@@ -114,21 +135,8 @@ async fn create_token(
     State(state): State<AppState>,
     body: Result<Json<TokenRequest>, JsonRejection>,
 ) -> Result<Json<TokenResponse>, StatusCode> {
-    let Some(expected) = state.token_issuer_key.as_deref() else {
-        tracing::warn!("token request refused: TOKEN_ISSUER_KEY is not configured");
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-
     let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let presented = req.api_key.as_deref().unwrap_or_default();
-    if presented.is_empty()
-        || presented.eq_ignore_ascii_case("auto")
-        || !issuer_key_matches(presented, expected)
-    {
-        tracing::warn!("token request refused: invalid api_key");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    check_issuer_key(&state, req.api_key.as_deref())?;
 
     if req.user_id.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -142,6 +150,108 @@ async fn create_token(
         token,
         expires_in: expiry,
     }))
+}
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct NotifyRequest {
+    /// Must equal the configured `TOKEN_ISSUER_KEY`.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// The user whose devices are notified (the same id the token was issued
+    /// for).
+    user_id: String,
+    /// What the notification is: `message` (a text message) is the only
+    /// kind. It is an ordinary alert, never a VoIP push.
+    kind: String,
+    title: String,
+    /// Left out, the alert shows the title only.
+    #[serde(default)]
+    body: Option<String>,
+    /// Alerts with the same id are grouped (iOS thread, Android tag).
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// Delivered with the alert, for the app to open the right screen.
+    #[serde(default)]
+    data: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct NotifyResponse {
+    /// Devices the provider accepted the alert for.
+    sent: usize,
+    /// Devices the provider refused or could not be reached for.
+    failed: usize,
+    /// Devices that cannot take an alert (an iOS app that sent no alert token).
+    skipped: usize,
+}
+
+const MAX_NOTIFY_DATA: usize = 20;
+
+/// Check the shape of a notification the backend asked for.
+fn validate_notify(req: &NotifyRequest) -> Result<(), StatusCode> {
+    let ok = req.kind == "message"
+        && !req.user_id.trim().is_empty()
+        && !req.title.trim().is_empty()
+        && req.title.chars().count() <= 200
+        && req
+            .body
+            .as_deref()
+            .is_none_or(|b| b.chars().count() <= 1000)
+        && req.thread_id.as_deref().is_none_or(|t| t.len() <= 200)
+        && req.data.len() <= MAX_NOTIFY_DATA
+        && req
+            .data
+            .iter()
+            .all(|(k, v)| !k.is_empty() && k.len() <= 64 && k != "aps" && v.len() <= 1000);
+    if ok {
+        Ok(())
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
+/// Send an alert to every active device of `user_id`.
+///
+/// Backend only, with `TOKEN_ISSUER_KEY` like the token endpoint. The answer
+/// counts devices: it is 200 even when none accepted, and the caller (the
+/// PBX) logs the counts.
+async fn notify_user(
+    State(state): State<AppState>,
+    body: Result<Json<NotifyRequest>, JsonRejection>,
+) -> Result<Json<NotifyResponse>, StatusCode> {
+    let Json(req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    check_issuer_key(&state, req.api_key.as_deref())?;
+    validate_notify(&req)?;
+
+    let devices = state
+        .db
+        .list_active_devices_for_user(&req.user_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let alert = crate::push::Alert {
+        title: req.title,
+        body: req.body,
+        thread_id: req.thread_id,
+        data: req.data,
+    };
+    let mut out = NotifyResponse {
+        sent: 0,
+        failed: 0,
+        skipped: 0,
+    };
+    for device in &devices {
+        match state.push_manager.send_alert(device, &alert).await {
+            Ok(()) => out.sent += 1,
+            Err(crate::push::PushError::NoAlertToken) => out.skipped += 1,
+            Err(e) => {
+                tracing::warn!(device_id = %device.id, error = %e, "alert push failed");
+                out.failed += 1;
+            }
+        }
+    }
+    Ok(Json(out))
 }
 
 // ── Ownership ────────────────────────────────────────────────────────────────
@@ -206,6 +316,10 @@ struct RegisterDeviceRequest {
     platform: String,
     push_token: String,
     bundle_id: Option<String>,
+    /// Token for ordinary notifications (text messages); see
+    /// `DeviceRecord::alert_token`.
+    #[serde(default)]
+    alert_token: Option<String>,
     sip_username: String,
     sip_password: String,
     sip_domain: String,
@@ -236,6 +350,9 @@ struct RegisterDeviceResponse {
 /// messages (CR/LF, URI or quoted-string delimiters, unknown transport).
 fn validate_registration(req: &mut RegisterDeviceRequest) -> Result<(), StatusCode> {
     let valid = matches!(req.platform.as_str(), "ios" | "android")
+        && req.alert_token.as_deref().is_none_or(|t| {
+            t.len() <= 512 && !t.chars().any(|c| c.is_control() || c.is_whitespace())
+        })
         && validate::is_valid_sip_user(&req.sip_username)
         && validate::is_valid_host(&req.sip_domain)
         && req
@@ -273,6 +390,7 @@ async fn register_device(
         platform: req.platform,
         push_token: req.push_token,
         bundle_id: req.bundle_id,
+        alert_token: req.alert_token.filter(|t| !t.is_empty()),
         sip_username: req.sip_username,
         sip_password: req.sip_password,
         sip_domain: req.sip_domain,
@@ -920,6 +1038,7 @@ mod tests {
                     platform: "android".into(),
                     push_token: push_token.into(),
                     bundle_id: None,
+                    alert_token: None,
                     sip_username: sip_username.into(),
                     sip_password: "pw".into(),
                     sip_domain: "pbx.example.com".into(),
@@ -1010,6 +1129,60 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(json["expires_in"], 3600);
         let claims = auth::verify_token(json["token"].as_str().unwrap(), JWT_SECRET).unwrap();
         assert_eq!(claims.sub, "ext-1");
+    }
+
+    fn notify_body(key: &str, user: &str) -> serde_json::Value {
+        serde_json::json!({
+            "api_key": key, "user_id": user, "kind": "message",
+            "title": "+15551230000", "body": "hi", "thread_id": "t",
+            "data": {"type": "sms"}
+        })
+    }
+
+    #[tokio::test]
+    async fn notify_needs_the_issuer_key_and_a_valid_body() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (s, _) = app.post_json("/v1/notify", notify_body("wrong", "u")).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let (s, _) = app.post_json("/v1/notify", notify_body("auto", "u")).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        for mutate in [
+            serde_json::json!({"kind": "call"}),
+            serde_json::json!({"title": " "}),
+            serde_json::json!({"user_id": ""}),
+            serde_json::json!({"data": {"aps": "x"}}),
+        ] {
+            let mut body = notify_body(ISSUER_KEY, "u");
+            for (k, v) in mutate.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let (s, _) = app.post_json("/v1/notify", body.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let off = test_app(None).await;
+        let (s, _) = off.post_json("/v1/notify", notify_body("k", "u")).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn notify_counts_the_users_active_devices_only() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("a1", "u", true).await;
+        app.add_device("a2", "u", false).await;
+        app.add_device("b1", "other", true).await;
+        // No FCM is configured in the test app: the one active Android
+        // device is a failure, and nothing else is counted.
+        let (s, body) = app
+            .post_json("/v1/notify", notify_body(ISSUER_KEY, "u"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"sent": 0, "failed": 1, "skipped": 0}));
+        let (_, body) = app
+            .post_json("/v1/notify", notify_body(ISSUER_KEY, "nobody"))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"sent": 0, "failed": 0, "skipped": 0}));
     }
 
     #[tokio::test]
@@ -1530,6 +1703,7 @@ Content-Length: 0\r\n\r\n";
                 platform: "android".into(),
                 push_token: format!("push-{id}"),
                 bundle_id: None,
+                alert_token: None,
                 sip_username: "1001".into(),
                 sip_password: "stored-pw".into(),
                 sip_domain: "pbx.example.com".into(),

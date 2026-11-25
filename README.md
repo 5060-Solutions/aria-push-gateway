@@ -318,6 +318,7 @@ re-registration fails.
   "platform": "ios",
   "push_token": "<apns-device-token>",
   "bundle_id": "com.example.aria",
+  "alert_token": "<regular-apns-device-token>",
   "sip_username": "alice",
   "sip_password": "secret",
   "sip_domain": "sip.example.com",
@@ -327,6 +328,31 @@ re-registration fails.
   "sip_display_name": "Alice"
 }
 ```
+
+`alert_token` is optional: the token for ordinary notifications (text
+messages). On iOS it is the regular APNs device token, which is not the PushKit
+token in `push_token`; an iOS device without one gets no message alerts. On
+Android the FCM `push_token` serves both.
+
+### Notifications
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/notify` | Send an alert to every active device of a user (trusted backend only) |
+
+Like `/v1/auth/token`, it takes `api_key` (the `TOKEN_ISSUER_KEY`) in the
+body and needs no bearer token.
+
+**Body:** `{"api_key", "user_id", "kind": "message", "title", "body"?, "thread_id"?, "data"?: {string: string}}`
+
+The alert is an ordinary notification (APNs `alert`, FCM notification message),
+never a VoIP push. `data` is delivered beside it (at most 20 entries; `aps` is
+reserved). `body` is optional so a backend can leave message text out of
+Apple's and Google's systems.
+
+**Response:** `{"sent", "failed", "skipped"}`: devices the provider accepted,
+devices it refused or could not be reached for, and devices that cannot take an
+alert (iOS without an `alert_token`). `200` whatever the counts.
 
 ### Call Signaling
 
