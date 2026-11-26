@@ -1397,6 +1397,8 @@ impl HandoffManager {
             caller_uri: format!("{}@{}", caller_user, caller_domain),
             caller_name,
             sdp_offer: sdp,
+            x_aria_move: message::extract_header(&call.invite_raw, "X-Aria-Move")
+                .filter(|m| !m.is_empty()),
         })
     }
 
@@ -2624,6 +2626,10 @@ pub struct CallOffer {
     pub caller_uri: String,
     pub caller_name: Option<String>,
     pub sdp_offer: String,
+    /// The INVITE's `X-Aria-Move` value when the PBX is moving a call to
+    /// this device; the app compares it with the move it requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aria_move: Option<String>,
 }
 
 impl CallStatus {

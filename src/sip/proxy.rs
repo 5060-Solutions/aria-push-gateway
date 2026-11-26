@@ -185,7 +185,7 @@ impl ProxyRegistration {
             resolver: None,
             lookups: None,
             allow_local_targets: false,
-            instance: message::instance_urn("1001", domain),
+            instance: message::instance_urn("test-device"),
             options_cseq: 0,
             transport: Transport::Udp,
             tls: None,
@@ -509,7 +509,7 @@ impl SipProxyManager {
         let call_id = message::generate_call_id();
         let from_tag = format!("{:08x}", rand::random::<u32>());
 
-        let instance = message::instance_urn(&config.username, &config.domain);
+        let instance = message::instance_urn(&device_id);
         let (lookups_tx, lookups_rx) = tokio::sync::mpsc::unbounded_channel();
         let reg = Arc::new(RwLock::new(ProxyRegistration {
             device_id: device_id.clone(),
@@ -1133,6 +1133,7 @@ impl SipProxyManager {
             message::extract_from_uri(text).unwrap_or(("unknown".into(), "unknown".into()));
         let caller_uri = format!("{caller_user}@{caller_domain}");
         let caller_name = message::extract_display_name(text);
+        let move_id = message::extract_header(text, "X-Aria-Move").filter(|m| !m.is_empty());
         let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
 
         // SDP passes through unchanged — phone talks directly to PBX relay
@@ -1159,7 +1160,13 @@ impl SipProxyManager {
         let handoff = Arc::clone(handoff);
         tokio::spawn(async move {
             let result = push_mgr
-                .send_incoming_call(&device_id, &call_token, &caller_uri, caller_name.as_deref())
+                .send_incoming_call(
+                    &device_id,
+                    &call_token,
+                    &caller_uri,
+                    caller_name.as_deref(),
+                    move_id.as_deref(),
+                )
                 .await;
             let push_ms = received.elapsed().as_millis() as u64;
             match result {
@@ -1500,7 +1507,7 @@ impl SipProxyManager {
             resolver: None,
             lookups: None,
             allow_local_targets: false,
-            instance: message::instance_urn(&account.username, &account.domain),
+            instance: message::instance_urn("outgoing"),
             options_cseq: 0,
             transport: socket.transport(),
             tls: None,
@@ -2506,7 +2513,7 @@ Content-Length: 0\r\n\r\n";
         .await
         .unwrap();
         let (register, _) = recv_from(&pbx).await;
-        let instance = message::instance_urn("1001", "pbx.example.com");
+        let instance = message::instance_urn("dev1");
         let contact = message::extract_header(&register, "Contact").unwrap();
         assert!(
             contact.ends_with(&format!(";+sip.instance=\"<{instance}>\";reg-id=1")),

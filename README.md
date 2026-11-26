@@ -183,7 +183,11 @@ it is on, and outgoing calls open their own. Messages are framed by
 `Content-Length`. RFC 3261 retransmission timers (A/E/G, and the 2xx
 retransmission until ACK) run on UDP only. On a stream a request or response is
 written once, and the transaction timeouts stay the same. Each REGISTER carries
-`+sip.instance`, `reg-id` and `Supported: outbound` (RFC 5626). The gateway
+`+sip.instance`, `reg-id` and `Supported: outbound` (RFC 5626). The instance
+is `urn:uuid:<device_id>`, the `device_id` that `POST /v1/devices` returned (it
+was a hash of user and domain before, so two phones of one user shared it).
+The apps pass the same URN as `sip_instance` to the PBX API, which matches it
+against the registration, so call move can find the device. The gateway
 sends a double-CRLF keep-alive every 80-100 % of the registrar's `Flow-Timer`,
 or every 25 s when there is none. If no CRLF pong arrives within 10 s, the flow
 has failed. A flow failure (the connection closed or reset, or a missing pong)
@@ -206,6 +210,19 @@ the gateway opens one stream per device plus one per outgoing call, all from
 the gateway's IP. Raise `SIP_STREAM_MAX_PER_IP` (default 32) above the
 number of devices plus concurrent calls. List the gateway's public IP in
 `PUSH_GATEWAY_SIP_SOURCES` on every node.
+
+## Call move
+
+When the PBX moves a call to a device it INVITEs it with `X-Aria-Move:
+<move_id>`. The gateway passes the value on, and only then:
+
+- VoIP push (APNs body, FCM `data`): `moveId` and `moveFrom` (the caller's
+  display name, else its URI), beside `callToken`, `callerUri`, `callerName`.
+- `GET /v1/calls/{token}` (the call offer): `x_aria_move`, omitted otherwise.
+
+The gateway's source IP is all the PBX sees for a mobile device; apps report
+nearness through the PBX API (`/me/devices/current/proximity`), so the gateway
+does nothing for it.
 
 ## Docker
 
