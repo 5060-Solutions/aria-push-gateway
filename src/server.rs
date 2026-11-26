@@ -1178,6 +1178,7 @@ Content-Length: 0\r\n\r\n";
             serde_json::json!("hold wait"),
             serde_json::json!("x".repeat(65)),
             serde_json::json!("HOLD-WAIT"),
+            serde_json::json!("hold_wait"),
             serde_json::json!(""),
         ] {
             let mut body = notify_body(ISSUER_KEY, "u");

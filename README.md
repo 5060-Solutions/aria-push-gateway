@@ -244,9 +244,9 @@ wording it shows.
 Call status (`GET /v1/calls/{token}/status`) reports `"reason": "held_for_you"`
 for a call ended by a BYE carrying `X-Aria-Hold-Wait`.
 
-The notify request (`POST /v1/notify`) also carries `"category": "HOLD_WAIT"`,
-a new optional field of at most 64 characters from `[A-Z_]`. The gateway puts
-it in `aps.category` on iOS. FCM is unchanged.
+The PBX sends `"category": "HOLD_WAIT"` on hold-wait alerts (see
+`/v1/notify`); the gateway puts it in `aps.category` on iOS and leaves FCM
+unchanged.
 
 ## Docker
 

@@ -1171,6 +1171,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dirty_hold_return_name_is_cleaned_at_the_invite() {
+        let raw = format!(
+            "INVITE sip:a@b SIP/2.0\r\nX-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: \"Acme\" <Bank>\\ {}\r\n\r\n",
+            "\u{e9}".repeat(200)
+        );
+        let e = IncomingCallExtras::from_invite(&raw);
+        let name = e.hold_return_name.expect("name kept");
+        assert_eq!(name.chars().count(), 64);
+        assert!(!name.contains(['"', '<', '>', '\\']));
+        assert_eq!(
+            name,
+            format!("Acme Bank {}", "\u{e9}".repeat(64 - "Acme Bank ".len()))
+        );
+
+        let empty = IncomingCallExtras::from_invite(
+            "INVITE sip:a@b SIP/2.0\r\nX-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: <>\r\n\r\n",
+        );
+        assert_eq!(empty.hold_return_name, None);
+    }
+
+    #[test]
     fn push_payloads_carry_the_move_id_only_for_a_move() {
         let moved_extras = IncomingCallExtras {
             move_id: Some("m-1".into()),
