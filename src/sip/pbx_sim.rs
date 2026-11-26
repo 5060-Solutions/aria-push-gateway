@@ -264,6 +264,7 @@ fn account(transport: &str) -> SipAccountConfig {
         port: 5061,
         auth_username: None,
         display_name: String::new(),
+        platform: "ios".into(),
     }
 }
 

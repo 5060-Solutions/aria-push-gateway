@@ -49,6 +49,7 @@ impl DeviceRecord {
             port: self.sip_port as u16,
             auth_username: self.sip_auth_username.clone(),
             display_name: self.sip_display_name.clone(),
+            platform: self.platform.clone(),
         }
     }
 }
@@ -248,6 +249,28 @@ impl Database {
     /// Deactivate `user_id`'s active devices with this push token, so one
     /// physical device isn't registered as several of the user's extensions.
     /// Other users' devices are never touched.
+    /// The id of `user_id`'s device with this push token, active or not: the
+    /// phone's earlier registration, whose id (and so `+sip.instance`) a new
+    /// registration keeps, so one phone is one device at the PBX however
+    /// often its app starts.
+    pub async fn device_id_for_token(
+        &self,
+        user_id: &str,
+        push_token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if push_token.is_empty() {
+            return Ok(None);
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM devices WHERE user_id = ? AND push_token = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(push_token)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn deactivate_user_devices_for_token(
         &self,
         user_id: &str,
