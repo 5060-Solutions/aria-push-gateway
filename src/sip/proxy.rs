@@ -31,6 +31,9 @@ pub struct SipAccountConfig {
     pub port: u16,
     pub auth_username: Option<String>,
     pub display_name: String,
+    /// `ios` or `android`: named in the REGISTER's User-Agent, which is how
+    /// the PBX labels the device ("Aria for Android").
+    pub platform: String,
 }
 
 impl SipAccountConfig {
@@ -166,6 +169,7 @@ impl ProxyRegistration {
                 port: 5060,
                 auth_username: None,
                 display_name: String::new(),
+                platform: "android".into(),
             },
             socket,
             server_addr: local_addr,
@@ -711,6 +715,7 @@ impl SipProxyManager {
                 None,
                 r.expires(),
                 &r.instance,
+                &r.config.platform,
             );
             (msg, r.server_addr, r.socket.clone())
         };
@@ -1333,6 +1338,7 @@ impl SipProxyManager {
                         Some(&auth.to_header()),
                         r.expires(),
                         &r.instance,
+                        &r.config.platform,
                     );
 
                     (msg, r.server_addr, r.socket.clone())
@@ -2421,6 +2427,7 @@ Content-Length: 0\r\n\r\n";
             port: pbx.local_addr().unwrap().port(),
             auth_username: None,
             display_name: String::new(),
+            platform: "android".into(),
         }
     }
 
