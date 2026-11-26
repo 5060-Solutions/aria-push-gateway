@@ -246,9 +246,6 @@ impl Database {
         Ok(())
     }
 
-    /// Deactivate `user_id`'s active devices with this push token, so one
-    /// physical device isn't registered as several of the user's extensions.
-    /// Other users' devices are never touched.
     /// The id of `user_id`'s device with this push token, active or not: the
     /// phone's earlier registration, whose id (and so `+sip.instance`) a new
     /// registration keeps, so one phone is one device at the PBX however
@@ -271,6 +268,9 @@ impl Database {
         .await?)
     }
 
+    /// Deactivate `user_id`'s active devices with this push token, so one
+    /// physical device isn't registered as several of the user's extensions.
+    /// Other users' devices are never touched.
     pub async fn deactivate_user_devices_for_token(
         &self,
         user_id: &str,
