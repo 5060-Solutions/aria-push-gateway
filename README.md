@@ -241,6 +241,9 @@ The name is cleaned before it leaves the gateway: control characters, `"`,
 characters. The APNs alert body stays "{name} is calling"; the app decides the
 wording it shows.
 
+Call status (`GET /v1/calls/{token}/status`) reports `"reason": "held_for_you"`
+for a call ended by a BYE carrying `X-Aria-Hold-Wait`.
+
 ## Docker
 
 Build from the `5060/` parent directory (the gateway depends on the sibling `aria-sip-core` crate):
