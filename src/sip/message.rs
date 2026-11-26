@@ -127,20 +127,14 @@ pub fn extract_display_name(msg: &str) -> Option<String> {
 /// The `reg-id` of the gateway's one flow per user (RFC 5626 section 4.2).
 pub const REG_ID: u32 = 1;
 
-/// A stable RFC 5626 `+sip.instance` URN for `user@domain`: the same user
-/// gets the same instance ID across restarts, re-registrations and
-/// failovers, so a registrar replaces the binding instead of adding one.
-/// (A name-based UUID: FNV-1a 128 over the address of record, with the
-/// version and variant bits set.)
-pub fn instance_urn(username: &str, domain: &str) -> String {
-    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for b in format!("aria-gateway:{username}@{domain}").bytes() {
-        h ^= u128::from(b);
-        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
-    }
-    h = (h & !(0xf << 76)) | (8 << 76); // version 8 (custom)
-    h = (h & !(0x3 << 62)) | (0x2 << 62); // RFC 4122 variant
-    format!("urn:uuid:{}", uuid::Uuid::from_u128(h))
+/// The RFC 5626 `+sip.instance` URN of a device: `urn:uuid:<device_id>`,
+/// the ID the gateway returned at device registration. The apps send the
+/// same URN to the PBX API (`sip_instance`), which matches it against the
+/// registration's `+sip.instance` to find the device. It is stable across
+/// restarts, re-registrations and failovers, so a registrar replaces the
+/// binding instead of adding one; two devices of one user get two.
+pub fn instance_urn(device_id: &str) -> String {
+    format!("urn:uuid:{device_id}")
 }
 
 /// The Contact header value of a REGISTER: the gateway's address with its
@@ -489,7 +483,7 @@ mod tests {
 
     #[test]
     fn register_contact_carries_instance_and_reg_id() {
-        let inst = instance_urn("1001", "pbx.example.com");
+        let inst = instance_urn("dev1");
         let c = register_contact("1001", "10.0.0.5", 5070, "udp", &inst);
         assert_eq!(
             c,
@@ -514,14 +508,10 @@ mod tests {
     }
 
     #[test]
-    fn instance_urn_is_stable_per_user_and_a_valid_uuid() {
-        let a = instance_urn("1001", "pbx.example.com");
-        assert_eq!(a, instance_urn("1001", "pbx.example.com"));
-        assert_ne!(a, instance_urn("1002", "pbx.example.com"));
-        assert_ne!(a, instance_urn("1001", "other.example.com"));
-        let uuid = uuid::Uuid::parse_str(a.strip_prefix("urn:uuid:").unwrap()).unwrap();
-        assert_eq!(uuid.get_version_num(), 8);
-        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+    fn instance_urn_is_the_device_id() {
+        let id = "6f1c2a9e-1c1f-4c3e-9a55-0d7f3a1b2c4d";
+        assert_eq!(instance_urn(id), format!("urn:uuid:{id}"));
+        assert_ne!(instance_urn(id), instance_urn("another"));
     }
 
     #[test]

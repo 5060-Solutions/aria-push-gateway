@@ -167,6 +167,12 @@ struct ApnsPayload {
     caller_uri: String,
     #[serde(rename = "callerName", skip_serializing_if = "Option::is_none")]
     caller_name: Option<String>,
+    /// The PBX's `X-Aria-Move` value, when this INVITE moves a call here.
+    #[serde(rename = "moveId", skip_serializing_if = "Option::is_none")]
+    move_id: Option<String>,
+    /// Who the moved call is with (display name, else the caller's URI).
+    #[serde(rename = "moveFrom", skip_serializing_if = "Option::is_none")]
+    move_from: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -331,6 +337,7 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        move_id: Option<&str>,
     ) -> Result<(), PushError> {
         let device = {
             let devices = self.devices.read().await;
@@ -339,11 +346,11 @@ impl PushManager {
 
         match device.platform.as_str() {
             "ios" => {
-                self.send_apns(&device, call_token, caller_uri, caller_name)
+                self.send_apns(&device, call_token, caller_uri, caller_name, move_id)
                     .await
             }
             "android" => {
-                self.send_fcm(&device, call_token, caller_uri, caller_name)
+                self.send_fcm(&device, call_token, caller_uri, caller_name, move_id)
                     .await
             }
             _ => Err(PushError::UnknownPlatform(device.platform.clone())),
@@ -433,23 +440,11 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        move_id: Option<&str>,
     ) -> Result<(), PushError> {
         let apns = self.apns.as_ref().ok_or(PushError::NotConfigured("APNs"))?;
 
-        let display = caller_name.unwrap_or(caller_uri);
-        let payload = ApnsPayload {
-            aps: ApnsAps {
-                alert: ApnsAlert {
-                    title: "Incoming Call".to_string(),
-                    body: format!("{} is calling", display),
-                },
-                sound: "ringtone.caf".to_string(),
-                content_available: 1,
-            },
-            call_token: call_token.to_string(),
-            caller_uri: caller_uri.to_string(),
-            caller_name: caller_name.map(|s| s.to_string()),
-        };
+        let payload = apns_payload(call_token, caller_uri, caller_name, move_id);
 
         let jwt = Self::get_apns_jwt(apns)
             .await
@@ -493,16 +488,11 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        move_id: Option<&str>,
     ) -> Result<(), PushError> {
         let fcm = self.fcm.as_ref().ok_or(PushError::NotConfigured("FCM"))?;
 
-        let mut data = serde_json::Map::new();
-        data.insert("type".into(), "incoming_call".into());
-        data.insert("callToken".into(), call_token.into());
-        data.insert("callerUri".into(), caller_uri.into());
-        if let Some(name) = caller_name {
-            data.insert("callerName".into(), name.into());
-        }
+        let data = fcm_data(call_token, caller_uri, caller_name, move_id);
 
         let payload = serde_json::json!({
             "message": {
@@ -755,6 +745,54 @@ impl PushManager {
 }
 
 /// A device record for push tests.
+/// The VoIP push body for an incoming call. `move_id` is the INVITE's
+/// `X-Aria-Move` value; with it the push also carries `moveId` and
+/// `moveFrom`, so the app can tell a call moved here from a new one.
+fn apns_payload(
+    call_token: &str,
+    caller_uri: &str,
+    caller_name: Option<&str>,
+    move_id: Option<&str>,
+) -> ApnsPayload {
+    let display = caller_name.unwrap_or(caller_uri);
+    ApnsPayload {
+        aps: ApnsAps {
+            alert: ApnsAlert {
+                title: "Incoming Call".to_string(),
+                body: format!("{} is calling", display),
+            },
+            sound: "ringtone.caf".to_string(),
+            content_available: 1,
+        },
+        call_token: call_token.to_string(),
+        caller_uri: caller_uri.to_string(),
+        caller_name: caller_name.map(|s| s.to_string()),
+        move_id: move_id.map(str::to_string),
+        move_from: move_id.map(|_| display.to_string()),
+    }
+}
+
+/// The FCM `data` map for an incoming call (same fields as the APNs body).
+fn fcm_data(
+    call_token: &str,
+    caller_uri: &str,
+    caller_name: Option<&str>,
+    move_id: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), "incoming_call".into());
+    data.insert("callToken".into(), call_token.into());
+    data.insert("callerUri".into(), caller_uri.into());
+    if let Some(name) = caller_name {
+        data.insert("callerName".into(), name.into());
+    }
+    if let Some(id) = move_id {
+        data.insert("moveId".into(), id.into());
+        data.insert("moveFrom".into(), caller_name.unwrap_or(caller_uri).into());
+    }
+    data
+}
+
 #[cfg(test)]
 pub(crate) fn test_device(id: &str, platform: &str) -> DeviceRecord {
     let now = chrono::Utc::now();
@@ -968,20 +1006,20 @@ mod tests {
         let manager = fcm.manager("dev").await;
 
         manager
-            .send_incoming_call("dev", "tok-1", "2000@pbx", None)
+            .send_incoming_call("dev", "tok-1", "2000@pbx", None, None)
             .await
             .unwrap();
         assert_eq!(fcm.delivered.recv().await.unwrap().0, "tok-1");
 
         let err = manager
-            .send_incoming_call("ghost", "tok-2", "2000@pbx", None)
+            .send_incoming_call("ghost", "tok-2", "2000@pbx", None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, PushError::NoDevice), "{err}");
 
         fcm.set_status(404);
         let err = manager
-            .send_incoming_call("dev", "tok-3", "2000@pbx", None)
+            .send_incoming_call("dev", "tok-3", "2000@pbx", None, None)
             .await
             .unwrap_err();
         assert!(
@@ -992,9 +1030,30 @@ mod tests {
 
         manager.register_device(test_device("ios-dev", "ios")).await;
         let err = manager
-            .send_incoming_call("ios-dev", "tok-4", "2000@pbx", None)
+            .send_incoming_call("ios-dev", "tok-4", "2000@pbx", None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, PushError::NotConfigured("APNs")), "{err}");
+    }
+
+    #[test]
+    fn push_payloads_carry_the_move_id_only_for_a_move() {
+        let plain = serde_json::to_value(apns_payload("t", "2000@pbx", Some("Bob"), None)).unwrap();
+        assert!(plain.get("moveId").is_none() && plain.get("moveFrom").is_none());
+        let moved =
+            serde_json::to_value(apns_payload("t", "2000@pbx", Some("Bob"), Some("m-1"))).unwrap();
+        assert_eq!(moved["moveId"], "m-1");
+        assert_eq!(moved["moveFrom"], "Bob");
+        assert_eq!(moved["callToken"], "t");
+        let no_name =
+            serde_json::to_value(apns_payload("t", "2000@pbx", None, Some("m-1"))).unwrap();
+        assert_eq!(no_name["moveFrom"], "2000@pbx");
+
+        let plain = fcm_data("t", "2000@pbx", Some("Bob"), None);
+        assert!(!plain.contains_key("moveId") && !plain.contains_key("moveFrom"));
+        let moved = fcm_data("t", "2000@pbx", Some("Bob"), Some("m-1"));
+        assert_eq!(moved["moveId"], "m-1");
+        assert_eq!(moved["moveFrom"], "Bob");
+        assert_eq!(moved["type"], "incoming_call");
     }
 }
