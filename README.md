@@ -224,6 +224,23 @@ The gateway's source IP is all the PBX sees for a mobile device; apps report
 nearness through the PBX API (`/me/devices/current/proximity`), so the gateway
 does nothing for it.
 
+## Hold for me
+
+When a held call's far party is back, the PBX INVITEs the user's devices with
+`X-Aria-Hold-Return: <hold_wait_id>` and `X-Aria-Hold-Return-Name: <business
+name>`. The gateway passes each value on only when its header is present and
+not empty:
+
+- VoIP push (APNs body, FCM `data`): `holdReturnId` and `holdReturnName`,
+  beside `moveId`/`moveFrom`.
+- `GET /v1/calls/{token}` (the call offer): `x_aria_hold_return` and
+  `x_aria_hold_return_name`, omitted otherwise.
+
+The name is cleaned before it leaves the gateway: control characters, `"`,
+`<`, `>` and `\` are removed, whitespace is collapsed, and it is cut to 64
+characters. The APNs alert body stays "{name} is calling"; the app decides the
+wording it shows.
+
 ## Docker
 
 Build from the `5060/` parent directory (the gateway depends on the sibling `aria-sip-core` crate):

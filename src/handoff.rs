@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, RwLock};
 
+use crate::push::IncomingCallExtras;
 use crate::sip::digest::DigestAuth;
 use crate::sip::message;
 use crate::sip::rtp_relay::RtpRelay;
@@ -1392,13 +1393,15 @@ impl HandoffManager {
             message::extract_from_uri(&call.invite_raw).unwrap_or(("unknown".into(), "".into()));
         let caller_name = message::extract_display_name(&call.invite_raw);
 
+        let extras = IncomingCallExtras::from_invite(&call.invite_raw);
         Ok(CallOffer {
             call_token: call_token.to_string(),
             caller_uri: format!("{}@{}", caller_user, caller_domain),
             caller_name,
             sdp_offer: sdp,
-            x_aria_move: message::extract_header(&call.invite_raw, "X-Aria-Move")
-                .filter(|m| !m.is_empty()),
+            x_aria_move: extras.move_id,
+            x_aria_hold_return: extras.hold_return_id,
+            x_aria_hold_return_name: extras.hold_return_name,
         })
     }
 
@@ -2630,6 +2633,12 @@ pub struct CallOffer {
     /// this device; the app compares it with the move it requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_aria_move: Option<String>,
+    /// The INVITE's `X-Aria-Hold-Return` value when a held call's far party
+    /// is back, and the business name from `X-Aria-Hold-Return-Name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aria_hold_return: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aria_hold_return_name: Option<String>,
 }
 
 impl CallStatus {

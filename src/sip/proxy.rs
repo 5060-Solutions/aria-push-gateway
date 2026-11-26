@@ -18,7 +18,7 @@ use super::resolver::SrvResolver;
 use super::transport::{Flow, SipSocket, TlsClient, Transport};
 use super::trust::{SourcePolicy, TrustedSources};
 use crate::handoff::{CallOwner, HandoffManager, InviteDisposition};
-use crate::push::PushManager;
+use crate::push::{IncomingCallExtras, PushManager};
 
 /// SIP account configuration received from mobile devices.
 #[derive(Debug, Clone)]
@@ -1133,7 +1133,7 @@ impl SipProxyManager {
             message::extract_from_uri(text).unwrap_or(("unknown".into(), "unknown".into()));
         let caller_uri = format!("{caller_user}@{caller_domain}");
         let caller_name = message::extract_display_name(text);
-        let move_id = message::extract_header(text, "X-Aria-Move").filter(|m| !m.is_empty());
+        let extras = IncomingCallExtras::from_invite(text);
         let call_id = message::extract_header(text, "Call-ID").unwrap_or_default();
 
         // SDP passes through unchanged — phone talks directly to PBX relay
@@ -1165,7 +1165,7 @@ impl SipProxyManager {
                     &call_token,
                     &caller_uri,
                     caller_name.as_deref(),
-                    move_id.as_deref(),
+                    &extras,
                 )
                 .await;
             let push_ms = received.elapsed().as_millis() as u64;
