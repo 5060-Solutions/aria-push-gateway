@@ -244,6 +244,10 @@ wording it shows.
 Call status (`GET /v1/calls/{token}/status`) reports `"reason": "held_for_you"`
 for a call ended by a BYE carrying `X-Aria-Hold-Wait`.
 
+The notify request (`POST /v1/notify`) also carries `"category": "HOLD_WAIT"`,
+a new optional field of at most 64 characters from `[A-Z_]`. The gateway puts
+it in `aps.category` on iOS. FCM is unchanged.
+
 ## Docker
 
 Build from the `5060/` parent directory (the gateway depends on the sibling `aria-sip-core` crate):
@@ -380,12 +384,14 @@ Android the FCM `push_token` serves both.
 Like `/v1/auth/token`, it takes `api_key` (the `TOKEN_ISSUER_KEY`) in the
 body and needs no bearer token.
 
-**Body:** `{"api_key", "user_id", "kind": "message", "title", "body"?, "thread_id"?, "data"?: {string: string}}`
+**Body:** `{"api_key", "user_id", "kind": "message", "title", "body"?, "thread_id"?, "category"?, "data"?: {string: string}}`
 
 The alert is an ordinary notification (APNs `alert`, FCM notification message),
 never a VoIP push. `data` is delivered beside it (at most 20 entries; `aps` is
 reserved). `body` is optional so a backend can leave message text out of
-Apple's and Google's systems.
+Apple's and Google's systems. `category` is optional, 1 to 64 characters of
+`[A-Z_]`; the gateway puts it in `aps.category` on iOS and leaves FCM
+unchanged.
 
 **Response:** `{"sent", "failed", "skipped"}`: devices the provider accepted,
 devices it refused or could not be reached for, and devices that cannot take an

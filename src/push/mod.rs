@@ -228,6 +228,8 @@ pub struct Alert {
     pub body: Option<String>,
     /// Alerts with the same id are grouped (iOS `thread-id`, Android tag).
     pub thread_id: Option<String>,
+    /// iOS notification category (`aps.category`), for the app's actions.
+    pub category: Option<String>,
     /// Delivered beside the alert.
     pub data: std::collections::BTreeMap<String, String>,
 }
@@ -242,6 +244,9 @@ fn apns_alert_payload(alert: &Alert) -> serde_json::Value {
     let mut aps = serde_json::json!({ "alert": aps_alert, "sound": "default" });
     if let Some(thread) = &alert.thread_id {
         aps["thread-id"] = thread.clone().into();
+    }
+    if let Some(category) = &alert.category {
+        aps["category"] = category.clone().into();
     }
     let mut payload = serde_json::Map::new();
     for (k, v) in &alert.data {
@@ -994,8 +999,24 @@ mod tests {
             title: "+15551230000".into(),
             body: Some("hello".into()),
             thread_id: Some("did:+15551230000".into()),
+            category: None,
             data: [("type".to_string(), "sms".to_string())].into(),
         }
+    }
+
+    #[test]
+    fn an_alert_with_a_category_sets_aps_category() {
+        let mut a = alert();
+        a.category = Some("HOLD_WAIT".into());
+        assert_eq!(apns_alert_payload(&a)["aps"]["category"], "HOLD_WAIT");
+        assert!(apns_alert_payload(&alert())["aps"]
+            .get("category")
+            .is_none());
+        // FCM is unchanged.
+        assert_eq!(
+            fcm_alert_message("tok", &a),
+            fcm_alert_message("tok", &alert())
+        );
     }
 
     #[test]

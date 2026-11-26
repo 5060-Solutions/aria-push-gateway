@@ -172,6 +172,9 @@ struct NotifyRequest {
     /// Alerts with the same id are grouped (iOS thread, Android tag).
     #[serde(default)]
     thread_id: Option<String>,
+    /// iOS notification category (1-64 characters of `[A-Z_]`).
+    #[serde(default)]
+    category: Option<String>,
     /// Delivered with the alert, for the app to open the right screen.
     #[serde(default)]
     data: std::collections::BTreeMap<String, String>,
@@ -200,6 +203,9 @@ fn validate_notify(req: &NotifyRequest) -> Result<(), StatusCode> {
             .as_deref()
             .is_none_or(|b| b.chars().count() <= 1000)
         && req.thread_id.as_deref().is_none_or(|t| t.len() <= 200)
+        && req.category.as_deref().is_none_or(|c| {
+            (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        })
         && req.data.len() <= MAX_NOTIFY_DATA
         && req
             .data
@@ -234,6 +240,7 @@ async fn notify_user(
         title: req.title,
         body: req.body,
         thread_id: req.thread_id,
+        category: req.category,
         data: req.data,
     };
     let mut out = NotifyResponse {
@@ -1162,6 +1169,26 @@ Content-Length: 0\r\n\r\n";
         let off = test_app(None).await;
         let (s, _) = off.post_json("/v1/notify", notify_body("k", "u")).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_bad_category_is_refused() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        for bad in [
+            serde_json::json!("hold wait"),
+            serde_json::json!("x".repeat(65)),
+            serde_json::json!("HOLD-WAIT"),
+            serde_json::json!(""),
+        ] {
+            let mut body = notify_body(ISSUER_KEY, "u");
+            body["category"] = bad;
+            let (s, _) = app.post_json("/v1/notify", body.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let mut body = notify_body(ISSUER_KEY, "u");
+        body["category"] = "HOLD_WAIT".into();
+        let (s, _) = app.post_json("/v1/notify", body).await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     #[tokio::test]
