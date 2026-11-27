@@ -204,6 +204,17 @@ pub fn retry_after_secs(msg: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The User-Agent of a REGISTER: the gateway, and the platform of the phone it
+/// stands for, `Aria-Gateway/0.1.0 (android)`. The PBX reads the parenthesis
+/// to name the device for "Move to...".
+pub fn register_user_agent(platform: &str) -> String {
+    let p = platform.trim().to_ascii_lowercase();
+    match p.as_str() {
+        "ios" | "android" => format!("Aria-Gateway/0.1.0 ({p})"),
+        _ => "Aria-Gateway/0.1.0".to_owned(),
+    }
+}
+
 /// Build a REGISTER request.
 #[allow(clippy::too_many_arguments)]
 pub fn build_register(
@@ -219,8 +230,10 @@ pub fn build_register(
     auth_header: Option<&str>,
     expires: u32,
     instance: &str,
+    platform: &str,
 ) -> String {
     let branch = generate_branch();
+    let ua = register_user_agent(platform);
     let tp = transport.to_uppercase();
     let contact = register_contact(username, local_ip, local_port, transport, instance);
 
@@ -236,7 +249,7 @@ pub fn build_register(
          Expires: {expires}\r\n\
          Supported: outbound, path\r\n\
          Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, NOTIFY\r\n\
-         User-Agent: Aria-Gateway/0.1.0\r\n",
+         User-Agent: {ua}\r\n",
     );
 
     if let Some(auth) = auth_header {
@@ -532,8 +545,11 @@ mod tests {
             None,
             3600,
             &inst,
+            "android",
         );
         assert!(msg.contains(&format!("Contact: {c}\r\n")));
+        assert!(msg.contains("User-Agent: Aria-Gateway/0.1.0 (android)\r\n"));
+        assert_eq!(register_user_agent("tablet"), "Aria-Gateway/0.1.0");
         assert!(msg.contains("Supported: outbound, path\r\n"));
     }
 

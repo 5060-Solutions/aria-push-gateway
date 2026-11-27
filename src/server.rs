@@ -388,7 +388,21 @@ async fn register_device(
 ) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
     let Json(mut req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
     validate_registration(&mut req)?;
-    let device_id = uuid::Uuid::new_v4().to_string();
+    // A phone keeps its device id, and so its `+sip.instance`, across
+    // registrations: each start of the app would otherwise leave one more
+    // device at the PBX until its binding expired.
+    let device_id = match state
+        .db
+        .device_id_for_token(&auth.user_id, &req.push_token)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => uuid::Uuid::new_v4().to_string(),
+        Err(e) => {
+            tracing::warn!(user = %auth.user_id, %e, "could not look up the phone's earlier device");
+            uuid::Uuid::new_v4().to_string()
+        }
+    };
     let now = chrono::Utc::now();
 
     let record = DeviceRecord {
@@ -444,6 +458,9 @@ async fn register_device(
     }
     replaced.sort();
     replaced.dedup();
+    // The id being reused is registered again below, which retires its
+    // earlier session itself.
+    replaced.retain(|id| *id != device_id);
     for old in &replaced {
         let _ = state.sip_proxy.unregister_device(old).await;
         state.push_manager.unregister_device(old).await;
@@ -1670,7 +1687,8 @@ Content-Length: 0\r\n\r\n";
         let new_dev = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
 
         assert!(!app.device_active("bob-same-sip").await);
-        assert!(!app.device_active("bob-same-phone").await);
+        // The same phone keeps its device id (so its +sip.instance).
+        assert_eq!(new_dev, "bob-same-phone");
         assert!(app.device_active("bob-other").await);
         assert!(app.device_active(&new_dev).await);
     }
@@ -1679,8 +1697,8 @@ Content-Length: 0\r\n\r\n";
     async fn re_registering_retires_the_old_devices_sip_binding() {
         let app = test_app(Some(ISSUER_KEY)).await;
         let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // The phone registers, then registers again (a new device id, e.g.
-        // after failing back from another gateway instance).
+        // The phone registers, then registers again (the same device id, e.g.
+        // after the app restarts).
         let _first = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
         let mut buf = vec![0u8; 65535];
         let second = post_device(&app, "bob", "1001", "phone-token", &pbx).await;
