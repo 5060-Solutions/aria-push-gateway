@@ -172,6 +172,9 @@ struct NotifyRequest {
     /// Alerts with the same id are grouped (iOS thread, Android tag).
     #[serde(default)]
     thread_id: Option<String>,
+    /// iOS notification category (1-64 characters of `[A-Z_]`).
+    #[serde(default)]
+    category: Option<String>,
     /// Delivered with the alert, for the app to open the right screen.
     #[serde(default)]
     data: std::collections::BTreeMap<String, String>,
@@ -200,6 +203,9 @@ fn validate_notify(req: &NotifyRequest) -> Result<(), StatusCode> {
             .as_deref()
             .is_none_or(|b| b.chars().count() <= 1000)
         && req.thread_id.as_deref().is_none_or(|t| t.len() <= 200)
+        && req.category.as_deref().is_none_or(|c| {
+            (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        })
         && req.data.len() <= MAX_NOTIFY_DATA
         && req
             .data
@@ -234,6 +240,7 @@ async fn notify_user(
         title: req.title,
         body: req.body,
         thread_id: req.thread_id,
+        category: req.category,
         data: req.data,
     };
     let mut out = NotifyResponse {
@@ -1182,6 +1189,27 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn a_bad_category_is_refused() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        for bad in [
+            serde_json::json!("hold wait"),
+            serde_json::json!("x".repeat(65)),
+            serde_json::json!("HOLD-WAIT"),
+            serde_json::json!("hold_wait"),
+            serde_json::json!(""),
+        ] {
+            let mut body = notify_body(ISSUER_KEY, "u");
+            body["category"] = bad;
+            let (s, _) = app.post_json("/v1/notify", body.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let mut body = notify_body(ISSUER_KEY, "u");
+        body["category"] = "HOLD_WAIT".into();
+        let (s, _) = app.post_json("/v1/notify", body).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn notify_counts_the_users_active_devices_only() {
         let app = test_app(Some(ISSUER_KEY)).await;
         app.add_device("a1", "u", true).await;
@@ -1313,13 +1341,21 @@ Content-Length: 0\r\n\r\n";
     // ── Call ownership ──────────────────────────────────────────────────────
 
     async fn pending_call_for(app: &TestApp, device_id: &str) -> (tokio::net::UdpSocket, String) {
+        pending_call_with(app, device_id, INVITE).await
+    }
+
+    async fn pending_call_with(
+        app: &TestApp,
+        device_id: &str,
+        invite: &str,
+    ) -> (tokio::net::UdpSocket, String) {
         let (pbx, reg) = fake_pbx(&app.handoff).await;
         let token = app
             .handoff
             .create_pending_call(
                 device_id.into(),
                 "in-call-1".into(),
-                INVITE.into(),
+                invite.into(),
                 pbx.local_addr().unwrap(),
                 reg,
                 None,
@@ -1401,6 +1437,32 @@ Content-Length: 0\r\n\r\n";
             .await;
         assert_eq!(status, StatusCode::OK);
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 603 Decline\r\n"));
+    }
+
+    #[tokio::test]
+    async fn the_call_offer_carries_the_hold_return() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let invite = INVITE.replace(
+            "Content-Length",
+            "X-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: Acme Bank\r\nContent-Length",
+        );
+        let (_pbx, token) = pending_call_with(&app, "bob-dev", &invite).await;
+        let (status, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let offer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(offer["x_aria_hold_return"], "hw-1");
+        assert_eq!(offer["x_aria_hold_return_name"], "Acme Bank");
+
+        let (_pbx2, plain_token) = pending_call_for(&app, "bob-dev").await;
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{plain_token}"), "bob")
+            .await;
+        let plain: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(plain.get("x_aria_hold_return").is_none());
+        assert!(plain.get("x_aria_hold_return_name").is_none());
     }
 
     #[tokio::test]

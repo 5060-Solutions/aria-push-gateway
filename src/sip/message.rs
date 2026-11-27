@@ -75,6 +75,27 @@ pub fn extract_header(msg: &str, name: &str) -> Option<String> {
         .map(|(_, value)| value)
 }
 
+/// The longest hold-return business name the gateway passes on.
+pub const HOLD_RETURN_NAME_MAX: usize = 64;
+
+/// Header text made safe to hand to an app: control characters (CR and LF
+/// included), `"`, `<`, `>` and `\` are dropped, whitespace is collapsed,
+/// and the result is cut to `max_chars` characters.
+pub fn clean_header_text(s: &str, max_chars: usize) -> String {
+    let kept: String = s
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .filter(|c| !matches!(c, '"' | '<' | '>' | '\\'))
+        .collect();
+    let collapsed = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 /// A parameter of a header value (`tag`, `branch`, ...), looking only at the
 /// header's own parameters: after the `>` of a name-addr, or after the URI
 /// of an addr-spec — never inside the URI.
@@ -493,6 +514,15 @@ pub fn build_cancel(invite: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hold_return_name_is_cleaned_and_capped() {
+        let dirty = format!("Acme\tBank \"<x>\\ {}", "é".repeat(500));
+        let clean = clean_header_text(&dirty, HOLD_RETURN_NAME_MAX);
+        assert!(clean.chars().count() <= 64);
+        assert!(!clean.contains(['"', '<', '>', '\\', '\t', '\r', '\n']));
+        assert!(clean.starts_with("Acme Bank x"));
+    }
 
     #[test]
     fn register_contact_carries_instance_and_reg_id() {

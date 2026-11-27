@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, RwLock};
 
+use crate::push::IncomingCallExtras;
 use crate::sip::digest::DigestAuth;
 use crate::sip::message;
 use crate::sip::rtp_relay::RtpRelay;
@@ -1059,6 +1060,24 @@ pub struct EndedCallInfo {
     pub owner: CallOwner,
 }
 
+/// Header on a PBX BYE that releases a device into "Hold for me".
+pub const HOLD_WAIT_HEADER: &str = "X-Aria-Hold-Wait";
+
+/// Why a call ended, given the PBX's BYE: released into Hold for me, ended
+/// by a transfer, or hung up by the far end. A blank hold-wait header does
+/// not count.
+fn bye_reason(bye_raw: &str, transfer_pending: bool) -> &'static str {
+    let held =
+        message::extract_header(bye_raw, HOLD_WAIT_HEADER).is_some_and(|v| !v.trim().is_empty());
+    if held {
+        "held_for_you"
+    } else if transfer_pending {
+        "transferred"
+    } else {
+        "bye_from_remote"
+    }
+}
+
 impl HandoffManager {
     pub fn new() -> Self {
         let ended = Arc::new(RwLock::new(HashMap::<String, EndedCallInfo>::new()));
@@ -1392,13 +1411,15 @@ impl HandoffManager {
             message::extract_from_uri(&call.invite_raw).unwrap_or(("unknown".into(), "".into()));
         let caller_name = message::extract_display_name(&call.invite_raw);
 
+        let extras = IncomingCallExtras::from_invite(&call.invite_raw);
         Ok(CallOffer {
             call_token: call_token.to_string(),
             caller_uri: format!("{}@{}", caller_user, caller_domain),
             caller_name,
             sdp_offer: sdp,
-            x_aria_move: message::extract_header(&call.invite_raw, "X-Aria-Move")
-                .filter(|m| !m.is_empty()),
+            x_aria_move: extras.move_id,
+            x_aria_hold_return: extras.hold_return_id,
+            x_aria_hold_return_name: extras.hold_return_name,
         })
     }
 
@@ -1736,11 +1757,7 @@ impl HandoffManager {
             }
 
             // Record as ended so mobile app can detect remote hangup
-            let reason = if call.transfer_pending.load(Ordering::SeqCst) {
-                "transferred"
-            } else {
-                "bye_from_remote"
-            };
+            let reason = bye_reason(bye_raw, call.transfer_pending.load(Ordering::SeqCst));
             let mut ended = self.ended_calls.write().await;
             for token in tokens {
                 ended.insert(
@@ -2630,6 +2647,12 @@ pub struct CallOffer {
     /// this device; the app compares it with the move it requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_aria_move: Option<String>,
+    /// The INVITE's `X-Aria-Hold-Return` value when a held call's far party
+    /// is back, and the business name from `X-Aria-Hold-Return-Name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aria_hold_return: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aria_hold_return_name: Option<String>,
 }
 
 impl CallStatus {
@@ -4337,6 +4360,58 @@ Content-Length: 0\r\n\r\n";
                 CallStatus::Ended(info) => assert_eq!(info.reason, "transferred"),
                 _ => panic!("{token} should have ended"),
             }
+        }
+    }
+
+    #[test]
+    fn bye_reasons() {
+        assert_eq!(
+            bye_reason("BYE sip:a SIP/2.0\r\nX-Aria-Hold-Wait: hw-1\r\n\r\n", false),
+            "held_for_you"
+        );
+        assert_eq!(bye_reason("BYE sip:a SIP/2.0\r\n\r\n", true), "transferred");
+        assert_eq!(
+            bye_reason("BYE sip:a SIP/2.0\r\nX-Aria-Hold-Wait: \r\n\r\n", false),
+            "bye_from_remote"
+        );
+    }
+
+    #[test]
+    fn a_hold_wait_bye_is_held_for_you_even_mid_transfer() {
+        assert_eq!(
+            bye_reason("BYE sip:a SIP/2.0\r\nX-Aria-Hold-Wait: hw-1\r\n\r\n", true),
+            "held_for_you"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bye_from_the_pbx_with_hold_wait_ends_the_call_as_held_for_you() {
+        let h = attended_harness().await;
+        let call_id = "inbound-call-1";
+        let (local, remote, socket) = {
+            let calls = h.mgr.active.read().await;
+            let c = &calls[call_id];
+            (
+                c.dialog.local.clone(),
+                c.dialog.remote.clone(),
+                c.socket.clone(),
+            )
+        };
+        let bye = format!(
+            "BYE sip:aria-gateway@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bye\r\n\
+             From: {remote}\r\nTo: {local}\r\nCall-ID: {call_id}\r\n\
+             CSeq: 900 BYE\r\nX-Aria-Hold-Wait: hw-1\r\nContent-Length: 0\r\n\r\n"
+        );
+        let owner = h
+            .mgr
+            .handle_bye_from_pbx(call_id, &bye, h.pbx_in.local_addr().unwrap(), &socket)
+            .await
+            .unwrap();
+        assert!(owner.is_some());
+        match h.mgr.get_call_status(&h.in_token).await {
+            CallStatus::Ended(info) => assert_eq!(info.reason, "held_for_you"),
+            _ => panic!("the call should have ended"),
         }
     }
 
