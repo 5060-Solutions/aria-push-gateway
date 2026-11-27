@@ -625,10 +625,12 @@ struct MakeCallRequest {
     client_ref: Option<String>,
 }
 
-/// An error status, optionally with a `{"error": "<code>"}` body.
+/// An error status, optionally with a `{"error": "<code>"}` body, plus
+/// `"sip_status": <code>` when the PBX's SIP final response caused it.
 struct ApiError {
     status: StatusCode,
     code: Option<&'static str>,
+    sip_status: Option<u16>,
 }
 
 impl ApiError {
@@ -636,21 +638,50 @@ impl ApiError {
         Self {
             status,
             code: Some(code),
+            sip_status: None,
+        }
+    }
+
+    /// 502 for a request the PBX refused with SIP `sip_status`:
+    /// `{"error":"media_not_acceptable","sip_status":488}` when it would not
+    /// take the offered media (488 / 606, e.g. an `RTP/SAVP` offer to a PBX
+    /// without SRTP; the app may retry with `RTP/AVP`), otherwise
+    /// `{"error":"<other>","sip_status":<code>}`.
+    fn pbx_rejected(other: &'static str, sip_status: u16) -> Self {
+        let code = match sip_status {
+            488 | 606 => "media_not_acceptable",
+            _ => other,
+        };
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: Some(code),
+            sip_status: Some(sip_status),
         }
     }
 }
 
 impl From<StatusCode> for ApiError {
     fn from(status: StatusCode) -> Self {
-        Self { status, code: None }
+        Self {
+            status,
+            code: None,
+            sip_status: None,
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        match self.code {
-            Some(code) => (self.status, Json(serde_json::json!({ "error": code }))).into_response(),
-            None => self.status.into_response(),
+        match (self.code, self.sip_status) {
+            (Some(code), Some(sip)) => (
+                self.status,
+                Json(serde_json::json!({ "error": code, "sip_status": sip })),
+            )
+                .into_response(),
+            (Some(code), None) => {
+                (self.status, Json(serde_json::json!({ "error": code }))).into_response()
+            }
+            (None, _) => self.status.into_response(),
         }
     }
 }
@@ -670,7 +701,10 @@ struct MakeCallResponse {
 ///
 /// The SIP account must belong to an active device the caller owns;
 /// otherwise 404. With a `client_ref` the ringing call can be cancelled,
-/// in which case this answers 409 `{"error":"cancelled"}`.
+/// in which case this answers 409 `{"error":"cancelled"}`. A final non-2xx
+/// from the PBX is 502 `{"error":"media_not_acceptable","sip_status":488}`
+/// for 488/606 and `{"error":"call_failed","sip_status":<code>}` otherwise;
+/// other failures (timeout, unreachable PBX) stay a bare 502.
 async fn make_call(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -720,6 +754,10 @@ async fn make_call(
             Some(OriginateRefusal::Cancelled) => ApiError::coded(StatusCode::CONFLICT, "cancelled"),
             Some(OriginateRefusal::ClientRefInUse) => {
                 ApiError::coded(StatusCode::CONFLICT, "client_ref_in_use")
+            }
+            Some(OriginateRefusal::Rejected(sip_status)) => {
+                tracing::warn!(sip_status, "Outgoing call rejected by the PBX");
+                ApiError::pbx_rejected("call_failed", *sip_status)
             }
             None => {
                 tracing::error!("Outgoing call failed: {}", e);
@@ -924,8 +962,9 @@ struct UpdateMediaResponse {
 ///
 /// 200 with the answer; 400 for an unusable SDP; 404 for an unknown call;
 /// 409 while another media update of the call is in progress; 502 when the
-/// PBX refuses (the call stays up on its previous media); 504 when the PBX
-/// does not answer.
+/// PBX refuses (the call stays up on its previous media), with
+/// `{"error":"media_not_acceptable"|"media_update_rejected","sip_status":N}`;
+/// 504 when the PBX does not answer.
 async fn update_media(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -940,15 +979,16 @@ async fn update_media(
         .await
         .map_err(|e| {
             tracing::warn!(token = %token, "Media update failed: {e}");
-            ApiError::from(match e {
-                MediaUpdateError::InvalidSdp(_) => StatusCode::BAD_REQUEST,
-                MediaUpdateError::NotFound => StatusCode::NOT_FOUND,
-                MediaUpdateError::Conflict => StatusCode::CONFLICT,
-                MediaUpdateError::Rejected(_) | MediaUpdateError::Send(_) => {
-                    StatusCode::BAD_GATEWAY
+            match e {
+                MediaUpdateError::InvalidSdp(_) => StatusCode::BAD_REQUEST.into(),
+                MediaUpdateError::NotFound => StatusCode::NOT_FOUND.into(),
+                MediaUpdateError::Conflict => StatusCode::CONFLICT.into(),
+                MediaUpdateError::Rejected(sip_status) => {
+                    ApiError::pbx_rejected("media_update_rejected", sip_status)
                 }
-                MediaUpdateError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-            })
+                MediaUpdateError::Send(_) => StatusCode::BAD_GATEWAY.into(),
+                MediaUpdateError::Timeout => StatusCode::GATEWAY_TIMEOUT.into(),
+            }
         })?;
     Ok(Json(UpdateMediaResponse { sdp_answer }))
 }
@@ -2337,8 +2377,9 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(h(&ack, "From"), h(&invite, "From"));
         assert_eq!(h(&ack, "To"), h(&busy, "To"));
         assert_eq!(h(&ack, "CSeq"), "1 ACK");
-        let (status, _) = http_result(http).await;
+        let (status, body) = http_result(http).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, r#"{"error":"call_failed","sip_status":486}"#);
 
         // Timer D: a retransmitted final is ACKed again.
         pbx.send_to(busy.as_bytes(), gw).await.unwrap();
@@ -2823,5 +2864,315 @@ Content-Length: 0\r\n\r\n";
         let (status, body) = attended(&app, "bob", &out_token, &ringing).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, r#"{"error":"call_not_established"}"#);
+    }
+
+    // ── SDES-SRTP pass-through ──────────────────────────────────────────────
+    //
+    // The phone offers/answers `RTP/SAVP` with SDES `a=crypto:` keys; the
+    // gateway must carry that SDP between the app and the PBX untouched
+    // (only the media address/port when it relays RTP), so SRTP runs end to
+    // end phone <-> PBX.
+
+    /// The phone's SRTP offer/answer: two suites, key params (lifetime, MKI)
+    /// on one, a session param, rtcp-mux.
+    const PHONE_SAVP: &str = "v=0\r\n\
+o=aria 1700000000 1 IN IP4 198.51.100.7\r\n\
+s=Aria\r\n\
+c=IN IP4 198.51.100.7\r\n\
+t=0 0\r\n\
+m=audio 40000 RTP/SAVP 0 8 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR|2^20|1:4 UNENCRYPTED_SRTCP\r\n\
+a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:NzB4d1BINUAvLEw6UzF3WSJ+PSdFcGdUJShpX1Zj\r\n\
+a=rtcp-mux\r\n\
+a=sendrecv\r\n";
+
+    /// The PBX's SRTP offer/answer.
+    const PBX_SAVP: &str = "v=0\r\n\
+o=pbx 9 2 IN IP4 203.0.113.9\r\n\
+s=PBX\r\n\
+c=IN IP4 203.0.113.9\r\n\
+t=0 0\r\n\
+m=audio 30000 RTP/SAVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^31\r\n\
+a=rtcp-mux\r\n";
+
+    fn crypto_lines(sdp: &str) -> Vec<&str> {
+        sdp.split("\r\n")
+            .filter(|l| l.starts_with("a=crypto:"))
+            .collect()
+    }
+
+    fn sip_body(msg: &str) -> &str {
+        let body = msg.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(h(msg, "Content-Length"), body.len().to_string());
+        body
+    }
+
+    /// A PBX INVITE to device 1001 carrying `sdp`.
+    fn invite_with_sdp(sdp: &str) -> String {
+        let head = INVITE.split_once("Content-Length:").unwrap().0;
+        format!("{head}Content-Length: {}\r\n\r\n{sdp}", sdp.len())
+    }
+
+    async fn post_sdp(
+        app: &TestApp,
+        user: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> tokio::task::JoinHandle<axum::response::Response> {
+        let req = post_as(user, path, &body);
+        let router = app.router.clone();
+        tokio::spawn(async move { router.oneshot(req).await.unwrap() })
+    }
+
+    #[tokio::test]
+    async fn savp_offer_from_the_pbx_and_the_apps_answer_pass_unchanged() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (pbx, reg) = fake_pbx(&app.handoff).await;
+        // As the SIP proxy creates incoming calls: no RTP relay.
+        let token = app
+            .handoff
+            .create_pending_call(
+                "bob-dev".into(),
+                "in-call-1".into(),
+                invite_with_sdp(PBX_SAVP),
+                pbx.local_addr().unwrap(),
+                reg,
+                None,
+                String::new(),
+                0,
+                0,
+            )
+            .await;
+
+        // The offer the phone fetches is the PBX's SDP, byte for byte.
+        let (status, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let offer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(offer["sdp_offer"], PBX_SAVP);
+
+        // The phone's SRTP answer goes into the 200 OK, byte for byte.
+        let http = post_sdp(
+            &app,
+            "bob",
+            &format!("/v1/calls/{token}/accept"),
+            serde_json::json!({ "sdp_answer": PHONE_SAVP }),
+        )
+        .await;
+        let ok = recv_text(&pbx).await;
+        assert!(ok.starts_with("SIP/2.0 200 OK\r\n"), "{ok}");
+        assert_eq!(h(&ok, "Content-Type"), "application/sdp");
+        assert_eq!(sip_body(&ok), PHONE_SAVP);
+        assert_eq!(http.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn relayed_savp_sdp_only_changes_the_media_address() {
+        use crate::sip::rtp_relay::RtpRelay;
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let (pbx, reg) = fake_pbx(&app.handoff).await;
+        let (relay, phone_port, pbx_port) = RtpRelay::allocate().await.unwrap();
+        let token = app
+            .handoff
+            .create_pending_call(
+                "bob-dev".into(),
+                "in-call-1".into(),
+                invite_with_sdp(PBX_SAVP),
+                pbx.local_addr().unwrap(),
+                reg,
+                Some(Arc::new(relay)),
+                "192.0.2.10".into(),
+                phone_port,
+                pbx_port,
+            )
+            .await;
+        let readdress = |sdp: &str, from_ip: &str, from_port: u16, port: u16| {
+            sdp.replace(&format!("IN IP4 {from_ip}\r\n"), "IN IP4 192.0.2.10\r\n")
+                .replace(
+                    &format!("m=audio {from_port} "),
+                    &format!("m=audio {port} "),
+                )
+        };
+
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        let offer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let offer = offer["sdp_offer"].as_str().unwrap();
+        assert_eq!(offer, readdress(PBX_SAVP, "203.0.113.9", 30000, phone_port));
+        assert!(offer.contains(&format!("m=audio {phone_port} RTP/SAVP 0 101\r\n")));
+        assert_eq!(crypto_lines(offer), crypto_lines(PBX_SAVP));
+
+        let http = post_sdp(
+            &app,
+            "bob",
+            &format!("/v1/calls/{token}/accept"),
+            serde_json::json!({ "sdp_answer": PHONE_SAVP }),
+        )
+        .await;
+        let ok = recv_text(&pbx).await;
+        let answer = sip_body(&ok);
+        assert_eq!(
+            answer,
+            readdress(PHONE_SAVP, "198.51.100.7", 40000, pbx_port)
+        );
+        assert!(answer.contains(&format!("m=audio {pbx_port} RTP/SAVP 0 8 101\r\n")));
+        assert_eq!(crypto_lines(answer), crypto_lines(PHONE_SAVP));
+        assert_eq!(crypto_lines(answer).len(), 2);
+        assert_eq!(http.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn savp_outgoing_offer_and_the_pbx_answer_pass_unchanged() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, gw, invite, http) =
+            place_call(&app, serde_json::json!({ "sdp_offer": PHONE_SAVP })).await;
+        assert_eq!(h(&invite, "Content-Type"), "application/sdp");
+        assert_eq!(sip_body(&invite), PHONE_SAVP);
+
+        pbx.send_to(
+            pbx_reply(
+                &invite,
+                "200 OK",
+                "Content-Type: application/sdp\r\n",
+                PBX_SAVP,
+            )
+            .as_bytes(),
+            gw,
+        )
+        .await
+        .unwrap();
+        let (status, body) = http_result(http).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["sdp_answer"], PBX_SAVP);
+        let (ack, _) = recv_from(&pbx).await;
+        assert!(ack.starts_with("ACK "), "{ack}");
+    }
+
+    #[tokio::test]
+    async fn savp_refused_with_488_reports_media_not_acceptable() {
+        for (sip, want) in [
+            (
+                "488 Not Acceptable Here",
+                r#"{"error":"media_not_acceptable","sip_status":488}"#,
+            ),
+            (
+                "606 Not Acceptable",
+                r#"{"error":"media_not_acceptable","sip_status":606}"#,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"call_failed","sip_status":403}"#,
+            ),
+        ] {
+            let app = test_app(Some(ISSUER_KEY)).await;
+            let (pbx, gw, invite, http) =
+                place_call(&app, serde_json::json!({ "sdp_offer": PHONE_SAVP })).await;
+            pbx.send_to(pbx_reply(&invite, sip, "", "").as_bytes(), gw)
+                .await
+                .unwrap();
+            let (ack, _) = recv_from(&pbx).await;
+            assert!(ack.starts_with("ACK "), "{ack}");
+            let (status, body) = http_result(http).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{sip}");
+            assert_eq!(body, want, "{sip}");
+        }
+    }
+
+    /// Send `sdp` as a media update of `token`, answer its re-INVITE with
+    /// `status`/`answer`, and return the INVITE and the HTTP result.
+    async fn media_update_answered(
+        app: &TestApp,
+        pbx: &tokio::net::UdpSocket,
+        token: &str,
+        sdp: &str,
+        status: &str,
+        answer: &str,
+    ) -> (String, StatusCode, String) {
+        let http = post_sdp(
+            app,
+            "alice",
+            &format!("/v1/calls/{token}/media"),
+            serde_json::json!({ "sdp": sdp }),
+        )
+        .await;
+        let invite = recv_text(pbx).await;
+        assert!(invite.starts_with("INVITE "), "{invite}");
+        let extra = if answer.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/sdp\r\n"
+        };
+        app.handoff
+            .handle_refer_response(&pbx_reply(&invite, status, extra, answer))
+            .await;
+        let (code, body) = http_result(http).await;
+        let _ack = recv_text(pbx).await;
+        (invite, code, body)
+    }
+
+    #[tokio::test]
+    async fn savp_media_update_offer_and_answer_pass_unchanged() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "alice").await;
+        let (invite, status, body) =
+            media_update_answered(&app, &pbx, &token, PHONE_SAVP, "200 OK", PBX_SAVP).await;
+        // The call's SDP had no o= line, so the phone's is kept: the offer
+        // is the phone's SDP byte for byte.
+        assert_eq!(sip_body(&invite), PHONE_SAVP);
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["sdp_answer"], PBX_SAVP);
+
+        // A second update keeps the dialog's origin (version bumped) and
+        // changes nothing else, crypto lines included.
+        let moved = PHONE_SAVP
+            .replace("IN IP4 198.51.100.7", "IN IP4 192.0.2.44")
+            .replace("m=audio 40000 ", "m=audio 41000 ");
+        let (invite, status, _) =
+            media_update_answered(&app, &pbx, &token, &moved, "200 OK", PBX_SAVP).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sip_body(&invite),
+            moved.replace(
+                "o=aria 1700000000 1 IN IP4 192.0.2.44",
+                "o=aria 1700000000 2 IN IP4 198.51.100.7"
+            )
+        );
+        assert_eq!(crypto_lines(sip_body(&invite)), crypto_lines(PHONE_SAVP));
+    }
+
+    #[tokio::test]
+    async fn media_update_refused_with_488_reports_media_not_acceptable() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        let (pbx, token) = outgoing_call_for(&app, "alice").await;
+        let (_, status, body) = media_update_answered(
+            &app,
+            &pbx,
+            &token,
+            PHONE_SAVP,
+            "488 Not Acceptable Here",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, r#"{"error":"media_not_acceptable","sip_status":488}"#);
+
+        // The call is still up; another refusal carries its own status.
+        let (_, status, body) =
+            media_update_answered(&app, &pbx, &token, PHONE_SAVP, "403 Forbidden", "").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body,
+            r#"{"error":"media_update_rejected","sip_status":403}"#
+        );
     }
 }
