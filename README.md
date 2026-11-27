@@ -183,7 +183,11 @@ it is on, and outgoing calls open their own. Messages are framed by
 `Content-Length`. RFC 3261 retransmission timers (A/E/G, and the 2xx
 retransmission until ACK) run on UDP only. On a stream a request or response is
 written once, and the transaction timeouts stay the same. Each REGISTER carries
-`+sip.instance`, `reg-id` and `Supported: outbound` (RFC 5626). The gateway
+`+sip.instance`, `reg-id` and `Supported: outbound` (RFC 5626). The instance
+is `urn:uuid:<device_id>`, the `device_id` that `POST /v1/devices` returned (it
+was a hash of user and domain before, so two phones of one user shared it).
+The apps pass the same URN as `sip_instance` to the PBX API, which matches it
+against the registration, so call move can find the device. The gateway
 sends a double-CRLF keep-alive every 80-100 % of the registrar's `Flow-Timer`,
 or every 25 s when there is none. If no CRLF pong arrives within 10 s, the flow
 has failed. A flow failure (the connection closed or reset, or a missing pong)
@@ -206,6 +210,43 @@ the gateway opens one stream per device plus one per outgoing call, all from
 the gateway's IP. Raise `SIP_STREAM_MAX_PER_IP` (default 32) above the
 number of devices plus concurrent calls. List the gateway's public IP in
 `PUSH_GATEWAY_SIP_SOURCES` on every node.
+
+## Call move
+
+When the PBX moves a call to a device it INVITEs it with `X-Aria-Move:
+<move_id>`. The gateway passes the value on, and only then:
+
+- VoIP push (APNs body, FCM `data`): `moveId` and `moveFrom` (the caller's
+  display name, else its URI), beside `callToken`, `callerUri`, `callerName`.
+- `GET /v1/calls/{token}` (the call offer): `x_aria_move`, omitted otherwise.
+
+The gateway's source IP is all the PBX sees for a mobile device; apps report
+nearness through the PBX API (`/me/devices/current/proximity`), so the gateway
+does nothing for it.
+
+## Hold for me
+
+When a held call's far party is back, the PBX INVITEs the user's devices with
+`X-Aria-Hold-Return: <hold_wait_id>` and `X-Aria-Hold-Return-Name: <business
+name>`. The gateway passes each value on only when its header is present and
+not empty:
+
+- VoIP push (APNs body, FCM `data`): `holdReturnId` and `holdReturnName`,
+  beside `moveId`/`moveFrom`.
+- `GET /v1/calls/{token}` (the call offer): `x_aria_hold_return` and
+  `x_aria_hold_return_name`, omitted otherwise.
+
+The name is cleaned before it leaves the gateway: control characters, `"`,
+`<`, `>` and `\` are removed, whitespace is collapsed, and it is cut to 64
+characters. The APNs alert body stays "{name} is calling"; the app decides the
+wording it shows.
+
+Call status (`GET /v1/calls/{token}/status`) reports `"reason": "held_for_you"`
+for a call ended by a BYE carrying `X-Aria-Hold-Wait`.
+
+The PBX sends `"category": "HOLD_WAIT"` on hold-wait alerts (see
+`/v1/notify`); the gateway puts it in `aps.category` on iOS and leaves FCM
+unchanged.
 
 ## Docker
 
@@ -343,12 +384,14 @@ Android the FCM `push_token` serves both.
 Like `/v1/auth/token`, it takes `api_key` (the `TOKEN_ISSUER_KEY`) in the
 body and needs no bearer token.
 
-**Body:** `{"api_key", "user_id", "kind": "message", "title", "body"?, "thread_id"?, "data"?: {string: string}}`
+**Body:** `{"api_key", "user_id", "kind": "message", "title", "body"?, "thread_id"?, "category"?, "data"?: {string: string}}`
 
 The alert is an ordinary notification (APNs `alert`, FCM notification message),
 never a VoIP push. `data` is delivered beside it (at most 20 entries; `aps` is
 reserved). `body` is optional so a backend can leave message text out of
-Apple's and Google's systems.
+Apple's and Google's systems. `category` is optional, 1 to 64 characters of
+`[A-Z_]`; the gateway puts it in `aps.category` on iOS and leaves FCM
+unchanged.
 
 **Response:** `{"sent", "failed", "skipped"}`: devices the provider accepted,
 devices it refused or could not be reached for, and devices that cannot take an

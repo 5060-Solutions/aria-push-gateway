@@ -172,6 +172,9 @@ struct NotifyRequest {
     /// Alerts with the same id are grouped (iOS thread, Android tag).
     #[serde(default)]
     thread_id: Option<String>,
+    /// iOS notification category (1-64 characters of `[A-Z_]`).
+    #[serde(default)]
+    category: Option<String>,
     /// Delivered with the alert, for the app to open the right screen.
     #[serde(default)]
     data: std::collections::BTreeMap<String, String>,
@@ -200,6 +203,9 @@ fn validate_notify(req: &NotifyRequest) -> Result<(), StatusCode> {
             .as_deref()
             .is_none_or(|b| b.chars().count() <= 1000)
         && req.thread_id.as_deref().is_none_or(|t| t.len() <= 200)
+        && req.category.as_deref().is_none_or(|c| {
+            (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        })
         && req.data.len() <= MAX_NOTIFY_DATA
         && req
             .data
@@ -234,6 +240,7 @@ async fn notify_user(
         title: req.title,
         body: req.body,
         thread_id: req.thread_id,
+        category: req.category,
         data: req.data,
     };
     let mut out = NotifyResponse {
@@ -381,7 +388,21 @@ async fn register_device(
 ) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
     let Json(mut req) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
     validate_registration(&mut req)?;
-    let device_id = uuid::Uuid::new_v4().to_string();
+    // A phone keeps its device id, and so its `+sip.instance`, across
+    // registrations: each start of the app would otherwise leave one more
+    // device at the PBX until its binding expired.
+    let device_id = match state
+        .db
+        .device_id_for_token(&auth.user_id, &req.push_token)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => uuid::Uuid::new_v4().to_string(),
+        Err(e) => {
+            tracing::warn!(user = %auth.user_id, %e, "could not look up the phone's earlier device");
+            uuid::Uuid::new_v4().to_string()
+        }
+    };
     let now = chrono::Utc::now();
 
     let record = DeviceRecord {
@@ -437,6 +458,9 @@ async fn register_device(
     }
     replaced.sort();
     replaced.dedup();
+    // The id being reused is registered again below, which retires its
+    // earlier session itself.
+    replaced.retain(|id| *id != device_id);
     for old in &replaced {
         let _ = state.sip_proxy.unregister_device(old).await;
         state.push_manager.unregister_device(old).await;
@@ -1205,6 +1229,27 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn a_bad_category_is_refused() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        for bad in [
+            serde_json::json!("hold wait"),
+            serde_json::json!("x".repeat(65)),
+            serde_json::json!("HOLD-WAIT"),
+            serde_json::json!("hold_wait"),
+            serde_json::json!(""),
+        ] {
+            let mut body = notify_body(ISSUER_KEY, "u");
+            body["category"] = bad;
+            let (s, _) = app.post_json("/v1/notify", body.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let mut body = notify_body(ISSUER_KEY, "u");
+        body["category"] = "HOLD_WAIT".into();
+        let (s, _) = app.post_json("/v1/notify", body).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn notify_counts_the_users_active_devices_only() {
         let app = test_app(Some(ISSUER_KEY)).await;
         app.add_device("a1", "u", true).await;
@@ -1336,13 +1381,21 @@ Content-Length: 0\r\n\r\n";
     // ── Call ownership ──────────────────────────────────────────────────────
 
     async fn pending_call_for(app: &TestApp, device_id: &str) -> (tokio::net::UdpSocket, String) {
+        pending_call_with(app, device_id, INVITE).await
+    }
+
+    async fn pending_call_with(
+        app: &TestApp,
+        device_id: &str,
+        invite: &str,
+    ) -> (tokio::net::UdpSocket, String) {
         let (pbx, reg) = fake_pbx(&app.handoff).await;
         let token = app
             .handoff
             .create_pending_call(
                 device_id.into(),
                 "in-call-1".into(),
-                INVITE.into(),
+                invite.into(),
                 pbx.local_addr().unwrap(),
                 reg,
                 None,
@@ -1424,6 +1477,32 @@ Content-Length: 0\r\n\r\n";
             .await;
         assert_eq!(status, StatusCode::OK);
         assert!(recv_text(&pbx).await.starts_with("SIP/2.0 603 Decline\r\n"));
+    }
+
+    #[tokio::test]
+    async fn the_call_offer_carries_the_hold_return() {
+        let app = test_app(Some(ISSUER_KEY)).await;
+        app.add_device("bob-dev", "bob", true).await;
+        let invite = INVITE.replace(
+            "Content-Length",
+            "X-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: Acme Bank\r\nContent-Length",
+        );
+        let (_pbx, token) = pending_call_with(&app, "bob-dev", &invite).await;
+        let (status, body) = app
+            .call(Method::GET, &format!("/v1/calls/{token}"), "bob")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let offer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(offer["x_aria_hold_return"], "hw-1");
+        assert_eq!(offer["x_aria_hold_return_name"], "Acme Bank");
+
+        let (_pbx2, plain_token) = pending_call_for(&app, "bob-dev").await;
+        let (_, body) = app
+            .call(Method::GET, &format!("/v1/calls/{plain_token}"), "bob")
+            .await;
+        let plain: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(plain.get("x_aria_hold_return").is_none());
+        assert!(plain.get("x_aria_hold_return_name").is_none());
     }
 
     #[tokio::test]
@@ -1648,7 +1727,8 @@ Content-Length: 0\r\n\r\n";
         let new_dev = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
 
         assert!(!app.device_active("bob-same-sip").await);
-        assert!(!app.device_active("bob-same-phone").await);
+        // The same phone keeps its device id (so its +sip.instance).
+        assert_eq!(new_dev, "bob-same-phone");
         assert!(app.device_active("bob-other").await);
         assert!(app.device_active(&new_dev).await);
     }
@@ -1657,8 +1737,8 @@ Content-Length: 0\r\n\r\n";
     async fn re_registering_retires_the_old_devices_sip_binding() {
         let app = test_app(Some(ISSUER_KEY)).await;
         let pbx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // The phone registers, then registers again (a new device id, e.g.
-        // after failing back from another gateway instance).
+        // The phone registers, then registers again (the same device id, e.g.
+        // after the app restarts).
         let _first = register_as(&app, "bob", "1001", "phone-token", &pbx).await;
         let mut buf = vec![0u8; 65535];
         let second = post_device(&app, "bob", "1001", "phone-token", &pbx).await;

@@ -2,6 +2,7 @@
 
 use crate::config::PushConfig;
 use crate::db::DeviceRecord;
+use crate::sip::message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,6 +168,43 @@ struct ApnsPayload {
     caller_uri: String,
     #[serde(rename = "callerName", skip_serializing_if = "Option::is_none")]
     caller_name: Option<String>,
+    /// The PBX's `X-Aria-Move` value, when this INVITE moves a call here.
+    #[serde(rename = "moveId", skip_serializing_if = "Option::is_none")]
+    move_id: Option<String>,
+    /// Who the moved call is with (display name, else the caller's URI).
+    #[serde(rename = "moveFrom", skip_serializing_if = "Option::is_none")]
+    move_from: Option<String>,
+    /// The PBX's `X-Aria-Hold-Return` value: a held call's far party is back.
+    #[serde(rename = "holdReturnId", skip_serializing_if = "Option::is_none")]
+    hold_return_id: Option<String>,
+    /// Who is back (the business name from `X-Aria-Hold-Return-Name`).
+    #[serde(rename = "holdReturnName", skip_serializing_if = "Option::is_none")]
+    hold_return_name: Option<String>,
+}
+
+/// What the PBX's INVITE adds beyond the caller: the headers the gateway
+/// passes on to the push and the call offer.
+#[derive(Debug, Default, Clone)]
+pub struct IncomingCallExtras {
+    /// `X-Aria-Move`: this INVITE moves a call to the device.
+    pub move_id: Option<String>,
+    /// `X-Aria-Hold-Return`: the far party of a held call is back.
+    pub hold_return_id: Option<String>,
+    /// `X-Aria-Hold-Return-Name`, cleaned and capped.
+    pub hold_return_name: Option<String>,
+}
+
+impl IncomingCallExtras {
+    pub fn from_invite(raw: &str) -> Self {
+        let present = |name: &str| message::extract_header(raw, name).filter(|v| !v.is_empty());
+        Self {
+            move_id: present("X-Aria-Move"),
+            hold_return_id: present("X-Aria-Hold-Return"),
+            hold_return_name: message::extract_header(raw, "X-Aria-Hold-Return-Name")
+                .map(|n| message::clean_header_text(&n, message::HOLD_RETURN_NAME_MAX))
+                .filter(|n| !n.is_empty()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -190,6 +228,8 @@ pub struct Alert {
     pub body: Option<String>,
     /// Alerts with the same id are grouped (iOS `thread-id`, Android tag).
     pub thread_id: Option<String>,
+    /// iOS notification category (`aps.category`), for the app's actions.
+    pub category: Option<String>,
     /// Delivered beside the alert.
     pub data: std::collections::BTreeMap<String, String>,
 }
@@ -204,6 +244,9 @@ fn apns_alert_payload(alert: &Alert) -> serde_json::Value {
     let mut aps = serde_json::json!({ "alert": aps_alert, "sound": "default" });
     if let Some(thread) = &alert.thread_id {
         aps["thread-id"] = thread.clone().into();
+    }
+    if let Some(category) = &alert.category {
+        aps["category"] = category.clone().into();
     }
     let mut payload = serde_json::Map::new();
     for (k, v) in &alert.data {
@@ -331,6 +374,7 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        extras: &IncomingCallExtras,
     ) -> Result<(), PushError> {
         let device = {
             let devices = self.devices.read().await;
@@ -339,11 +383,11 @@ impl PushManager {
 
         match device.platform.as_str() {
             "ios" => {
-                self.send_apns(&device, call_token, caller_uri, caller_name)
+                self.send_apns(&device, call_token, caller_uri, caller_name, extras)
                     .await
             }
             "android" => {
-                self.send_fcm(&device, call_token, caller_uri, caller_name)
+                self.send_fcm(&device, call_token, caller_uri, caller_name, extras)
                     .await
             }
             _ => Err(PushError::UnknownPlatform(device.platform.clone())),
@@ -433,23 +477,11 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        extras: &IncomingCallExtras,
     ) -> Result<(), PushError> {
         let apns = self.apns.as_ref().ok_or(PushError::NotConfigured("APNs"))?;
 
-        let display = caller_name.unwrap_or(caller_uri);
-        let payload = ApnsPayload {
-            aps: ApnsAps {
-                alert: ApnsAlert {
-                    title: "Incoming Call".to_string(),
-                    body: format!("{} is calling", display),
-                },
-                sound: "ringtone.caf".to_string(),
-                content_available: 1,
-            },
-            call_token: call_token.to_string(),
-            caller_uri: caller_uri.to_string(),
-            caller_name: caller_name.map(|s| s.to_string()),
-        };
+        let payload = apns_payload(call_token, caller_uri, caller_name, extras);
 
         let jwt = Self::get_apns_jwt(apns)
             .await
@@ -493,16 +525,11 @@ impl PushManager {
         call_token: &str,
         caller_uri: &str,
         caller_name: Option<&str>,
+        extras: &IncomingCallExtras,
     ) -> Result<(), PushError> {
         let fcm = self.fcm.as_ref().ok_or(PushError::NotConfigured("FCM"))?;
 
-        let mut data = serde_json::Map::new();
-        data.insert("type".into(), "incoming_call".into());
-        data.insert("callToken".into(), call_token.into());
-        data.insert("callerUri".into(), caller_uri.into());
-        if let Some(name) = caller_name {
-            data.insert("callerName".into(), name.into());
-        }
+        let data = fcm_data(call_token, caller_uri, caller_name, extras);
 
         let payload = serde_json::json!({
             "message": {
@@ -755,6 +782,63 @@ impl PushManager {
 }
 
 /// A device record for push tests.
+/// The VoIP push body for an incoming call. With `extras.move_id` (the
+/// INVITE's `X-Aria-Move`) the push also carries `moveId` and `moveFrom`, so
+/// the app can tell a call moved here from a new one; the hold-return values
+/// ride along the same way.
+fn apns_payload(
+    call_token: &str,
+    caller_uri: &str,
+    caller_name: Option<&str>,
+    extras: &IncomingCallExtras,
+) -> ApnsPayload {
+    let display = caller_name.unwrap_or(caller_uri);
+    ApnsPayload {
+        aps: ApnsAps {
+            alert: ApnsAlert {
+                title: "Incoming Call".to_string(),
+                body: format!("{} is calling", display),
+            },
+            sound: "ringtone.caf".to_string(),
+            content_available: 1,
+        },
+        call_token: call_token.to_string(),
+        caller_uri: caller_uri.to_string(),
+        caller_name: caller_name.map(|s| s.to_string()),
+        move_id: extras.move_id.clone(),
+        move_from: extras.move_id.as_ref().map(|_| display.to_string()),
+        hold_return_id: extras.hold_return_id.clone(),
+        hold_return_name: extras.hold_return_name.clone(),
+    }
+}
+
+/// The FCM `data` map for an incoming call (same fields as the APNs body).
+fn fcm_data(
+    call_token: &str,
+    caller_uri: &str,
+    caller_name: Option<&str>,
+    extras: &IncomingCallExtras,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut data = serde_json::Map::new();
+    data.insert("type".into(), "incoming_call".into());
+    data.insert("callToken".into(), call_token.into());
+    data.insert("callerUri".into(), caller_uri.into());
+    if let Some(name) = caller_name {
+        data.insert("callerName".into(), name.into());
+    }
+    if let Some(id) = &extras.move_id {
+        data.insert("moveId".into(), id.as_str().into());
+        data.insert("moveFrom".into(), caller_name.unwrap_or(caller_uri).into());
+    }
+    if let Some(id) = &extras.hold_return_id {
+        data.insert("holdReturnId".into(), id.as_str().into());
+    }
+    if let Some(name) = &extras.hold_return_name {
+        data.insert("holdReturnName".into(), name.as_str().into());
+    }
+    data
+}
+
 #[cfg(test)]
 pub(crate) fn test_device(id: &str, platform: &str) -> DeviceRecord {
     let now = chrono::Utc::now();
@@ -915,8 +999,24 @@ mod tests {
             title: "+15551230000".into(),
             body: Some("hello".into()),
             thread_id: Some("did:+15551230000".into()),
+            category: None,
             data: [("type".to_string(), "sms".to_string())].into(),
         }
+    }
+
+    #[test]
+    fn an_alert_with_a_category_sets_aps_category() {
+        let mut a = alert();
+        a.category = Some("HOLD_WAIT".into());
+        assert_eq!(apns_alert_payload(&a)["aps"]["category"], "HOLD_WAIT");
+        assert!(apns_alert_payload(&alert())["aps"]
+            .get("category")
+            .is_none());
+        // FCM is unchanged.
+        assert_eq!(
+            fcm_alert_message("tok", &a),
+            fcm_alert_message("tok", &alert())
+        );
     }
 
     #[test]
@@ -968,20 +1068,38 @@ mod tests {
         let manager = fcm.manager("dev").await;
 
         manager
-            .send_incoming_call("dev", "tok-1", "2000@pbx", None)
+            .send_incoming_call(
+                "dev",
+                "tok-1",
+                "2000@pbx",
+                None,
+                &IncomingCallExtras::default(),
+            )
             .await
             .unwrap();
         assert_eq!(fcm.delivered.recv().await.unwrap().0, "tok-1");
 
         let err = manager
-            .send_incoming_call("ghost", "tok-2", "2000@pbx", None)
+            .send_incoming_call(
+                "ghost",
+                "tok-2",
+                "2000@pbx",
+                None,
+                &IncomingCallExtras::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, PushError::NoDevice), "{err}");
 
         fcm.set_status(404);
         let err = manager
-            .send_incoming_call("dev", "tok-3", "2000@pbx", None)
+            .send_incoming_call(
+                "dev",
+                "tok-3",
+                "2000@pbx",
+                None,
+                &IncomingCallExtras::default(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -992,9 +1110,115 @@ mod tests {
 
         manager.register_device(test_device("ios-dev", "ios")).await;
         let err = manager
-            .send_incoming_call("ios-dev", "tok-4", "2000@pbx", None)
+            .send_incoming_call(
+                "ios-dev",
+                "tok-4",
+                "2000@pbx",
+                None,
+                &IncomingCallExtras::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, PushError::NotConfigured("APNs")), "{err}");
+    }
+
+    #[test]
+    fn push_payloads_carry_the_hold_return_only_for_a_hold_return() {
+        let extras = IncomingCallExtras {
+            hold_return_id: Some("hw-1".into()),
+            hold_return_name: Some("Acme Bank".into()),
+            ..Default::default()
+        };
+        let apns = serde_json::to_value(apns_payload(
+            "t",
+            "+18005550100@pbx",
+            Some("Acme Bank"),
+            &extras,
+        ))
+        .unwrap();
+        assert_eq!(apns["holdReturnId"], "hw-1");
+        assert_eq!(apns["holdReturnName"], "Acme Bank");
+        assert!(apns.get("moveId").is_none());
+        let fcm = fcm_data("t", "+18005550100@pbx", Some("Acme Bank"), &extras);
+        assert_eq!(fcm["holdReturnId"], "hw-1");
+        assert_eq!(fcm["holdReturnName"], "Acme Bank");
+        let plain = serde_json::to_value(apns_payload(
+            "t",
+            "2000@pbx",
+            None,
+            &IncomingCallExtras::default(),
+        ))
+        .unwrap();
+        assert!(plain.get("holdReturnId").is_none() && plain.get("holdReturnName").is_none());
+    }
+
+    #[test]
+    fn move_and_hold_return_travel_independently() {
+        let raw = "INVITE sip:a@b SIP/2.0\r\nX-Aria-Move: m-1\r\nX-Aria-Hold-Return: hw-1\r\n\r\n";
+        let e = IncomingCallExtras::from_invite(raw);
+        assert_eq!(
+            (e.move_id.as_deref(), e.hold_return_id.as_deref()),
+            (Some("m-1"), Some("hw-1"))
+        );
+    }
+
+    #[test]
+    fn an_empty_hold_return_header_is_absent() {
+        let e = IncomingCallExtras::from_invite(
+            "INVITE sip:a@b SIP/2.0\r\nX-Aria-Hold-Return: \r\n\r\n",
+        );
+        assert!(e.hold_return_id.is_none());
+    }
+
+    #[test]
+    fn a_dirty_hold_return_name_is_cleaned_at_the_invite() {
+        let raw = format!(
+            "INVITE sip:a@b SIP/2.0\r\nX-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: \"Acme\" <Bank>\\ {}\r\n\r\n",
+            "\u{e9}".repeat(200)
+        );
+        let e = IncomingCallExtras::from_invite(&raw);
+        let name = e.hold_return_name.expect("name kept");
+        assert_eq!(name.chars().count(), 64);
+        assert!(!name.contains(['"', '<', '>', '\\']));
+        assert_eq!(
+            name,
+            format!("Acme Bank {}", "\u{e9}".repeat(64 - "Acme Bank ".len()))
+        );
+
+        let empty = IncomingCallExtras::from_invite(
+            "INVITE sip:a@b SIP/2.0\r\nX-Aria-Hold-Return: hw-1\r\nX-Aria-Hold-Return-Name: <>\r\n\r\n",
+        );
+        assert_eq!(empty.hold_return_name, None);
+    }
+
+    #[test]
+    fn push_payloads_carry_the_move_id_only_for_a_move() {
+        let moved_extras = IncomingCallExtras {
+            move_id: Some("m-1".into()),
+            ..Default::default()
+        };
+        let plain = serde_json::to_value(apns_payload(
+            "t",
+            "2000@pbx",
+            Some("Bob"),
+            &IncomingCallExtras::default(),
+        ))
+        .unwrap();
+        assert!(plain.get("moveId").is_none() && plain.get("moveFrom").is_none());
+        let moved = serde_json::to_value(apns_payload("t", "2000@pbx", Some("Bob"), &moved_extras))
+            .unwrap();
+        assert_eq!(moved["moveId"], "m-1");
+        assert_eq!(moved["moveFrom"], "Bob");
+        assert_eq!(moved["callToken"], "t");
+        let no_name =
+            serde_json::to_value(apns_payload("t", "2000@pbx", None, &moved_extras)).unwrap();
+        assert_eq!(no_name["moveFrom"], "2000@pbx");
+
+        let plain = fcm_data("t", "2000@pbx", Some("Bob"), &IncomingCallExtras::default());
+        assert!(!plain.contains_key("moveId") && !plain.contains_key("moveFrom"));
+        let moved = fcm_data("t", "2000@pbx", Some("Bob"), &moved_extras);
+        assert_eq!(moved["moveId"], "m-1");
+        assert_eq!(moved["moveFrom"], "Bob");
+        assert_eq!(moved["type"], "incoming_call");
     }
 }

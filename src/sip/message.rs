@@ -75,6 +75,27 @@ pub fn extract_header(msg: &str, name: &str) -> Option<String> {
         .map(|(_, value)| value)
 }
 
+/// The longest hold-return business name the gateway passes on.
+pub const HOLD_RETURN_NAME_MAX: usize = 64;
+
+/// Header text made safe to hand to an app: control characters (CR and LF
+/// included), `"`, `<`, `>` and `\` are dropped, whitespace is collapsed,
+/// and the result is cut to `max_chars` characters.
+pub fn clean_header_text(s: &str, max_chars: usize) -> String {
+    let kept: String = s
+        .chars()
+        .filter(|c| !c.is_control() || c.is_whitespace())
+        .filter(|c| !matches!(c, '"' | '<' | '>' | '\\'))
+        .collect();
+    let collapsed = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 /// A parameter of a header value (`tag`, `branch`, ...), looking only at the
 /// header's own parameters: after the `>` of a name-addr, or after the URI
 /// of an addr-spec — never inside the URI.
@@ -127,20 +148,14 @@ pub fn extract_display_name(msg: &str) -> Option<String> {
 /// The `reg-id` of the gateway's one flow per user (RFC 5626 section 4.2).
 pub const REG_ID: u32 = 1;
 
-/// A stable RFC 5626 `+sip.instance` URN for `user@domain`: the same user
-/// gets the same instance ID across restarts, re-registrations and
-/// failovers, so a registrar replaces the binding instead of adding one.
-/// (A name-based UUID: FNV-1a 128 over the address of record, with the
-/// version and variant bits set.)
-pub fn instance_urn(username: &str, domain: &str) -> String {
-    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    for b in format!("aria-gateway:{username}@{domain}").bytes() {
-        h ^= u128::from(b);
-        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
-    }
-    h = (h & !(0xf << 76)) | (8 << 76); // version 8 (custom)
-    h = (h & !(0x3 << 62)) | (0x2 << 62); // RFC 4122 variant
-    format!("urn:uuid:{}", uuid::Uuid::from_u128(h))
+/// The RFC 5626 `+sip.instance` URN of a device: `urn:uuid:<device_id>`,
+/// the ID the gateway returned at device registration. The apps send the
+/// same URN to the PBX API (`sip_instance`), which matches it against the
+/// registration's `+sip.instance` to find the device. It is stable across
+/// restarts, re-registrations and failovers, so a registrar replaces the
+/// binding instead of adding one; two devices of one user get two.
+pub fn instance_urn(device_id: &str) -> String {
+    format!("urn:uuid:{device_id}")
 }
 
 /// The Contact header value of a REGISTER: the gateway's address with its
@@ -189,6 +204,17 @@ pub fn retry_after_secs(msg: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The User-Agent of a REGISTER: the gateway, and the platform of the phone it
+/// stands for, `Aria-Gateway/0.1.0 (android)`. The PBX reads the parenthesis
+/// to name the device for "Move to...".
+pub fn register_user_agent(platform: &str) -> String {
+    let p = platform.trim().to_ascii_lowercase();
+    match p.as_str() {
+        "ios" | "android" => format!("Aria-Gateway/0.1.0 ({p})"),
+        _ => "Aria-Gateway/0.1.0".to_owned(),
+    }
+}
+
 /// Build a REGISTER request.
 #[allow(clippy::too_many_arguments)]
 pub fn build_register(
@@ -204,8 +230,10 @@ pub fn build_register(
     auth_header: Option<&str>,
     expires: u32,
     instance: &str,
+    platform: &str,
 ) -> String {
     let branch = generate_branch();
+    let ua = register_user_agent(platform);
     let tp = transport.to_uppercase();
     let contact = register_contact(username, local_ip, local_port, transport, instance);
 
@@ -221,7 +249,7 @@ pub fn build_register(
          Expires: {expires}\r\n\
          Supported: outbound, path\r\n\
          Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, NOTIFY\r\n\
-         User-Agent: Aria-Gateway/0.1.0\r\n",
+         User-Agent: {ua}\r\n",
     );
 
     if let Some(auth) = auth_header {
@@ -523,8 +551,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_hold_return_name_is_cleaned_and_capped() {
+        let dirty = format!("Acme\tBank \"<x>\\ {}", "é".repeat(500));
+        let clean = clean_header_text(&dirty, HOLD_RETURN_NAME_MAX);
+        assert!(clean.chars().count() <= 64);
+        assert!(!clean.contains(['"', '<', '>', '\\', '\t', '\r', '\n']));
+        assert!(clean.starts_with("Acme Bank x"));
+    }
+
+    #[test]
     fn register_contact_carries_instance_and_reg_id() {
-        let inst = instance_urn("1001", "pbx.example.com");
+        let inst = instance_urn("dev1");
         let c = register_contact("1001", "10.0.0.5", 5070, "udp", &inst);
         assert_eq!(
             c,
@@ -543,20 +580,19 @@ mod tests {
             None,
             3600,
             &inst,
+            "android",
         );
         assert!(msg.contains(&format!("Contact: {c}\r\n")));
+        assert!(msg.contains("User-Agent: Aria-Gateway/0.1.0 (android)\r\n"));
+        assert_eq!(register_user_agent("tablet"), "Aria-Gateway/0.1.0");
         assert!(msg.contains("Supported: outbound, path\r\n"));
     }
 
     #[test]
-    fn instance_urn_is_stable_per_user_and_a_valid_uuid() {
-        let a = instance_urn("1001", "pbx.example.com");
-        assert_eq!(a, instance_urn("1001", "pbx.example.com"));
-        assert_ne!(a, instance_urn("1002", "pbx.example.com"));
-        assert_ne!(a, instance_urn("1001", "other.example.com"));
-        let uuid = uuid::Uuid::parse_str(a.strip_prefix("urn:uuid:").unwrap()).unwrap();
-        assert_eq!(uuid.get_version_num(), 8);
-        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+    fn instance_urn_is_the_device_id() {
+        let id = "6f1c2a9e-1c1f-4c3e-9a55-0d7f3a1b2c4d";
+        assert_eq!(instance_urn(id), format!("urn:uuid:{id}"));
+        assert_ne!(instance_urn(id), instance_urn("another"));
     }
 
     #[test]
